@@ -89,6 +89,8 @@ def recovery_summary(job_root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
         if batch not in committed or saved_in_batch < segment_count:
             current = {
                 "number": batch + 1,
+                "start_segment": offset,
+                "end_segment": offset + segment_count - 1,
                 "completed_segments": saved_in_batch,
                 "segment_count": segment_count,
                 "regenerate_segments": segment_count - saved_in_batch,

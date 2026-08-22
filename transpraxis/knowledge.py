@@ -134,6 +134,46 @@ def _first_alignment(
     return first, ""
 
 
+def candidate_context(candidate: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the human-review context for one persisted knowledge candidate."""
+    source = str(candidate.get("source") or "").strip()
+    segment = candidate.get("first_observed_segment")
+    segment = segment if isinstance(segment, int) and not isinstance(segment, bool) else None
+    pairs = state.get("pairs") or []
+    pair = pairs[segment] if segment is not None and 0 <= segment < len(pairs) else {}
+    glossary = state.get("glossary") or (state.get("glossary_frozen") or {}).get("entries") or []
+    entries = [entry for entry in models.normalize_glossary(glossary)
+               if entry.get("source", "").casefold() == source.casefold()]
+    proposed = str(candidate.get("observed_target") or "").strip()
+    conflicts = []
+    for entry in entries:
+        current = str(entry.get("preferred") or entry.get("target") or "").strip()
+        if current.casefold() != proposed.casefold():
+            conflicts.append({
+                "status": entry.get("status"),
+                "target": current,
+                "behavior": entry.get("behavior"),
+                "scope": entry.get("scope"),
+            })
+    return {
+        "candidate_id": candidate_id(candidate),
+        "source": source,
+        "proposed_target": proposed,
+        "kind": str(candidate.get("kind") or "term"),
+        "first_observed_segment": segment,
+        "occurrences": list(candidate.get("occurrences") or []),
+        "observed_segments": list(candidate.get("observed_segments") or []),
+        "source_context": str(pair.get("source") or ""),
+        "target_context": str(pair.get("target") or ""),
+        "confidence": candidate.get("confidence"),
+        "origin": str(candidate.get("origin") or "translation_observation"),
+        "existing_entries": entries,
+        "conflicts": conflicts,
+        "decision": candidate.get("decision"),
+        "decision_note": candidate.get("decision_note"),
+    }
+
+
 def _existing_entry(source: str, glossary: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     key = source.casefold()
     for entry in models.normalize_glossary(glossary or []):
@@ -144,6 +184,17 @@ def _existing_entry(source: str, glossary: Sequence[Dict[str, Any]]) -> Optional
 
 def _candidate_key(candidate: Dict[str, Any]) -> str:
     return str(candidate.get("source") or "").casefold()
+
+
+def candidate_id(candidate: Dict[str, Any]) -> str:
+    """Stable identity for a persisted human-review candidate."""
+    existing = str(candidate.get("id") or "").strip()
+    if existing:
+        return existing
+    return models.stable_id(
+        _candidate_key(candidate),
+        str(candidate.get("observed_target") or "").casefold(),
+        prefix="k")
 
 
 def _make_candidate(
@@ -259,6 +310,8 @@ def provisional_hints(
     """Expose observations as non-governing suggestions for later batches."""
     hints = []
     for candidate in list(candidates or [])[-max(0, limit):]:
+        if candidate.get("decision") in {"project_term", "rejected"}:
+            continue
         source = str(candidate.get("source") or "").strip()
         target = str(candidate.get("observed_target") or "").strip()
         if not source or not target:
@@ -292,6 +345,9 @@ def discard_candidates_for_segments(
     kept = []
     for item in candidates or []:
         if not isinstance(item, dict):
+            continue
+        if item.get("decision"):
+            kept.append(dict(item))
             continue
         observed = item.get("observed_segments")
         if not isinstance(observed, list):

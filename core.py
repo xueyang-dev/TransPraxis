@@ -2269,6 +2269,36 @@ def recovery_summary(job_id, state=None):
     return _checkpoint.recovery_summary(job_dir(job_id), state or {})
 
 
+def load_context_artifacts(job_id, state=None):
+    """Load persisted context artifacts, tolerating older or partial jobs."""
+    state = state if state is not None else load_job_state(job_id)
+    state = state or {}
+
+    def read_json(name, default):
+        path = job_dir(job_id) / name
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            return default
+
+    units = state.get("semantic_units") or read_json("semantic_units.json", [])
+    digests = state.get("section_digests") or read_json("section_digests.json", [])
+    synopsis = state.get("document_synopsis")
+    stored_synopsis = read_json("document_synopsis.json", None)
+    if not isinstance(synopsis, dict):
+        synopsis = {}
+    if not synopsis or (synopsis.get("status") == "pending"
+                        and isinstance(stored_synopsis, dict)
+                        and stored_synopsis.get("status") != "pending"):
+        synopsis = stored_synopsis or {}
+    return {
+        "semantic_units": units if isinstance(units, list) else [],
+        "section_digests": digests if isinstance(digests, list) else [],
+        "document_synopsis": synopsis if isinstance(synopsis, dict) else {},
+        "warnings": list(state.get("understanding_warnings") or []),
+    }
+
+
 def task_status_label(state):
     """User-facing task status derived from persisted workflow state."""
     from transpraxis import delivery as _delivery
@@ -2391,6 +2421,122 @@ def set_glossary_entry_status(job_id, entry_ids, status):
             e["status"] = status
     save_job_state(job_id, state)
     return state
+
+
+def review_knowledge_candidate(job_id, candidate_id, decision, actor="user"):
+    """Apply an explicit human decision to one persisted knowledge candidate.
+
+    The only project-wide promotion path is the existing per-task glossary
+    freeze/version workflow.  There is intentionally no global glossary store.
+    """
+    allowed = {"project_term", "task_only", "rejected"}
+    if decision not in allowed:
+        raise ValueError(f"非法知识候选决策：{decision}")
+    state = load_job_state(job_id)
+    if state is None:
+        return None, False, "任务不存在"
+    candidate = next((item for item in state.get("knowledge_candidates") or []
+                      if _knowledge.candidate_id(item) == str(candidate_id)), None)
+    if candidate is None:
+        return state, False, "找不到待确认词条"
+    if candidate.get("decision"):
+        return state, False, "该词条已经处理过"
+
+    context = _knowledge.candidate_context(candidate, state)
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def record(action, note, event):
+        candidate["decision"] = decision
+        candidate["decision_at"] = timestamp
+        candidate["decision_by"] = actor
+        candidate["decision_note"] = note
+        candidate["status"] = {
+            "project_term": "promoted_project_term",
+            "task_only": "accepted_task",
+            "rejected": "rejected",
+        }[decision]
+        state.setdefault("knowledge_events", []).append({
+            "type": "human_candidate_decision",
+            "candidate_id": context["candidate_id"],
+            "source": context["source"],
+            "observed_target": context["proposed_target"],
+            "decision": decision,
+            "scope": "document" if decision == "project_term" else "task",
+            "timestamp": timestamp,
+            "actor": actor,
+            "note": note,
+            **event,
+        })
+        state.setdefault("human_actions", []).append({
+            "action": action,
+            "finding_id": f"knowledge:{context['candidate_id']}",
+            "note": note,
+            "timestamp": timestamp,
+            "actor": actor,
+        })
+
+    if decision == "project_term":
+        if context["conflicts"]:
+            return state, False, "与现有项目术语冲突，未覆盖现有术语"
+        entries = normalize_glossary(
+            state.get("glossary") or (state.get("glossary_frozen") or {}).get("entries") or [])
+        matching = [entry for entry in entries
+                    if entry.get("source", "").casefold() == context["source"].casefold()]
+        target = context["proposed_target"]
+        changed = False
+        if matching:
+            entry = matching[0]
+            current = str(entry.get("preferred") or entry.get("target") or "").strip()
+            if current.casefold() != target.casefold():
+                return state, False, "与现有术语译名冲突，未覆盖现有术语"
+            if entry.get("status") != "locked":
+                entry["status"] = "locked"
+                entry["preferred"] = target
+                entry["target"] = target
+                changed = True
+            entry_id = entry.get("id")
+        else:
+            entry = _models.normalize_glossary_entry({
+                "source": context["source"],
+                "proposed_target": target,
+                "target": target,
+                "preferred": target,
+                "behavior": "translate",
+                "status": "locked",
+                "scope": "document",
+                "occurrences": context["occurrences"],
+                "note": "由人工从翻译流知识候选提升为项目术语",
+                "evidence": [{
+                    "evidence_type": "user",
+                    "source_name": "TransPraxis 知识候选",
+                    "note": f"来自第 {(context['first_observed_segment'] + 1) if context['first_observed_segment'] is not None else '?'} 段的人工确认",
+                    "quote": context["source_context"],
+                    "url": "",
+                }],
+            })
+            if entry is None:
+                return state, False, "词条内容无效，未加入项目术语"
+            entries.append(entry)
+            entry_id = entry.get("id")
+            changed = True
+        candidate["promotion_entry_id"] = entry_id
+        record("knowledge_project_term", "人工确认并加入项目术语；术语版本将更新", {
+            "entry_id": entry_id,
+        })
+        state["glossary"] = entries
+        save_job_state(job_id, state)
+        if changed or not state.get("glossary_frozen"):
+            state = freeze_glossary(job_id, entries=entries, frozen_by=actor)
+        return state, True, "已加入项目术语，并通过术语版本冻结流程保存"
+
+    if decision == "task_only":
+        record("knowledge_task_only", "人工确认仅在本任务采用，不加入项目术语", {})
+        save_job_state(job_id, state)
+        return state, True, "已记录为仅本任务采用"
+
+    record("knowledge_rejected", "人工拒绝该知识候选", {})
+    save_job_state(job_id, state)
+    return state, True, "已拒绝该知识候选"
 
 
 def freeze_glossary(job_id, entries=None, frozen_by="user"):

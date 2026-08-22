@@ -15,7 +15,9 @@ import streamlit as st
 
 import core
 from transpraxis import assets as _assets
+from transpraxis import context as _context
 from transpraxis import delivery as _delivery
+from transpraxis import knowledge as _knowledge
 from transpraxis import literature_evidence as _literature_evidence
 from transpraxis import report_evidence as _report_evidence
 
@@ -2028,6 +2030,237 @@ def _render_recovery_panel(job_id, state):
             st.rerun()
 
 
+def _context_status_label(status):
+    return {
+        "model": "模型生成",
+        "deterministic_fallback": "临时摘要",
+        "pending": "生成中",
+        "unavailable": "不可用",
+    }.get(str(status or ""), "未记录")
+
+
+def _target_context_level_label(level):
+    return {
+        "human_accepted": "人工确认",
+        "reviewed": "独立审校",
+        "tm_approved": "翻译记忆",
+        "generated": "自动译文（未确认）",
+    }.get(level, "未标注")
+
+
+def _render_context_surface(job_id, state):
+    st.header("文档上下文")
+    st.caption("查看系统对全文、当前内容单元和前文译文连续性的理解。")
+    artifacts = core.load_context_artifacts(job_id, state)
+    units = artifacts["semantic_units"]
+    digests = artifacts["section_digests"]
+    synopsis = artifacts["document_synopsis"]
+    recovery = core.recovery_summary(job_id, state)
+    pairs = state.get("pairs") or []
+    current_batch = recovery.get("current_batch")
+    if current_batch:
+        current_index = current_batch.get("start_segment", len(pairs)) \
+            + current_batch.get("completed_segments", 0)
+        st.info(
+            f"当前处理批次：第 {current_batch['number']} 批 · "
+            f"本批已保存 {current_batch['completed_segments']}/{current_batch['segment_count']} 段。")
+    else:
+        current_index = len(pairs)
+        if state.get("p2_done"):
+            st.success("翻译批次已完成；以下显示最近使用的上下文。")
+        else:
+            st.caption("翻译尚未形成批次记录；以下可查看已经生成的全文理解。")
+    current_index = max(0, min(current_index, len(state.get("paras") or pairs)))
+
+    synopsis_status = _context_status_label(synopsis.get("status"))
+    accepted_context = _context.select_target_context(
+        pairs, current_index, limit=4)
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("内容单元", len(units))
+    metric_cols[1].metric("章节摘要", len(digests))
+    metric_cols[2].metric("前文连续性", f"{len(accepted_context)} 条")
+
+    with st.container(border=True):
+        st.subheader("全文概要")
+        if synopsis.get("summary"):
+            st.write(synopsis["summary"])
+            if synopsis.get("document_arc"):
+                st.markdown(f"**全文发展/论证**：{synopsis['document_arc']}")
+            for label, key in (("主题", "themes"), ("关键实体", "entities"),
+                               ("关键概念", "terms"), ("翻译连续性提示", "translation_notes")):
+                values = synopsis.get(key) or []
+                if values:
+                    st.caption(f"{label}：" + "、".join(values))
+            st.caption(f"概要状态：{synopsis_status}")
+        else:
+            st.info(
+                "当前任务没有可用的全文概要。可能是快速模式运行，或全文理解尚未完成；"
+                "这不会阻止翻译继续。")
+
+    if units:
+        digest_by_unit = {str(item.get("unit_id")): item for item in digests
+                          if isinstance(item, dict)}
+        def unit_label(index):
+            unit = units[index]
+            label = unit.get("label") or f"内容单元 {index + 1}"
+            return f"{label} · 第 {unit.get('start_segment', 0) + 1}-{unit.get('end_segment', 0) + 1} 段"
+
+        default_unit = 0
+        for index, unit in enumerate(units):
+            if unit.get("start_segment", 0) <= current_index <= unit.get("end_segment", -1):
+                default_unit = index
+                break
+            if unit.get("start_segment", 0) <= max(0, current_index - 1) \
+                    <= unit.get("end_segment", -1):
+                default_unit = index
+        selected_unit = st.selectbox(
+            "当前章节/内容单元", range(len(units)), index=default_unit,
+            format_func=unit_label, key=f"context_unit_{job_id}")
+        unit = units[selected_unit]
+        digest = digest_by_unit.get(str(unit.get("unit_id")))
+        with st.container(border=True):
+            st.subheader("章节摘要")
+            st.caption(unit_label(selected_unit))
+            if digest and digest.get("summary"):
+                st.write(digest["summary"])
+                for label, key in (("关键实体", "key_entities"), ("关键概念", "key_terms"),
+                                   ("待确认线索", "open_threads"),
+                                   ("翻译提示", "translation_notes")):
+                    values = digest.get(key) or []
+                    if values:
+                        st.caption(f"{label}：" + "、".join(values))
+            else:
+                st.info("该内容单元暂无章节摘要。")
+    elif not synopsis.get("summary"):
+        st.info("当前任务没有可展示的内容单元或章节摘要。")
+
+    with st.container(border=True):
+        st.subheader("上下文连续性")
+        if accepted_context:
+            st.caption("最近批次/最近译文参考的前文内容如下；标签表示译文的确认程度。")
+            for item in accepted_context:
+                with st.expander(
+                        f"第 {item['segment_index'] + 1} 段 · "
+                        f"{_target_context_level_label(item['level'])}", expanded=False):
+                    st.markdown("**前文原文**")
+                    st.code(item["source"] or "（无原文记录）")
+                    st.markdown("**前文译文**")
+                    st.code(item["target"])
+        else:
+            st.info("当前没有可用的前文译文连续性记录。")
+
+        packet_log = state.get("context_packet_log") or []
+        if packet_log:
+            latest = packet_log[-1]
+            previous_count = len(latest.get("previous_target_segments") or [])
+            st.caption(
+                f"最近一次处理参考了全文概要、当前章节摘要、前文原文，"
+                f"以及 {previous_count} 条前文译文连续性记录。")
+        else:
+            st.caption("当前任务尚无已保存的批次上下文参考记录。")
+
+    warnings = artifacts.get("warnings") or []
+    if warnings:
+        with st.expander("上下文生成提示", expanded=False):
+            for warning in warnings:
+                st.warning(warning)
+    if state.get("context_packet_log"):
+        with st.expander("高级诊断", expanded=False):
+            st.caption("仅供排查使用；正常工作不需要查看内部记录。")
+            st.json(state["context_packet_log"][-5:])
+
+
+def _render_terminology_version(state):
+    entries = state.get("glossary") or []
+    frozen = state.get("glossary_frozen") or {}
+    versions = state.get("glossary_versions") or []
+    status = "已冻结" if frozen else "草稿，尚未冻结"
+    version = frozen.get("version") if frozen else "—"
+    recent = frozen.get("frozen_at") if frozen else "暂无冻结版本"
+    st.caption(
+        f"当前术语版本：v{version} · 状态：{status} · 条目数量：{len(entries)} · "
+        f"最近变更：{str(recent or '暂无记录').replace('T', ' ')[:19]}")
+    if versions:
+        st.caption(f"历史版本 {len(versions)} 个；旧版本保留，不在普通界面显示哈希。")
+
+
+def _render_knowledge_library(saved_jobs):
+    st.subheader("待确认词条")
+    st.caption("这些词条来自翻译过程中的知识观察，默认不会成为锁定术语。")
+    any_pending = False
+    for job in saved_jobs:
+        state = job["state"]
+        candidates = [item for item in state.get("knowledge_candidates") or []
+                      if isinstance(item, dict) and not item.get("decision")]
+        if not candidates:
+            continue
+        any_pending = True
+        filename = state.get("filename", "?")
+        with st.expander(f"{filename} · {len(candidates)} 条待确认词条", expanded=True):
+            for candidate in candidates:
+                context = _knowledge.candidate_context(candidate, state)
+                cid = context["candidate_id"]
+                with st.container(key=f"knowledge_candidate_{job['job_id']}_{cid}"):
+                    st.markdown(
+                        f"**{context['source']}** → **{context['proposed_target']}**")
+                    segment = context["first_observed_segment"]
+                    segment_label = f"第 {segment + 1} 段" if segment is not None else "段落未知"
+                    try:
+                        confidence = float(context["confidence"] or 0)
+                    except (TypeError, ValueError):
+                        confidence = 0.0
+                    st.caption(
+                        f"首次出现：{segment_label} · 出现 {len(context['occurrences'])} 次 · "
+                        f"类型：{'术语' if context['kind'] == 'term' else '专名' if context['kind'] == 'name' else '固定表达'} · "
+                        f"来源：翻译流观察 · 观察置信度：{confidence:.2f}")
+                    if context["source_context"] or context["target_context"]:
+                        source_col, target_col = st.columns(2)
+                        with source_col:
+                            st.markdown("**所在原文**")
+                            st.code(context["source_context"] or "（未找到原文段落）")
+                        with target_col:
+                            st.markdown("**所在译文**")
+                            st.code(context["target_context"] or "（未找到译文段落）")
+                    if context["conflicts"]:
+                        st.warning(
+                            "与现有项目术语存在译名冲突：" + "；".join(
+                                f"{item['target']}（{item['status']}）"
+                                for item in context["conflicts"]))
+                    else:
+                        st.caption("未发现与当前项目术语的译名冲突。")
+                    c1, c2, c3 = st.columns(3)
+                    if c1.button(
+                            "加入项目术语", disabled=bool(context["conflicts"]),
+                            key=f"knowledge_project_{job['job_id']}_{cid}", width="stretch"):
+                        _, ok, message = core.review_knowledge_candidate(
+                            job["job_id"], cid, "project_term")
+                        if ok:
+                            st.success(message)
+                            st.rerun()
+                        st.error(message)
+                    if c2.button(
+                            "仅本任务采用", key=f"knowledge_task_{job['job_id']}_{cid}",
+                            width="stretch"):
+                        _, ok, message = core.review_knowledge_candidate(
+                            job["job_id"], cid, "task_only")
+                        if ok:
+                            st.rerun()
+                        st.error(message)
+                    if c3.button(
+                            "拒绝", key=f"knowledge_reject_{job['job_id']}_{cid}",
+                            width="stretch"):
+                        _, ok, message = core.review_knowledge_candidate(
+                            job["job_id"], cid, "rejected")
+                        if ok:
+                            st.rerun()
+                        st.error(message)
+                    st.caption(
+                        "可复用术语库：当前运行时没有全局术语库存储，因此不提供此操作。"
+                        "项目术语会保存在本任务的术语版本中。")
+    if not any_pending:
+        st.info("当前没有待确认词条。通过审校的译文会在后续批次产生新的知识观察。")
+
+
 def _render_delivery_review_queue(
     job_id, state, target_lang, ai_provider, ai_model, api_key, style_rules,
 ):
@@ -2894,6 +3127,14 @@ if app_view == "library":
             if st.button("清空翻译记忆", disabled=not _tm_confirm, key="library_tm_clear"):
                 core.save_tm({})
                 st.rerun()
+    _render_knowledge_library(saved_jobs)
+    with st.expander("项目术语版本", expanded=False):
+        if saved_jobs:
+            for job in saved_jobs:
+                st.markdown(f"**{job['state'].get('filename', '?')}**")
+                _render_terminology_version(job["state"])
+        else:
+            st.caption("暂无项目术语版本。")
     st.stop()
 if app_view == "history":
     if not saved_jobs:
@@ -3105,8 +3346,9 @@ if active:
         bypassed = astate.get("quality_bypass")
         if frozen:
             box.success(f"术语表已冻结：版本 v{frozen.get('version')} "
-                        f"hash {str(frozen.get('glossary_hash', ''))[:12]}… "
-                       f"冻结时间 {frozen.get('frozen_at', '')}")
+                        f"冻结时间 {frozen.get('frozen_at', '')}")
+            with box.expander("高级诊断", expanded=False):
+                st.caption(f"术语版本内容指纹：{frozen.get('glossary_hash', '')}")
         elif bypassed:
             box.info("已选择跳过人工冻结：术语以 provisional 建议注入翻译。")
         else:
@@ -3215,7 +3457,7 @@ if active:
 # switch so delivery controls are not constructed while the academic surface
 # is active.
 workspace_surface = st.radio(
-    "当前工作区", ["资产与交付", "实践报告"], horizontal=True,
+    "当前工作区", ["资产与交付", "文档上下文", "实践报告"], horizontal=True,
     key="workspace_surface")
 
 
@@ -3702,5 +3944,11 @@ def _render_academic_surface():
 
 if workspace_surface == "资产与交付":
     _render_delivery_surface()
+elif workspace_surface == "文档上下文":
+    if active:
+        _render_context_surface(active, core.load_job_state(active) or {})
+    else:
+        st.header("文档上下文")
+        st.info("请先打开一个当前任务，或从历史任务中选择任务。")
 else:
     _render_academic_surface()

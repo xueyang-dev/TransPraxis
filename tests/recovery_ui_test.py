@@ -52,7 +52,8 @@ def test_recovery_ui():
         assert summary["completed_batch_count"] == 1
         assert summary["total_batches"] == 2
         assert summary["current_batch"] == {
-            "number": 2, "completed_segments": 0,
+            "number": 2, "start_segment": 2, "end_segment": 3,
+            "completed_segments": 0,
             "segment_count": 2, "regenerate_segments": 2,
         }
         assert summary["can_resume"] and summary["recovered_tm_entries"] == 2
