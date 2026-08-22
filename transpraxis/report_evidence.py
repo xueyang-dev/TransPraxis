@@ -60,12 +60,13 @@ def build_segment_evidence(state: Dict[str, Any], job_id: str,
         },
         "deterministic_findings": [
             {k: f.get(k) for k in ("severity", "reason", "type", "entry_id",
-                                   "resolved")}
+                                   "kind", "detected_text", "resolved")}
             for f in seg_findings if f.get("type") == "check"
         ],
         "review_findings": [
             {k: f.get(k) for k in ("severity", "reason", "type",
-                                   "suggested_target", "resolved")}
+                                   "suggested_target", "evidence_refs",
+                                   "review_event_id", "resolved")}
             for f in seg_findings if f.get("type") == "review"
         ],
         "repair_history": [
@@ -74,7 +75,7 @@ def build_segment_evidence(state: Dict[str, Any], job_id: str,
             for f in seg_findings
             if f.get("suggested_target") or (
                 f.get("resolved") and f.get("resolution", {}).get("action")
-                in {"human_fixed", "retranslated", "system_fixed",
+                in {"human_fixed", "preserved", "retranslated", "system_fixed",
                     "system_alignment_fixed"})
         ],
         "human_actions": human_actions,

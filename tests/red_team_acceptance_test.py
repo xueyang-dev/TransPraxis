@@ -396,7 +396,78 @@ def test_finding_identity_and_independent_resolution():
     # 相同 issue 不同 wording -> 不同 ID，旧 resolution 不错误作用于新问题
     f1_rewrite = dict(f1, reason="占位符未保留")
     assert delivery.finding_id(f1_rewrite) != id1
-    print("  ✓ finding identity：稳定 ID + 独立 resolution + 不跨 wording 绑定")
+    f1_unresolved = {"segment_index": 0, "severity": "blocking", "type": "check",
+                     "reason": "占位符丢失"}
+    duplicate = dict(f1_unresolved, severity="actionable")
+    unresolved = delivery.unresolved_findings({
+        "findings": [duplicate, f1_unresolved, f2],
+    })
+    unresolved_ids = [delivery.finding_id(f) for f in unresolved]
+    assert unresolved_ids == [id1, id2]
+    assert unresolved[0]["severity"] == "blocking", \
+        "同一 finding 去重时必须保留 blocking 门禁"
+    print("  ✓ finding identity：稳定 ID + 独立 resolution + 重复 finding 去重")
+
+
+def test_review_queue_context_and_actions():
+    same_event = {
+        "segment_index": 0, "type": "check", "severity": "actionable",
+        "kind": "source_residue",
+        "reason": "疑似残留源语片段「Gayatri Chakravorty」",
+        "review_event_id": "event-1",
+        "evidence_refs": ["E1"],
+    }
+    duplicate = dict(same_event, evidence_refs=["E2"])
+    other_event = dict(same_event, review_event_id="event-2",
+                       evidence_refs=["E3"])
+    blocking = {"segment_index": 1, "type": "check", "severity": "blocking",
+                "reason": "占位符丢失"}
+    state = core.new_job_state("review-queue.pdf")
+    state.update(
+        p1_done=True, p2_done=True, has_blocking=True,
+        pairs=[{"source": "Gayatri Chakravorty", "target": "Gayatri Chakravorty"},
+               {"source": "src-2", "target": "tgt-2"}],
+        findings=[same_event, duplicate, other_event, blocking],
+        review_evidence=[{
+            "phase": "formal_review", "review_event_id": "event-1",
+            "segment_ids": [0], "decision": "findings", "evidence_ids": ["E1", "E2"],
+        }],
+        delivery_status="review_required")
+    queue = delivery.review_queue_findings(state)
+    assert len(queue) == 3, "同事件重复记录应合并，不同事件和不同问题必须保留"
+    normalized = delivery.normalize_state_findings(dict(state))
+    assert len(normalized["findings"]) == 3, "同一审校实例应在状态层归并"
+    merged = next(x for x in queue if x.get("review_event_id") == "event-1")
+    assert merged["duplicate_count"] == 2
+    assert merged["evidence_refs"] == ["E1", "E2"]
+    assert len({delivery.finding_id(x) for x in queue}) == len(queue)
+    context = delivery.finding_context(state, merged)
+    assert context["segment_number"] == 1
+    assert context["source"] == "Gayatri Chakravorty"
+    assert context["proper_noun_candidate"] is True
+    assert context["review_evidence"][0]["evidence_ids"] == ["E1", "E2"]
+    info_name = dict(same_event, severity="informational", reason="疑似残留源语片段「Mellon」")
+    info_context = delivery.finding_context(state, info_name)
+    assert info_context["severity_label"] == "仅供参考"
+    assert info_context["proper_noun_candidate"] is True, \
+        "informational 专名也必须可确认有意保留"
+    assert delivery.severity_label("blocking") == "必须处理"
+    assert delivery.severity_label("actionable") == "建议检查"
+    assert delivery.severity_label("informational") == "仅供参考"
+
+    state, marked = delivery.mark_findings(
+        state, [delivery.finding_id(merged)], "preserved", "确认保留专名")
+    assert marked and any(x.get("action") == "preserved"
+                          for x in state["human_actions"])
+    assert delivery.compute_delivery_status(state) == "review_required", \
+        "blocking 未解决时确认保留 actionable 不得放开交付"
+    final_state = dict(state, delivery_status="final")
+    assert delivery.compute_delivery_status(final_state) == "review_required", \
+        "残留 blocking 时显式 final 也不得绕过交付门禁"
+    state, _ = delivery.mark_findings(
+        state, [delivery.finding_id(blocking)], "human_fixed", "已修复")
+    assert delivery.compute_delivery_status(state) == "draft"
+    print("  ✓ review queue：同事件合并证据、独立事件分离、上下文、专名保留、状态门禁")
 
 
 # ================= TM 污染矩阵 =================
@@ -854,6 +925,7 @@ if __name__ == "__main__":
         test_freeze_idempotent_same_content,
         test_migration_cases_and_idempotence,
         test_finding_identity_and_independent_resolution,
+        test_review_queue_context_and_actions,
         test_tm_contamination_matrix,
         test_hostile_xml_and_json_assets,
         test_manifest_asset_consistency,

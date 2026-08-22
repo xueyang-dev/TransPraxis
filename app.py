@@ -1952,6 +1952,239 @@ def _asset_prefix(state):
     return "final_" if state.get("delivery_status") == "final" else "draft_"
 
 
+def _review_sort_key(context):
+    return (
+        _delivery.SEVERITY_ORDER.get(context.get("severity"), 99),
+        context.get("segment_index") if context.get("segment_index") is not None else 10**9,
+        context.get("finding_id") or "",
+    )
+
+
+def _review_phase_label(phase):
+    return {
+        "formal_review": "正式审校",
+        "shadow_repair": "自动修订复核",
+        "suggested_shadow_review": "建议译文复核",
+    }.get(phase, phase or "审校记录")
+
+
+def _render_finding_evidence(context):
+    refs = context.get("evidence_refs") or []
+    traces = context.get("review_evidence") or []
+    if refs:
+        st.caption("该问题引用的证据：" + "、".join(refs))
+    if not traces:
+        st.caption("暂无额外证据请求；以上原文与译文来自任务本地记录。")
+        return
+    with st.expander("审校 / 证据详情", expanded=False):
+        for trace in traces[-3:]:
+            status = (trace.get("completion_receipt") or {}).get("status") or "-"
+            evidence_ids = "、".join(trace.get("evidence_ids") or []) or "无"
+            st.caption(
+                f"{_review_phase_label(trace.get('phase'))} · "
+                f"结论 {trace.get('decision') or '-'} · 状态 {status} · "
+                f"证据 {evidence_ids}")
+            for request in (trace.get("requests") or [])[:4]:
+                tool = request.get("tool") or "evidence"
+                evidence_id = request.get("evidence_id") or "-"
+                arguments = request.get("arguments") or {}
+                st.caption(f"{evidence_id} · {tool} · {arguments}")
+
+
+def _format_saved_at(value):
+    if not value:
+        return "尚无保存记录"
+    return str(value).replace("T", " ")[:19]
+
+
+def _render_recovery_panel(job_id, state):
+    summary = core.recovery_summary(job_id, state)
+    status = core.task_status_label(state)
+    with st.container(border=True):
+        st.subheader("任务状态与自动保存")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("当前状态", status)
+        batch_count = (f"{summary['completed_batch_count']}/{summary['total_batches']}"
+                       if summary["total_batches"] else "—")
+        c2.metric("已完成处理批次", batch_count)
+        c3.metric("自动保存", "已开启")
+        st.caption(f"最近保存进度：{_format_saved_at(summary['last_saved_at'])} · "
+                   f"最近完成阶段：{summary['last_completed_stage']}")
+        current = summary.get("current_batch")
+        if current:
+            st.warning(
+                f"第 {current['number']} 个处理批次中断：已保存本批次 "
+                f"{current['completed_segments']}/{current['segment_count']} 段。"
+                f"继续时会重新执行本批次剩余内容（最多重新执行 "
+                f"{current['regenerate_segments']} 段），此前已保存的批次不会重做。")
+        if summary["recovered_tm_entries"]:
+            st.info(f"已从上次中断中恢复 {summary['recovered_tm_entries']} 条翻译记忆同步记录。")
+        if summary["can_resume"] and st.button(
+                "从断点继续", type="primary", key=f"resume_workspace_{job_id}",
+                width="stretch"):
+            st.session_state.update(
+                active_job_id=job_id, app_view="workspace", workspace_mode=True,
+                pending_continue_job=job_id)
+            st.rerun()
+
+
+def _render_delivery_review_queue(
+    job_id, state, target_lang, ai_provider, ai_model, api_key, style_rules,
+):
+    """Render the human review queue; delivery state changes stay in core.py."""
+    findings = _delivery.review_queue_findings(state)
+    contexts = sorted(
+        [_delivery.finding_context(state, finding) for finding in findings],
+        key=_review_sort_key)
+    st.divider()
+    st.subheader("人工审查队列")
+    if not contexts:
+        st.success("当前没有待处理发现；可以继续准备交付资产。")
+        return
+
+    counts = {severity: sum(1 for x in contexts if x["severity"] == severity)
+              for severity in _delivery.SEVERITY_LABELS}
+    st.caption(
+        f"共 {len(contexts)} 个待审问题 · "
+        f"必须处理 {counts['blocking']} · 建议检查 {counts['actionable']} · "
+        f"仅供参考 {counts['informational']}。先处理必须处理项；相同审校事件的重复记录已合并，"
+        "不同审校事件会分别保留。")
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("待审", len(contexts))
+    metric_cols[1].metric("必须处理", counts["blocking"])
+    metric_cols[2].metric("建议检查", counts["actionable"])
+    metric_cols[3].metric("仅供参考", counts["informational"])
+
+    filter_options = ["必须处理", "全部", "建议检查", "仅供参考"]
+    default_filter = "必须处理" if counts["blocking"] else "全部"
+    filter_label = st.radio(
+        "筛选发现", filter_options,
+        index=filter_options.index(default_filter), horizontal=True,
+        key=f"fd_filter_{job_id}")
+    selected_severity = {
+        "必须处理": "blocking", "建议检查": "actionable", "仅供参考": "informational",
+    }.get(filter_label)
+    visible = [x for x in contexts
+               if selected_severity is None or x["severity"] == selected_severity]
+    st.caption(f"当前显示 {len(visible)} 项；展开单项可查看原文、译文和审校证据。")
+
+    selectable = [x for x in contexts if x["severity"] in ("blocking", "actionable")
+                  or x["proper_noun_candidate"]]
+    for ordinal, context in enumerate(visible):
+        fid = context["finding_id"]
+        interactive = context in selectable
+        if interactive:
+            st.checkbox(
+                "选择此问题",
+                key=f"fd_select_{job_id}_{fid}",
+                help="选择后可在队列底部批量标记或重新翻译。")
+        title = (
+            f"第 {context['segment_number']} 段 · {context['severity_label']} · "
+            f"{context['reason'][:100]}")
+        if context["duplicate_count"] > 1:
+            title += f" · 已合并 {context['duplicate_count']} 条重复记录"
+        with st.expander(title, expanded=(ordinal == 0 and context["severity"] == "blocking")):
+            st.caption(f"问题编号（调试/证据追踪）：{fid}")
+            if context["detected_text"]:
+                st.markdown("**检测到的文本**")
+                st.code(context["detected_text"])
+            source_col, target_col = st.columns(2)
+            with source_col:
+                st.markdown("**原文**")
+                st.code(context["source"] or "（未找到对应段落）")
+            with target_col:
+                st.markdown("**当前译文**")
+                st.code(context["target"] or "（未找到当前译文）")
+            if context["initial_target"] and context["initial_target"] != context["target"]:
+                st.caption("初译（当前译文之前）：")
+                st.code(context["initial_target"])
+            st.markdown(f"**问题说明**：{context['reason']}")
+            if context["proper_noun_candidate"]:
+                st.info(
+                    "检测到的源语片段可能是人名、机构名或作品名。若确认这是有意保留，"
+                    "可选择该问题并使用“确认保留专名”，不会强制重新翻译。")
+            _render_finding_evidence(context)
+
+    selected = [
+        context for context in selectable
+        if st.session_state.get(f"fd_select_{job_id}_{context['finding_id']}", False)
+    ]
+    selected_ids = [context["finding_id"] for context in selected]
+    selected_segments = sorted({
+        context["segment_index"] for context in selected
+        if context["severity"] in ("blocking", "actionable")
+        and isinstance(context["segment_index"], int)
+    })
+    preserve_ids = [
+        context["finding_id"] for context in selected
+        if context["proper_noun_candidate"]
+    ]
+    st.divider()
+    st.caption(
+        f"已选择 {len(selected)} 个问题 / {len(selected_segments)} 个段落。"
+        "批量重新翻译按段落执行，同一段的多个问题会一起复验。")
+    note = st.text_input("处理说明（可选）", key=f"fd_note_{job_id}")
+    action_cols = st.columns(4)
+    if action_cols[0].button(
+            "标记选中为人工已处理", disabled=not selected_ids,
+            key=f"fd_fix_{job_id}", width="stretch"):
+        core.mark_findings_resolved(
+            job_id, selected_ids, "human_fixed", note or "人工核对后确认已处理")
+        st.rerun()
+    if action_cols[1].button(
+            "重新翻译选中段落", disabled=not selected_segments or not api_key,
+            key=f"fd_retranslate_{job_id}", width="stretch"):
+        core.retranslate_segments(
+            job_id, selected_segments, ai_provider, api_key, ai_model,
+            target_lang, style_rules=style_rules,
+            on_caption=lambda text: st.caption(text))
+        st.rerun()
+    if action_cols[2].button(
+            "确认保留选中专名", disabled=not preserve_ids,
+            key=f"fd_preserve_{job_id}", width="stretch"):
+        core.mark_findings_resolved(
+            job_id, preserve_ids, "preserved",
+            note or "用户确认该源语片段为有意保留的专名")
+        st.rerun()
+    if action_cols[3].button(
+            "清除选择", disabled=not selected,
+            key=f"fd_clear_{job_id}", width="stretch"):
+        for context in selectable:
+            st.session_state.pop(f"fd_select_{job_id}_{context['finding_id']}", None)
+        st.rerun()
+    if selected_segments and not api_key:
+        st.warning("重新翻译需要先在设置中配置 API Key；人工处理和确认保留仍可使用。")
+
+
+def _render_delivery_gate(job_id, state, dstatus):
+    st.divider()
+    st.subheader("最终交付")
+    blockers = _delivery.unresolved_blocking(state)
+    actions = _delivery.unresolved_findings(state)
+    if blockers:
+        st.warning(f"仍有 {len(blockers)} 个必须处理问题；未处理或未明确接受风险前不能最终交付。")
+        confirm = st.checkbox(
+            "我已检查这些必须处理问题，并确认接受剩余风险",
+            key=f"fd_accept_confirm_{job_id}")
+        note = st.text_input("接受风险说明", key=f"fd_accept_note_{job_id}")
+        if st.button(
+                "接受必须处理风险并进入最终交付",
+                disabled=not confirm, key=f"fd_accept_{job_id}", width="stretch"):
+            core.approve_delivery(
+                job_id, note or "人工确认并接受剩余 blocking 风险", accept_blocking=True)
+            st.rerun()
+    elif dstatus == "final":
+        st.success("已进入最终交付；后续重新翻译会自动撤销本次交付确认。")
+        return
+    else:
+        if actions:
+            st.info(f"还有 {len(actions)} 个建议检查/参考项；它们不阻止最终交付。")
+        note = st.text_input("最终交付说明（可选）", key=f"fd_final_note_{job_id}")
+        if st.button("确认进入最终交付", key=f"fd_final_{job_id}", width="stretch"):
+            core.approve_delivery(job_id, note or "人工确认交付")
+            st.rerun()
+
+
 # ================= 可视化辅助（证据链流程 / 术语状态） =================
 def _chain_flow(stages):
     """横向流程卡片。"""
@@ -2586,7 +2819,7 @@ with setup_placeholder.container():
                 back_step=3, next_label="开始任务", run=True,
                 next_disabled=not can_start)
 
-    elif app_view == "workspace" or workspace_mode:
+    elif app_view == "workspace":
         # If a processing loop is about to resume (pending_continue_job), skip the
         # static pipeline rendering — the processing loop below handles progress UI.
         will_process = bool(st.session_state.get("pending_continue_job"))
@@ -2594,6 +2827,8 @@ with setup_placeholder.container():
             _page_title("任务工作区", "任务进度、质量状态与交付资产")
             active_state = core.load_job_state(st.session_state.get("active_job_id")) \
             if st.session_state.get("active_job_id") else None
+            if active_state and st.session_state.get("active_job_id"):
+                _render_recovery_panel(st.session_state["active_job_id"], active_state)
             stage_label = core.progress_label(active_state) if active_state else "等待任务开始"
             done_profile = bool(active_state and active_state.get("p1_done"))
             done_translation = bool(active_state and active_state.get("p2_done"))
@@ -2635,7 +2870,7 @@ with setup_placeholder.container():
                         "REVIEW_REQUIRED": "待审校处理", "FINAL": "已交付",
                     }
                     _raw = active_state.get("stage") or "PREPARE"
-                    st.caption(f"当前阶段：{_stage_map.get(_raw, _raw)}")
+                    st.caption(f"当前阶段：{_stage_map.get(_raw, '处理中')}")
                 else:
                     st.caption("从“新建任务”开始，或在“历史任务”中继续已有任务。")
     elif app_view == "history":
@@ -2668,12 +2903,31 @@ if app_view == "history":
             with st.container(key=f"history_item_{job['job_id']}"):
                 hc1, hc2 = st.columns([4, 1])
                 filename = escape(str(job["state"].get("filename", "?")))
-                progress = escape(core.progress_label(job["state"]))
+                status = escape(core.task_status_label(job["state"]))
+                recovery = core.recovery_summary(job["job_id"], job["state"])
                 hc1.markdown(f'<div class="tp-history-copy"><strong>{filename}</strong>'
-                             f'<span>{progress}</span></div>', unsafe_allow_html=True)
+                             f'<span>{status}</span></div>', unsafe_allow_html=True)
                 if hc2.button("打开", key=f"open_history_{job['job_id']}", width="stretch"):
                     st.session_state.update(active_job_id=job["job_id"], app_view="workspace",
                                             workspace_mode=True)
+                    st.rerun()
+                st.caption(
+                    f"自动保存已开启 · 最近保存进度 {_format_saved_at(recovery['last_saved_at'])} · "
+                    f"已完成 {recovery['completed_batch_count']}/{recovery['total_batches']} 个处理批次")
+                if recovery.get("current_batch"):
+                    current = recovery["current_batch"]
+                    st.warning(
+                        f"第 {current['number']} 个处理批次中断，已保存到本批次 "
+                        f"{current['completed_segments']}/{current['segment_count']} 段；"
+                        "继续时只会重新执行未完成批次。")
+                if recovery.get("recovered_tm_entries"):
+                    st.caption(f"已恢复 {recovery['recovered_tm_entries']} 条翻译记忆同步记录。")
+                if recovery.get("can_resume") and st.button(
+                        "从断点继续", type="primary", key=f"resume_history_{job['job_id']}",
+                        width="stretch"):
+                    st.session_state.update(
+                        active_job_id=job["job_id"], app_view="workspace",
+                        workspace_mode=True, pending_continue_job=job["job_id"])
                     st.rerun()
     st.stop()
 if app_view == "new" and not workspace_mode and not run_clicked:
@@ -2799,7 +3053,7 @@ if tasks:
                             state="complete")
                     elif state.get("has_blocking"):
                         status.update(
-                            label=f"{filename} 流程完成，但有 blocking 问题待确认（见资产面板审查报告）",
+                            label=f"{filename} 流程完成，但有必须处理问题待确认（见资产面板审查报告）",
                             state="complete")
                     else:
                         status.update(
@@ -2957,10 +3211,15 @@ if active:
                        "或选择跳过冻结（快速模式）。")
 
 # ================= 动态渲染过程资产面板（基于磁盘任务，刷新后仍可用）=================
-tab_delivery, tab_academic = st.tabs(
-    ["资产与交付", "实践报告"], key="main_tabs")
+# Streamlit tabs execute both bodies on every rerun.  Use an explicit surface
+# switch so delivery controls are not constructed while the academic surface
+# is active.
+workspace_surface = st.radio(
+    "当前工作区", ["资产与交付", "实践报告"], horizontal=True,
+    key="workspace_surface")
 
-with tab_delivery:
+
+def _render_delivery_surface():
     st.header("项目过程资产")
     with st.expander("翻译记忆（全局复用）", expanded=False):
         _tm = core.load_tm()
@@ -2989,10 +3248,11 @@ with tab_delivery:
                 st.success("交付状态：最终交付（final）")
             elif dstatus == "review_required":
                 st.warning(f"交付状态：{core.delivery_status_label(state)}"
-                           "（存在 blocking，未最终交付）")
+                           "（存在必须处理问题，未最终交付）")
             else:
                 st.caption(f"交付状态：{core.delivery_status_label(state)}"
                            "（当前为 draft 资产，尚未最终交付）")
+            st.subheader("过程资产")
             col_d1, col_d2, col_d3, col_d4 = st.columns(4)
 
             with col_d1:
@@ -3041,9 +3301,14 @@ with tab_delivery:
                 stats = state.get("review_stats") or {}
                 st.caption(
                     f"审校：{stats.get('reviewed_segments', 0)} 段通过 · "
-                    f"blocking {stats.get('blocking', 0)} · actionable {stats.get('actionable', 0)} · "
-                    f"informational {stats.get('informational', 0)} · "
+                    f"必须处理 {stats.get('blocking', 0)} · 建议检查 {stats.get('actionable', 0)} · "
+                    f"仅供参考 {stats.get('informational', 0)} · "
                     f"记忆复用 {state.get('tm_used_count', 0)} 段")
+                _render_delivery_review_queue(
+                    job["job_id"], state, target_lang, ai_provider, ai_model,
+                    api_key, style_rules)
+                _render_delivery_gate(job["job_id"], state, dstatus)
+                st.subheader("交付资产")
                 exported = _assets.export_all(
                     state, job["job_id"], target_lang, ai_provider, ai_model,
                     source_filename=filename)
@@ -3069,40 +3334,6 @@ with tab_delivery:
                     _report_evidence.export_segment_evidence_jsonl(state, job["job_id"]).encode("utf-8"),
                     file_name=f"{_asset_prefix(state)}segment_evidence_{filename}.jsonl",
                     mime="application/x-jsonlines", key=f"ev_{job['job_id']}", width="stretch")
-
-                unresolved = _delivery.unresolved_findings(state)
-                if dstatus == "review_required" and unresolved:
-                    chosen = []
-                    for finding in unresolved:
-                        fid = _delivery.finding_id(finding)
-                        label = (f"`{fid}` 段 {finding.get('segment_index', -1) + 1} "
-                                 f"[{finding.get('severity')}] {finding.get('reason')}")
-                        if st.checkbox(label, key=f"fd_{job['job_id']}_{fid}"):
-                            chosen.append(fid)
-                    note = st.text_input("处理说明", key=f"fdnote_{job['job_id']}")
-                    dc1, dc2, dc3 = st.columns(3)
-                    if dc1.button("标记已人工修复", disabled=not chosen,
-                                  key=f"fdfix_{job['job_id']}", width="stretch"):
-                        core.mark_findings_resolved(job["job_id"], chosen, "human_fixed", note or "人工修复")
-                        st.rerun()
-                    if dc2.button("重新翻译选中段落", disabled=not chosen,
-                                  key=f"fdrt_{job['job_id']}", width="stretch"):
-                        idxs = sorted({finding.get("segment_index") for finding in unresolved
-                                       if _delivery.finding_id(finding) in chosen
-                                       and isinstance(finding.get("segment_index"), int)})
-                        core.retranslate_segments(
-                            job["job_id"], idxs, ai_provider, api_key, ai_model,
-                            target_lang, style_rules=style_rules,
-                            on_caption=lambda text: st.caption(text))
-                        st.rerun()
-                    if dc3.button("接受风险并进入 final", key=f"fdacc_{job['job_id']}", width="stretch"):
-                        core.approve_delivery(job["job_id"], note or "接受风险", accept_blocking=True)
-                        st.rerun()
-                elif dstatus != "final":
-                    note2 = st.text_input("交付说明（可选）", key=f"fdn_{job['job_id']}")
-                    if st.button("确认交付 (final)", key=f"fdok_{job['job_id']}"):
-                        core.approve_delivery(job["job_id"], note2 or "人工确认交付")
-                        st.rerun()
                 if state.get("human_actions"):
                     with st.expander("人工处理记录"):
                         for action in state["human_actions"][-20:]:
@@ -3163,7 +3394,7 @@ with tab_delivery:
                         st.session_state.pop(del_key, None)
                         st.rerun()
 
-with tab_academic:
+def _render_academic_surface():
     st.header("学术写作工作区")
     if not saved_jobs_after:
         st.caption("暂无本地任务。上传文件并开始处理后，学术写作工作区会显示在这里。")
@@ -3467,3 +3698,9 @@ with tab_academic:
                         file_name=f"academic-evidence-warnings_{filename}.md",
                         mime="text/markdown", key=f"academic_warn_{job['job_id']}",
                                    width="stretch")
+
+
+if workspace_surface == "资产与交付":
+    _render_delivery_surface()
+else:
+    _render_academic_surface()

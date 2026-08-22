@@ -812,6 +812,7 @@ def check_translation_batch(sources, targets, glossary, target_lang,
                                  "reason": f"保留项 {kind}「{token}」在译文中丢失"})
         for residual, sev in find_residuals(src, tgt, target_lang):
             findings.append({"segment_index": i, "type": "check", "severity": sev,
+                             "kind": "source_residue", "detected_text": residual,
                              "reason": f"疑似残留源语片段「{residual}」"})
         findings.extend(check_glossary_compliance(
             src, tgt, glossary, segment_id=i, section_profile=section_profile))
@@ -1610,6 +1611,10 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                     batch_sources, batch_targets, glossary_text, style_rules, target_lang,
                     provider, api_key, model, evidence_index, call_llm=call_llm,
                     segment_ids=list(range(offset, offset + len(batch_pairs))))
+            review_event_id = (
+                f"translation-review-{job_id}-{bi}-formal-"
+                f"{len(state.get('review_evidence') or [])}")
+            review_trace["review_event_id"] = review_event_id
             state.setdefault("review_evidence", []).append({
                 "batch": bi, "phase": "formal_review", **review_trace,
             })
@@ -1639,6 +1644,7 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                         "severity": sev, "type": "review",
                         "reason": str(rf.get("reason") or "审校发现问题"),
                         "evidence_refs": list(rf.get("evidence_refs") or []),
+                        "review_event_id": review_event_id,
                     }
                     if sev == "actionable" and rf.get("suggested_target") \
                             and not batch_pairs[idx]["from_tm"]:
@@ -2183,11 +2189,14 @@ def load_job_state(job_id):
         raw = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
-    return _state_migration.migrate_state(raw)
+    from transpraxis import delivery as _delivery
+    return _delivery.normalize_state_findings(_state_migration.migrate_state(raw))
 
 
 def save_job_state(job_id, state):
     """原子写入（先写临时文件再替换），避免中断写坏 state.json。"""
+    from transpraxis import delivery as _delivery
+    _delivery.normalize_state_findings(state)
     d = job_dir(job_id)
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / "state.json.tmp"
@@ -2205,6 +2214,8 @@ def list_jobs():
                 s = json.loads(sp.read_text(encoding="utf-8"))
             except Exception:
                 continue
+            from transpraxis import delivery as _delivery
+            s = _delivery.normalize_state_findings(_state_migration.migrate_state(s))
             jobs.append({"job_id": d.name, "state": s})
     return jobs
 
@@ -2249,6 +2260,40 @@ def progress_label(state):
         return "报告生成中"
     if state.get("p1_done"):
         return "翻译中"
+    return "待处理"
+
+
+def recovery_summary(job_id, state=None):
+    """Read-only durable progress summary used by History and the workspace."""
+    state = state if state is not None else load_job_state(job_id)
+    return _checkpoint.recovery_summary(job_dir(job_id), state or {})
+
+
+def task_status_label(state):
+    """User-facing task status derived from persisted workflow state."""
+    from transpraxis import delivery as _delivery
+
+    if state.get("delivery_status") == "final":
+        return "已交付"
+    if state.get("p2_done") and _delivery.unresolved_blocking(state):
+        return "待审校"
+    academic = state.get("academic_state") or {}
+    if state.get("p2_done") and state.get("p3_done") and (
+            academic.get("quality_status") in ("review_required", "fail", "failed")
+            or academic.get("status") == "failed"):
+        return "待学术复核"
+    if state.get("p2_done") and (
+            state.get("p3_done") or not state.get("report_enabled", True)):
+        return "可交付"
+    if state.get("p1_done") and not state.get("p2_done"):
+        if (state.get("stage") == "TERMS_PREPARED" and state.get("quality_mode")
+                and state.get("glossary") is not None
+                and not state.get("glossary_frozen")
+                and not state.get("quality_bypass")):
+            return "待术语确认"
+        return "处理中断"
+    if state.get("p2_done") and not state.get("p3_done"):
+        return "处理中断"
     return "待处理"
 
 

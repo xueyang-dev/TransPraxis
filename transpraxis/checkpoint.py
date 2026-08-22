@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -41,6 +42,96 @@ def read_events(job_root: Path) -> List[Dict[str, Any]]:
     except OSError:
         return []
     return events
+
+
+def recovery_summary(job_root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarize durable progress for the UI without changing resume semantics."""
+    root = Path(job_root)
+    events = read_events(root)
+    started: Dict[int, Dict[str, Any]] = {}
+    committed = set()
+    last_completed_stage = "尚未开始"
+    phase_labels = {
+        "generation_done": "批次翻译完成",
+        "deterministic_qa_done": "自动质量检查完成",
+        "semantic_review_done": "独立审校完成",
+        "semantic_review_skipped": "独立审校已跳过",
+        "knowledge_feedback_done": "知识反馈完成",
+        "state_commit_done": "进度已保存",
+        "tm_promotion_done": "翻译记忆已同步",
+    }
+    for event in events:
+        batch = event.get("batch")
+        if isinstance(batch, int) and batch >= 0:
+            if event.get("phase") == "generation_started":
+                started[batch] = event
+            elif event.get("phase") == "state_commit_done":
+                committed.add(batch)
+        label = phase_labels.get(event.get("phase"))
+        if label:
+            last_completed_stage = label
+
+    all_batches = set(started) | committed
+    total_batches = max(all_batches) + 1 if all_batches else 0
+    completed_batches = sorted(committed)
+    reviewed_batches = int((state.get("review_stats") or {}).get("batches_reviewed") or 0)
+    if reviewed_batches:
+        total_batches = max(total_batches, reviewed_batches)
+    pairs = state.get("pairs") or []
+    current = None
+    for batch in sorted(started):
+        event = started[batch]
+        offset = event.get("offset")
+        segment_count = event.get("segment_count")
+        if not isinstance(offset, int) or not isinstance(segment_count, int):
+            continue
+        saved_in_batch = max(0, min(segment_count, len(pairs) - offset))
+        if batch not in committed or saved_in_batch < segment_count:
+            current = {
+                "number": batch + 1,
+                "completed_segments": saved_in_batch,
+                "segment_count": segment_count,
+                "regenerate_segments": segment_count - saved_in_batch,
+            }
+            break
+
+    durable_times = []
+    for name in ("state.json", EVENTS_FILE):
+        try:
+            durable_times.append((root / name).stat().st_mtime)
+        except OSError:
+            pass
+    last_saved_at = None
+    if durable_times:
+        last_saved_at = datetime.fromtimestamp(max(durable_times)).astimezone().isoformat(
+            timespec="seconds")
+
+    stage = str(state.get("stage") or "")
+    if last_completed_stage == "尚未开始":
+        last_completed_stage = {
+            "TERMS_PREPARED": "术语准备完成",
+            "GLOSSARY_FROZEN": "术语已确认",
+            "TRANSLATING": "术语已确认",
+            "TRANSLATED": "批次翻译完成",
+            "REVIEW_REQUIRED": "独立审校完成",
+            "FINAL": "交付已确认",
+        }.get(stage, last_completed_stage)
+    can_resume = bool(current) or (
+        bool(state.get("p1_done")) and not state.get("p2_done")
+        and stage in {"GLOSSARY_FROZEN", "TRANSLATING"}
+    )
+    return {
+        "auto_save_enabled": True,
+        "last_saved_at": last_saved_at,
+        "completed_batches": completed_batches,
+        "completed_batch_count": max(len(completed_batches), reviewed_batches),
+        "total_batches": total_batches,
+        "current_batch": current,
+        "can_resume": can_resume,
+        "last_completed_stage": last_completed_stage,
+        "recovered_tm_entries": int(state.get("tm_recovered_count") or 0),
+        "event_count": len(events),
+    }
 
 
 def _eligible(source: str, target: str) -> bool:
