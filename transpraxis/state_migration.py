@@ -54,6 +54,8 @@ def _default_new_fields() -> Dict[str, Any]:
         "delivery_manifest": {},
         "delivery_approved_by_human": False,
         "delivery_approval": None,
+        "delivery_snapshots": [],
+        "latest_delivery_snapshot_version": None,
         "exported_assets": [],
         "quality_mode": False,
         "quality_bypass": False,
@@ -132,7 +134,10 @@ def migrate_state(state: Any) -> Dict[str, Any]:
     if out.get("auto_term_entries") == {}:
         out["auto_term_entries"] = []
 
-    out["stage"] = derive_stage(out)
+    # An explicitly approved delivery is a durable milestone, not a value to
+    # recompute from the mutable processing flags on reload.
+    out["stage"] = "FINAL" if out.get("delivery_status") == "final" \
+        else derive_stage(out)
     # 只在不显式设置过交付状态时推导；显式 final/approved 不覆盖
     if out.get("delivery_status") not in ("approved", "final"):
         out["delivery_status"] = derive_delivery_status(out)

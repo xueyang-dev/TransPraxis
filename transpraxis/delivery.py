@@ -293,6 +293,8 @@ def approve_delivery(state: Dict[str, Any], note: str = "", actor: str = "user",
     - accept_blocking=True：把所有未解决 blocking 记录为 accepted_risk 后进入 final；
     - 全部人工处理记录保存到 state["human_actions"]。
     """
+    if not state.get("p2_done"):
+        return state, False, ["翻译尚未完成，不能创建最终交付版本"]
     blockers = unresolved_blocking(state)
     if blockers:
         if not accept_blocking:

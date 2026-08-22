@@ -1949,9 +1949,34 @@ def _render_profile_editor(job_id, state, box=None):
         elif not state.get("profile_done"):
             box.caption("画像未生成（AI 失败或已跳过），可在此人工填写后保存。")
 
-def _asset_prefix(state):
-    """draft/final 资产文件名前缀：非 final 一律明确标注 draft。"""
-    return "final_" if state.get("delivery_status") == "final" else "draft_"
+def _asset_prefix(state, snapshot_current=False):
+    """Only a currently matching frozen snapshot may use the final prefix."""
+    return "final_" if snapshot_current and state.get("delivery_status") == "final" else "draft_"
+
+
+def _render_snapshot_versions(job_id, state, location):
+    snapshots = core.list_delivery_snapshots(job_id)
+    if not snapshots:
+        return
+    filename = Path(str(state.get("filename") or "document")).stem or "document"
+    with st.expander("最终交付版本", expanded=False):
+        st.caption("历史版本来自已冻结文件，不会随当前工作版本变化。")
+        for snapshot in reversed(snapshots):
+            version = snapshot["snapshot_version"]
+            approval = snapshot.get("approval") or {}
+            st.markdown(f"**最终交付版本 v{version}** · 已冻结")
+            st.caption(
+                f"确认时间：{approval.get('timestamp') or snapshot.get('created_at') or '—'} · "
+                f"交付说明：{approval.get('note') or '—'} · "
+                f"资产：{len(snapshot.get('assets') or [])} 项")
+            archive = core.delivery_snapshot_archive(job_id, version)
+            if archive is not None:
+                st.download_button(
+                    f"下载最终交付版本 v{version}", archive,
+                    file_name=f"final_delivery_v{version}_{filename}.zip",
+                    mime="application/zip",
+                    key=f"snapshot_download_{location}_{job_id}_v{version}",
+                    width="stretch")
 
 
 def _review_sort_key(context):
@@ -2389,7 +2414,7 @@ def _render_delivery_review_queue(
         st.warning("重新翻译需要先在设置中配置 API Key；人工处理和确认保留仍可使用。")
 
 
-def _render_delivery_gate(job_id, state, dstatus):
+def _render_delivery_gate(job_id, state, dstatus, target_lang="", provider="", model=""):
     st.divider()
     st.subheader("最终交付")
     blockers = _delivery.unresolved_blocking(state)
@@ -2403,19 +2428,46 @@ def _render_delivery_gate(job_id, state, dstatus):
         if st.button(
                 "接受必须处理风险并进入最终交付",
                 disabled=not confirm, key=f"fd_accept_{job_id}", width="stretch"):
-            core.approve_delivery(
-                job_id, note or "人工确认并接受剩余 blocking 风险", accept_blocking=True)
-            st.rerun()
+            _, ok, errors = core.approve_delivery(
+                job_id, note or "人工确认并接受剩余 blocking 风险", accept_blocking=True,
+                target_lang=target_lang, provider=provider, model=model)
+            if ok:
+                st.rerun()
+            for error in errors:
+                st.error(error)
     elif dstatus == "final":
-        st.success("已进入最终交付；后续重新翻译会自动撤销本次交付确认。")
+        snapshot = core.delivery_snapshot_status(job_id, state)
+        if snapshot["current"]:
+            latest = snapshot["latest"]
+            st.success(
+                f"最终交付版本 v{latest['snapshot_version']} 已冻结；"
+                "后续工作版本变更不会修改该版本。")
+        else:
+            st.warning(
+                "当前任务虽有最终状态，但没有可用的冻结交付版本，或工作版本已有变更；"
+                "请重新确认以生成新的最终交付版本。")
+            note = st.text_input("交付说明（可选）", key=f"fd_reapprove_note_{job_id}")
+            if st.button("重新确认并冻结最终交付", key=f"fd_reapprove_{job_id}", width="stretch"):
+                _, ok, errors = core.approve_delivery(
+                    job_id, note or "重新确认最终交付", target_lang=target_lang,
+                    provider=provider, model=model)
+                if ok:
+                    st.rerun()
+                for error in errors:
+                    st.error(error)
         return
     else:
         if actions:
             st.info(f"还有 {len(actions)} 个建议检查/参考项；它们不阻止最终交付。")
         note = st.text_input("最终交付说明（可选）", key=f"fd_final_note_{job_id}")
         if st.button("确认进入最终交付", key=f"fd_final_{job_id}", width="stretch"):
-            core.approve_delivery(job_id, note or "人工确认交付")
-            st.rerun()
+            _, ok, errors = core.approve_delivery(
+                job_id, note or "人工确认交付", target_lang=target_lang,
+                provider=provider, model=model)
+            if ok:
+                st.rerun()
+            for error in errors:
+                st.error(error)
 
 
 # ================= 可视化辅助（证据链流程 / 术语状态） =================
@@ -3163,6 +3215,7 @@ if app_view == "history":
                         "继续时只会重新执行未完成批次。")
                 if recovery.get("recovered_tm_entries"):
                     st.caption(f"已恢复 {recovery['recovered_tm_entries']} 条翻译记忆同步记录。")
+                _render_snapshot_versions(job["job_id"], job["state"], "history")
                 if recovery.get("can_resume") and st.button(
                         "从断点继续", type="primary", key=f"resume_history_{job['job_id']}",
                         width="stretch"):
@@ -3486,49 +3539,74 @@ def _render_delivery_surface():
         is_active = job["job_id"] == st.session_state.get("active_job_id")
         with st.expander(f"资产与交付: {filename}", expanded=is_active):
             dstatus = state.get("delivery_status") or "draft"
-            if dstatus == "final":
-                st.success("交付状态：最终交付（final）")
+            snapshot_status = core.delivery_snapshot_status(job["job_id"], state)
+            latest_snapshot = snapshot_status["latest"]
+            snapshot_current = snapshot_status["current"]
+            frozen_assets = {}
+            if snapshot_current and latest_snapshot:
+                frozen_assets = core.delivery_snapshot_assets(
+                    job["job_id"], latest_snapshot["snapshot_version"])
+            asset_prefix = _asset_prefix(state, snapshot_current)
+            if dstatus == "final" and snapshot_current:
+                st.success(
+                    f"交付状态：最终交付版本 v{latest_snapshot['snapshot_version']}（已冻结）")
+            elif dstatus == "final":
+                st.warning(
+                    "当前任务虽有最终状态，但没有可用的冻结交付版本；"
+                    "请重新确认后生成最终交付版本。")
             elif dstatus == "review_required":
                 st.warning(f"交付状态：{core.delivery_status_label(state)}"
                            "（存在必须处理问题，未最终交付）")
             else:
                 st.caption(f"交付状态：{core.delivery_status_label(state)}"
                            "（当前为 draft 资产，尚未最终交付）")
+                if latest_snapshot:
+                    st.warning("当前工作版本已有变更；历史最终交付版本保持不变。")
+            _render_snapshot_versions(job["job_id"], state, "assets")
             st.subheader("过程资产")
             col_d1, col_d2, col_d3, col_d4 = st.columns(4)
 
             with col_d1:
                 if state.get("p1_done") and state.get("paras"):
+                    data = frozen_assets.get("stage1_cleaned.docx") \
+                        if snapshot_current else core.paragraphs_to_word(state["paras"])
                     st.download_button(
  "1. 洗净后原文",
-                        core.paragraphs_to_word(state["paras"]),
-                        file_name=f"{_asset_prefix(state)}阶段1_清洗原文_{filename}.docx",
+                        data,
+                        file_name=f"{asset_prefix}阶段1_清洗原文_{filename}.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
  key=f"d1_{job['job_id']}", width="stretch")
             with col_d2:
                 if state.get("auto_terms"):
+                    data = frozen_assets.get("auto_terms.xlsx") \
+                        if snapshot_current else core.dict_to_excel(state["auto_terms"])
                     st.download_button(
  "1.5 提取术语库",
-                        core.dict_to_excel(state["auto_terms"]),
-                        file_name=f"{_asset_prefix(state)}自动抽词库_{filename}.xlsx",
+                        data,
+                        file_name=f"{asset_prefix}自动抽词库_{filename}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
  key=f"dt_{job['job_id']}", width="stretch")
             with col_d3:
                 if state.get("p2_done") and state.get("pairs"):
+                    data = frozen_assets.get("stage2_bilingual.docx") if snapshot_current \
+                        else core.pairs_to_word(
+                            state["pairs"], annotations=state.get("annotations"),
+                            colors=annotation_colors)
                     st.download_button(
  "2. 双语对照表",
-                        core.pairs_to_word(state["pairs"],
-                                           annotations=state.get("annotations"),
-                                           colors=annotation_colors),
-                        file_name=f"{_asset_prefix(state)}阶段2_双语对照_{filename}.docx",
+                        data,
+                        file_name=f"{asset_prefix}阶段2_双语对照_{filename}.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
  key=f"d2_{job['job_id']}", width="stretch")
             with col_d4:
                 if state.get("p3_md"):
+                    data = frozen_assets.get("stage3_report.docx") if snapshot_current \
+                        else core.markdown_to_word(
+                            state["p3_md"], state.get("theory") or translation_theory)
                     st.download_button(
  "3. 翻译实践报告",
-                        core.markdown_to_word(state["p3_md"], state.get("theory") or translation_theory),
-                        file_name=f"{_asset_prefix(state)}阶段3_实践报告_{filename}.docx",
+                        data,
+                        file_name=f"{asset_prefix}阶段3_实践报告_{filename}.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
  key=f"d3_{job['job_id']}", width="stretch")
 
@@ -3549,32 +3627,45 @@ def _render_delivery_surface():
                 _render_delivery_review_queue(
                     job["job_id"], state, target_lang, ai_provider, ai_model,
                     api_key, style_rules)
-                _render_delivery_gate(job["job_id"], state, dstatus)
+                _render_delivery_gate(
+                    job["job_id"], state, dstatus, target_lang,
+                    ai_provider, ai_model)
                 st.subheader("交付资产")
-                exported = _assets.export_all(
+                exported = {} if snapshot_current else _assets.export_all(
                     state, job["job_id"], target_lang, ai_provider, ai_model,
                     source_filename=filename)
                 ea1, ea2, ea3, ea4 = st.columns(4)
                 with ea1:
-                    st.download_button("TBX 术语库", exported["terms.tbx"],
-                                       file_name=f"{_asset_prefix(state)}terms_{filename}.tbx",
+                    data = frozen_assets.get("terms.tbx") if snapshot_current \
+                        else exported["terms.tbx"]
+                    st.download_button("TBX 术语库", data,
+                                       file_name=f"{asset_prefix}terms_{filename}.tbx",
                                        mime="application/xml", key=f"tbx_{job['job_id']}", width="stretch")
                 with ea2:
-                    st.download_button("TMX 翻译记忆", exported["memory.tmx"],
-                                       file_name=f"{_asset_prefix(state)}memory_{filename}.tmx",
+                    data = frozen_assets.get("memory.tmx") if snapshot_current \
+                        else exported["memory.tmx"]
+                    st.download_button("TMX 翻译记忆", data,
+                                       file_name=f"{asset_prefix}memory_{filename}.tmx",
                                        mime="application/xml", key=f"tmx_{job['job_id']}", width="stretch")
                 with ea3:
-                    st.download_button("JSONL 双语段落", exported["bilingual.jsonl"],
-                                       file_name=f"{_asset_prefix(state)}bilingual_{filename}.jsonl",
+                    data = frozen_assets.get("bilingual.jsonl") if snapshot_current \
+                        else exported["bilingual.jsonl"]
+                    st.download_button("JSONL 双语段落", data,
+                                       file_name=f"{asset_prefix}bilingual_{filename}.jsonl",
                                        mime="application/x-jsonlines", key=f"jl_{job['job_id']}", width="stretch")
                 with ea4:
-                    st.download_button("交付清单 manifest", exported["delivery_manifest.json"],
-                                       file_name=f"{_asset_prefix(state)}delivery_manifest_{filename}.json",
+                    data = frozen_assets.get("delivery_manifest.json") if snapshot_current \
+                        else exported["delivery_manifest.json"]
+                    st.download_button("交付清单 manifest", data,
+                                       file_name=f"{asset_prefix}delivery_manifest_{filename}.json",
                                        mime="application/json", key=f"mf_{job['job_id']}", width="stretch")
+                evidence_data = frozen_assets.get("segment_evidence.jsonl") \
+                    if snapshot_current else _report_evidence.export_segment_evidence_jsonl(
+                        state, job["job_id"]).encode("utf-8")
                 st.download_button(
                     "案例证据包 (.jsonl)",
-                    _report_evidence.export_segment_evidence_jsonl(state, job["job_id"]).encode("utf-8"),
-                    file_name=f"{_asset_prefix(state)}segment_evidence_{filename}.jsonl",
+                    evidence_data,
+                    file_name=f"{asset_prefix}segment_evidence_{filename}.jsonl",
                     mime="application/x-jsonlines", key=f"ev_{job['job_id']}", width="stretch")
                 if state.get("human_actions"):
                     with st.expander("人工处理记录"):
@@ -3582,8 +3673,10 @@ def _render_delivery_surface():
                             st.caption(f"{action.get('timestamp')} {action.get('action')} "
                                        f"{action.get('finding_id')} {action.get('note')}")
                 if state.get("findings"):
-                    st.download_button("审查报告 (.md)", core.findings_report_md(state),
-                                       file_name=f"{_asset_prefix(state)}审查报告_{filename}.md",
+                    review_data = frozen_assets.get("review_report.md") \
+                        if snapshot_current else core.findings_report_md(state)
+                    st.download_button("审查报告 (.md)", review_data,
+                                       file_name=f"{asset_prefix}审查报告_{filename}.md",
                                        mime="text/markdown", key=f"rr_{job['job_id']}", width="stretch")
 
             if state.get("p3_md"):

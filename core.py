@@ -27,6 +27,7 @@ from transpraxis import knowledge as _knowledge
 from transpraxis import repair as _repair
 from transpraxis import translation_evidence as _translation_evidence
 from transpraxis import checkpoint as _checkpoint
+from transpraxis import snapshots as _snapshots
 
 # ================= 常量 =================
 # 任务进度与过程文件的本地存储目录（已加入 .gitignore）
@@ -2151,6 +2152,24 @@ def job_state_path(job_id):
     return job_dir(job_id) / "state.json"
 
 
+def _invalidate_final_delivery_state(state):
+    """Invalidate only the mutable working approval; snapshot history stays on disk."""
+    state["delivery_status"] = "draft"
+    state["delivery_approved_by_human"] = False
+    state["delivery_approval"] = None
+    if state.get("stage") == "FINAL":
+        state["stage"] = _state_migration.derive_stage(state)
+    return state
+
+
+def _reconcile_final_delivery_snapshot(job_id, state):
+    latest = _snapshots.latest_snapshot(job_dir(job_id))
+    if latest and state.get("delivery_status") == "final" \
+            and _snapshots.state_identity(state) != latest.get("translation_state_identity"):
+        return _invalidate_final_delivery_state(state)
+    return state
+
+
 def new_job_state(filename):
     state = {
         "filename": filename,
@@ -2190,13 +2209,15 @@ def load_job_state(job_id):
     except Exception:
         return None
     from transpraxis import delivery as _delivery
-    return _delivery.normalize_state_findings(_state_migration.migrate_state(raw))
+    state = _delivery.normalize_state_findings(_state_migration.migrate_state(raw))
+    return _reconcile_final_delivery_snapshot(job_id, state)
 
 
 def save_job_state(job_id, state):
     """原子写入（先写临时文件再替换），避免中断写坏 state.json。"""
     from transpraxis import delivery as _delivery
     _delivery.normalize_state_findings(state)
+    _reconcile_final_delivery_snapshot(job_id, state)
     d = job_dir(job_id)
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / "state.json.tmp"
@@ -2216,6 +2237,7 @@ def list_jobs():
                 continue
             from transpraxis import delivery as _delivery
             s = _delivery.normalize_state_findings(_state_migration.migrate_state(s))
+            s = _reconcile_final_delivery_snapshot(d.name, s)
             jobs.append({"job_id": d.name, "state": s})
     return jobs
 
@@ -2241,6 +2263,105 @@ def save_source(job_id, file_bytes):
 def load_source(job_id):
     p = job_dir(job_id) / "source.bin"
     return p.read_bytes() if p.is_file() else None
+
+
+def _bytes(value):
+    return value.getvalue() if hasattr(value, "getvalue") else bytes(value)
+
+
+def _delivery_asset_bundle(job_id, state, target_lang, provider, model):
+    """Build the complete approved delivery set once, before freezing it."""
+    from transpraxis import assets as _assets
+    from transpraxis import report_evidence as _report_evidence
+
+    source = load_source(job_id)
+    snapshot_state = dict(state)
+    if source is not None:
+        snapshot_state["_source_bin"] = source
+    filename = state.get("filename", "")
+    bundle = {}
+    if state.get("p1_done") and state.get("paras"):
+        bundle["stage1_cleaned.docx"] = _bytes(paragraphs_to_word(state["paras"]))
+    if state.get("auto_terms"):
+        bundle["auto_terms.xlsx"] = _bytes(dict_to_excel(state["auto_terms"]))
+    if state.get("p2_done") and state.get("pairs"):
+        bundle["stage2_bilingual.docx"] = _bytes(pairs_to_word(
+            state["pairs"], annotations=state.get("annotations"), colors=ANNOTATION_COLORS))
+    if state.get("p3_md"):
+        bundle["stage3_report.docx"] = _bytes(markdown_to_word(
+            state["p3_md"], state.get("theory") or ""))
+    bundle.update(_assets.export_all(
+        snapshot_state, job_id, target_lang, provider, model,
+        source_filename=filename, source_bin=source))
+    if state.get("p2_done"):
+        bundle["segment_evidence.jsonl"] = _report_evidence.export_segment_evidence_jsonl(
+            state, job_id).encode("utf-8")
+        if state.get("findings"):
+            bundle["review_report.md"] = findings_report_md(state).encode("utf-8")
+    manifest = _assets.build_delivery_manifest(
+        snapshot_state, job_id, target_lang, provider, model,
+        generated_assets=sorted(bundle), source_filename=filename)
+    bundle["delivery_manifest.json"] = (
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    return bundle
+
+
+def create_delivery_snapshot(job_id, state, target_lang="", provider="", model=""):
+    source = load_source(job_id)
+    frozen = state.get("glossary_frozen") or {}
+    source_hash = hashlib.sha256(source).hexdigest() if source else \
+        str(frozen.get("source_hash") or "")
+    manifest = _snapshots.create_snapshot(
+        job_dir(job_id), job_id, state,
+        _delivery_asset_bundle(job_id, state, target_lang, provider, model),
+        source_identity={
+            "filename": state.get("filename", ""),
+            "source_hash": source_hash,
+            "source_page_count": state.get("source_page_count"),
+        },
+        active_terminology_version={
+            "version": frozen.get("version"),
+            "glossary_hash": frozen.get("glossary_hash"),
+            "status": "已冻结" if frozen else "未冻结",
+        })
+    return manifest
+
+
+def list_delivery_snapshots(job_id):
+    return _snapshots.list_snapshots(job_dir(job_id))
+
+
+def delivery_snapshot_status(job_id, state=None):
+    state = state if state is not None else load_job_state(job_id)
+    latest = _snapshots.latest_snapshot(job_dir(job_id))
+    if latest is None:
+        return {"latest": None, "current": False, "diverged": False, "integrity": False}
+    current_identity = _snapshots.state_identity(state or {})
+    matches = current_identity == latest.get("translation_state_identity")
+    assets = delivery_snapshot_assets(job_id, latest["snapshot_version"])
+    integrity = bool(assets) and all(data is not None for data in assets.values())
+    return {
+        "latest": latest,
+        "current": bool(matches and integrity and state
+                        and state.get("delivery_status") == "final"),
+        "diverged": not matches,
+        "integrity": integrity,
+    }
+
+
+def delivery_snapshot_assets(job_id, version):
+    manifest = next((item for item in list_delivery_snapshots(job_id)
+                     if item.get("snapshot_version") == int(version)), None)
+    if manifest is None:
+        return {}
+    return {
+        item["name"]: _snapshots.load_asset(job_dir(job_id), version, item["name"])
+        for item in manifest.get("assets") or []
+    }
+
+
+def delivery_snapshot_archive(job_id, version):
+    return _snapshots.archive(job_dir(job_id), version)
 
 
 def progress_label(state):
@@ -2549,6 +2670,7 @@ def freeze_glossary(job_id, entries=None, frozen_by="user"):
     state = load_job_state(job_id)
     if state is None:
         return None
+    was_final = state.get("delivery_status") == "final"
     norm = normalize_glossary(entries if entries is not None
                               else state.get("glossary") or [])
     versions = state.get("glossary_versions") or []
@@ -2581,7 +2703,9 @@ def freeze_glossary(job_id, entries=None, frozen_by="user"):
     if state.get("delivery_status") not in ("approved", "final"):
         state["delivery_status"] = "draft"
     # 术语决策变化 -> 立即失效受影响段落
-    _apply_glossary_staleness(state)
+    state, stale = _apply_glossary_staleness(state)
+    if was_final and not stale:
+        _invalidate_final_delivery_state(state)
     save_job_state(job_id, state)
     return state
 
@@ -2664,15 +2788,36 @@ def mark_findings_resolved(job_id, finding_ids, action, note="", actor="user"):
     return state
 
 
-def approve_delivery(job_id, note="", accept_blocking=False, actor="user"):
-    """人工交付确认 -> final；有未解决 blocking 且不接受风险时拒绝。"""
+def approve_delivery(job_id, note="", accept_blocking=False, actor="user",
+                     target_lang="", provider="", model=""):
+    """人工交付确认 -> final + immutable snapshot."""
     from transpraxis import delivery as _delivery
     state = load_job_state(job_id)
     if state is None:
         return None, False, ["任务不存在"]
     state, ok, errors = _delivery.approve_delivery(state, note, actor, accept_blocking)
+    if not ok:
+        save_job_state(job_id, state)
+        return state, ok, errors
+    try:
+        manifest = create_delivery_snapshot(
+            job_id, state,
+            target_lang=target_lang or state.get("target_lang") or "",
+            provider=provider or state.get("provider") or "",
+            model=model or state.get("model") or "")
+    except Exception as exc:  # fail closed: final state is not saved without bytes
+        persisted = load_job_state(job_id) or state
+        return persisted, False, [f"无法冻结最终交付版本：{str(exc)[:200]}"]
+    state.setdefault("delivery_snapshots", []).append({
+        "version": manifest["snapshot_version"],
+        "created_at": manifest["created_at"],
+        "approval": dict(manifest.get("approval") or {}),
+        "asset_count": len(manifest.get("assets") or []),
+        "translation_state_identity": manifest.get("translation_state_identity"),
+    })
+    state["latest_delivery_snapshot_version"] = manifest["snapshot_version"]
     save_job_state(job_id, state)
-    return state, ok, errors
+    return state, True, []
 
 
 def retranslate_segments(job_id, indexes, provider, api_key, model, target_lang,
