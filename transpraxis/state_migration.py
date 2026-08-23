@@ -62,6 +62,8 @@ def _default_new_fields() -> Dict[str, Any]:
         "delivery_notes": "",
         "research_settings": {},
         "literature_sources": [],
+        "report_template": None,
+        "report_template_contract": None,
         "academic_state": default_academic_state(),
     }
 

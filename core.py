@@ -2563,8 +2563,105 @@ def load_source(job_id):
     return p.read_bytes() if p.is_file() else None
 
 
+def save_report_template(job_id, filename, template_bytes):
+    """Parse and persist the uploaded DOCX template before academic stages run."""
+    from transpraxis import report_template
+
+    raw = _bytes(template_bytes)
+    contract = report_template.parse_docx_template(filename, raw)
+    directory = job_dir(job_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "report-template.docx").write_bytes(raw)
+    (directory / "template-contract.json").write_text(
+        json.dumps(contract, ensure_ascii=False, indent=2), encoding="utf-8")
+    state = load_job_state(job_id)
+    if state is not None:
+        identity = contract.get("template_identity") or {}
+        state["report_template"] = {
+            "filename": identity.get("filename"),
+            "template_id": identity.get("template_id"),
+            "template_hash": identity.get("sha256"),
+            "schema_version": contract.get("schema_version"),
+            "status": "parsed",
+        }
+        state["report_template_contract"] = contract
+        settings = dict(state.get("research_settings") or {})
+        settings["report_template_contract"] = contract
+        state["research_settings"] = settings
+        save_job_state(job_id, state)
+    return contract
+
+
+def clear_report_template(job_id):
+    """Remove the saved report template and its contract from a task."""
+    directory = job_dir(job_id)
+    for name in ("report-template.docx", "template-contract.json"):
+        path = directory / name
+        if path.is_file():
+            path.unlink()
+    state = load_job_state(job_id)
+    if state is not None:
+        state["report_template"] = None
+        state["report_template_contract"] = None
+        settings = dict(state.get("research_settings") or {})
+        settings.pop("report_template_contract", None)
+        settings.pop("template_contract", None)
+        state["research_settings"] = settings
+        save_job_state(job_id, state)
+    return state
+
+
+def load_report_template(job_id):
+    """Load the persisted DOCX bytes and canonical contract, if configured."""
+    from transpraxis import report_template
+
+    directory = job_dir(job_id)
+    docx_path = directory / "report-template.docx"
+    contract_path = directory / "template-contract.json"
+    state = load_job_state(job_id)
+    contract = None
+    if contract_path.is_file():
+        try:
+            value = json.loads(contract_path.read_text(encoding="utf-8"))
+            contract = value if isinstance(value, dict) else None
+        except (OSError, ValueError):
+            contract = None
+    if contract is None and state:
+        contract = state.get("report_template_contract") or \
+            (state.get("research_settings") or {}).get("report_template_contract")
+    if not contract or not docx_path.is_file():
+        return None
+    raw = docx_path.read_bytes()
+    return {
+        "bytes": raw,
+        "contract": contract,
+        "metadata": state.get("report_template") if state else None,
+        "summary": report_template.contract_summary(contract),
+    }
+
+
 def _bytes(value):
     return value.getvalue() if hasattr(value, "getvalue") else bytes(value)
+
+
+def report_docx_bytes(job_id, state=None, frozen_assets=None):
+    """Render the structured report with its template, or use the legacy fallback."""
+    if frozen_assets and frozen_assets.get("stage3_report.docx"):
+        return frozen_assets["stage3_report.docx"]
+    state = state or load_job_state(job_id) or {}
+    report = state.get("p3_md")
+    if not report:
+        return None
+    template = load_report_template(job_id)
+    if template:
+        from transpraxis import report_template
+        artifact = load_academic_artifact(job_id, "report")
+        if not artifact:
+            raise report_template.TemplateParseError(
+                "模板化报告缺少结构化 report artifact，请重新生成报告。")
+        return _bytes(report_template.render_report_docx(
+            artifact, template["bytes"], template["contract"]))
+    return _bytes(markdown_to_word(report, state.get("theory") or ""))
 
 
 def _delivery_asset_bundle(job_id, state, target_lang, provider, model):
@@ -2586,8 +2683,7 @@ def _delivery_asset_bundle(job_id, state, target_lang, provider, model):
         bundle["stage2_bilingual.docx"] = _bytes(pairs_to_word(
             state["pairs"], annotations=state.get("annotations"), colors=ANNOTATION_COLORS))
     if state.get("p3_md"):
-        bundle["stage3_report.docx"] = _bytes(markdown_to_word(
-            state["p3_md"], state.get("theory") or ""))
+        bundle["stage3_report.docx"] = report_docx_bytes(job_id, state)
     bundle.update(_assets.export_all(
         snapshot_state, job_id, target_lang, provider, model,
         source_filename=filename, source_bin=source))

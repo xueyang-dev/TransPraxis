@@ -18,13 +18,15 @@ from . import academic_validator
 from . import case_analysis
 from . import human_evidence
 from . import literature_evidence
+from . import report_template
 from . import synthetic_cases
 from . import thesis_constraints
 
-PIPELINE_VERSION = "academic-pipeline-v6"
+PIPELINE_VERSION = "academic-pipeline-v7"
 VERSIONS = {
     "evidence_version": academic_evidence.SCHEMA_VERSION,
     "report_constraints_version": thesis_constraints.SCHEMA_VERSION,
+    "template_contract_version": report_template.SCHEMA_VERSION,
     "research_model_version": "research-model-v2",
     "literature_sources_version": literature_evidence.SOURCES_VERSION,
     "literature_evidence_version": literature_evidence.EVIDENCE_VERSION,
@@ -37,8 +39,9 @@ VERSIONS = {
     "synthetic_validation_version": synthetic_cases.VALIDATION_VERSION,
     "case_selection_version": "case-selector-v4",
     "outline_version": "academic-outline-v5",
-    "writer_version": "academic-writer-v8",
+    "writer_version": "academic-writer-v9",
     "validator_version": academic_validator.VALIDATOR_VERSION,
+    "report_artifact_version": "academic-report-artifact-v1",
     "reviewer_version": "academic-reviewer-v1",
     "literature_reviewer_version": "literature-support-reviewer-v1",
     "academic_quality_version": academic_quality.QUALITY_VERSION,
@@ -61,6 +64,7 @@ ARTIFACT_FILES = {
     "selected_cases": "selected-cases.json",
     "outline": "academic-outline.json",
     "sections": "academic-sections.json",
+    "report": "academic-report.json",
     "validation": "academic-validation.json",
     "review": "academic-review.json",
     "literature_support_review": "literature-support-review.json",
@@ -84,6 +88,9 @@ def default_academic_state() -> Dict[str, Any]:
         "status": "not_started",
         "current_stage": "not_started",
         "quality_status": None,
+        "template_hash": None,
+        "template_id": None,
+        "template_contract_version": None,
         "versions": {},
         "artifacts": {},
         "forced_sections": [],
@@ -256,6 +263,9 @@ def _invalidate_names(state: Dict[str, Any], names: Sequence[str], reason: str) 
                      "sections", "validation", "review"}:
         state["p3_done"] = False
         academic["status"] = "stale"
+    if "report" in names:
+        state["p3_md"] = ""
+        state["p3_sections"] = []
 
 
 def sync_versions(state: Dict[str, Any], versions: Optional[Dict[str, str]] = None) -> None:
@@ -264,7 +274,14 @@ def sync_versions(state: Dict[str, Any], versions: Optional[Dict[str, str]] = No
     academic = _state(state)
     old = academic.get("versions") or {}
     if old:
-        if old.get("evidence_version") != versions["evidence_version"]:
+        if old.get("template_contract_version") != versions["template_contract_version"] \
+                or old.get("report_artifact_version") != versions["report_artifact_version"]:
+            _invalidate_names(state, [
+                "research_model", "argument_plan", "selected_cases", "outline",
+                "sections", "validation", "review", "academic_quality", "report",
+                "literature_support_review", "quality_repair_history", "repair_history",
+            ], "template contract architecture changed")
+        elif old.get("evidence_version") != versions["evidence_version"]:
             _invalidate_names(state, list(ARTIFACT_FILES), "evidence schema/version changed")
         elif old.get("literature_sources_version") != versions["literature_sources_version"]:
             _invalidate_names(state, [
@@ -404,6 +421,28 @@ def prepare_academic_inputs(
     if research_settings:
         settings.update(research_settings)
     settings["theoretical_framework"] = settings.get("theoretical_framework") or [theory]
+    template_contract = settings.get("report_template_contract") or \
+        settings.get("template_contract")
+    template_identity = (template_contract or {}).get("template_identity") or {}
+    template_hash = str(template_identity.get("sha256") or "") or None
+    old_template_hash = academic.get("template_hash")
+    if old_template_hash != template_hash:
+        _invalidate_names(state, [
+            "research_model", "argument_plan", "selected_cases", "outline", "sections",
+            "validation", "review", "academic_quality", "report",
+            "literature_support_review", "quality_repair_history", "repair_history",
+        ], "report template changed")
+    academic["template_hash"] = template_hash
+    academic["template_id"] = template_identity.get("template_id")
+    academic["template_contract_version"] = (template_contract or {}).get("schema_version")
+    state["report_template_contract"] = template_contract
+    state["report_template"] = ({
+        "filename": template_identity.get("filename"),
+        "template_id": template_identity.get("template_id"),
+        "template_hash": template_hash,
+        "schema_version": (template_contract or {}).get("schema_version"),
+        "status": "parsed",
+    } if template_contract else None)
     literature = list(
         literature_sources if literature_sources is not None
         else state.get("literature_sources") or [])
@@ -524,6 +563,9 @@ def build_research_model(
     ]
     rqs = provided_rqs or default_rqs
     profile = evidence.get("project_evidence", {}).get("document_profile") or {}
+    template_contract = settings.get("report_template_contract") or \
+        settings.get("template_contract")
+    template_identity = (template_contract or {}).get("template_identity") or {}
     artifact = {
         "schema_version": VERSIONS["research_model_version"],
         "research_topic": settings.get("research_topic") or
@@ -542,6 +584,8 @@ def build_research_model(
             "说明机器翻译、术语治理与人工审校的作用边界",
         ],
         "report_constraints": report_constraints,
+        "template_contract": template_contract,
+        "template_hash": template_identity.get("sha256"),
         "body_language": report_constraints["body_language"]["language"],
         "writing_style": settings.get("writing_style") or report_constraints[
             "style_rules"]["academic_register"],
@@ -898,11 +942,15 @@ def _fallback_outline(
             "合成对比案例必须标为模拟初译/优化译文，不能写成作者历史修订")
         conclusion_limits.append(
             "合成案例只展示合理失败模式，不证明人类译者中的发生频率")
+    template_configured = bool((constraints.get("template") or {}).get("configured"))
     sections = []
     for section_id, chapter in required_chapters.items():
         sections.append({
             "section_id": section_id,
             "title": chapter.get("title") or f"Section {section_id}",
+            "role": chapter.get("role") or (
+                "generic_section" if template_configured else "case_analysis"),
+            "level": chapter.get("level", 1),
             "purpose": chapter.get("purpose") or "仅陈述证据库可支持的内容",
             "required_subsections": chapter.get("required_subsections") or [],
             "research_questions": rqs,
@@ -920,6 +968,8 @@ def _fallback_outline(
         sections = [{
             "section_id": "1",
             "title": "写作提纲",
+            "role": "generic_section" if template_configured else "case_analysis",
+            "level": 1,
             "purpose": "仅陈述证据库可支持的内容",
             "required_subsections": [],
             "research_questions": rqs,
@@ -931,7 +981,13 @@ def _fallback_outline(
             "required_statistics": [], "target_words": total, "minimum_chars": 200,
             "allowed_conclusions": analysis_conclusions + conclusion_limits,
         }]
+    planning_warnings = []
+    if template_configured and not any(
+            x.get("role") == "case_analysis" for x in sections):
+        planning_warnings.append(
+            "模板没有明确的 case_analysis 章节；案例不会被静默塞入最后一章，请确认章节角色。")
     return {"sections": sections, "planner_fallback": True,
+        "planning_warnings": planning_warnings,
         "report_constraints": constraints,
         "case_count_policy": {
             "status": case_status,
@@ -966,6 +1022,10 @@ def build_academic_outline(
         "仅在 report_constraints 提供结构时遵循其 section_id、标题、功能和"
         "required_subsections；未提供结构时不得自行补充固定模板。各 section 只使用"
         "其写作包内的证据，不得在结论部分引入未在前文建立的新案例证据。"
+        "若 report_constraints.template.configured=true，输入的 chapters 是唯一合法的"
+        "章节集合；不得新增、删除、改名或重排 section_id/title，只为这些已有章节分配"
+        "purpose、research_questions、claims、cases、literature 和 statistics。chapter role"
+        "决定 case_analysis/conclusion 等职责。"
         "案例数量以 selected_cases.case_count_policy 为准；two_case_fallback 是合格的"
         "双案例结构，不得虚构或要求第三个案例，并须在案例分析或结论中披露证据稀缺。"
         "若存在 synthetic_contrast，必须与 authentic_revision 分组，并规划方法说明和局限；"
@@ -994,11 +1054,12 @@ def build_academic_outline(
     lit_claims = literature_evidence.claim_index(literature_claims_artifact or {})
     valid_stats = academic_validator.statistic_keys(
         evidence.get("project_evidence", {}).get("statistics", {}))
-    sections = []
-    for i, item in enumerate(raw.get("sections") or []):
-        if not isinstance(item, dict):
-            continue
-        section_id = str(item.get("section_id") or i + 1)
+    raw_items = [x for x in raw.get("sections") or [] if isinstance(x, dict)]
+    raw_by_id = {str(x.get("section_id")): x for x in raw_items
+                 if x.get("section_id") is not None}
+
+    def normalize_section(section_id, chapter, item):
+        item = item or {}
         section_lit_claims = [str(x) for x in item.get("literature_claims") or []
                               if str(x) in lit_claims]
         allowed_evidence = {
@@ -1013,14 +1074,16 @@ def build_academic_outline(
             lit_evidence[x]["source_id"] for x in section_lit_evidence
             if lit_evidence[x].get("source_id") in lit_sources
         })
-        sections.append({
+        return {
             "section_id": section_id,
-            "title": required_chapters.get(section_id, {}).get(
-                "title") or str(item.get("title") or f"章节 {section_id}").strip(),
-            "purpose": required_chapters.get(section_id, {}).get(
-                "purpose") or str(item.get("purpose") or "").strip(),
-            "required_subsections": required_chapters.get(section_id, {}).get(
-                "required_subsections", []),
+            # Template title/order/level/role are authoritative.  The model
+            # only fills the evidence assignment fields below.
+            "title": chapter.get("title") or str(
+                item.get("title") or f"章节 {section_id}").strip(),
+            "role": chapter.get("role") or str(item.get("role") or "generic_section"),
+            "level": chapter.get("level", 1),
+            "purpose": chapter.get("purpose") or str(item.get("purpose") or "").strip(),
+            "required_subsections": chapter.get("required_subsections", []),
             "research_questions": [str(x) for x in item.get("research_questions") or []
                                    if str(x) in valid_rqs],
             "claims": [str(x) for x in item.get("claims") or [] if str(x) in valid_claims],
@@ -1033,38 +1096,65 @@ def build_academic_outline(
             "target_words": max(200, int(item.get("target_words") or 700)),
             "minimum_chars": max(100, int(item.get("minimum_chars") or 200)),
             "allowed_conclusions": _as_list(item.get("allowed_conclusions")),
-        })
-    if required_chapters and {x["section_id"] for x in sections} != set(required_chapters):
-        sections = _fallback_outline(research_model, argument_plan, selected_cases)["sections"]
-        fallback = True
-    elif not sections:
-        sections = _fallback_outline(research_model, argument_plan, selected_cases)["sections"]
-        fallback = True
-    else:
+        }
+
+    if required_chapters:
+        # Canonical construction prevents an LLM response from deleting or
+        # renaming a template chapter, even when it returns fewer sections.
+        sections = [normalize_section(section_id, chapter, raw_by_id.get(section_id))
+                    for section_id, chapter in required_chapters.items()]
         fallback = bool(raw.get("planner_fallback"))
-    # Deterministically guarantee graph coverage; the writer cannot silently lose a claim/RQ.
+    else:
+        sections = [normalize_section(
+            str(item.get("section_id") or index),
+            {"title": str(item.get("title") or f"章节 {index}"),
+             "role": str(item.get("role") or "case_analysis"),
+             "level": 1,
+             "purpose": str(item.get("purpose") or ""),
+             "required_subsections": []}, item)
+                    for index, item in enumerate(raw_items, start=1)]
+        if not sections:
+            fallback_outline = _fallback_outline(
+                research_model, argument_plan, selected_cases)
+            sections = fallback_outline["sections"]
+            fallback = True
+        else:
+            fallback = bool(raw.get("planner_fallback"))
+
+    # Deterministically route evidence by explicit chapter role.  No section
+    # position is allowed to imply analysis or conclusion semantics.
     section_by_id = {x["section_id"]: x for x in sections}
-    analysis = sections[-1]
-    conclusion = sections[-1]
-    # The final configured section carries case evidence; later sections may
-    # be configured by callers without imposing a template here.
+    case_sections = [x for x in sections if x.get("role") == "case_analysis"]
+    conclusion_sections = [x for x in sections if x.get("role") == "conclusion_reflection"]
+    intro_sections = [x for x in sections if x.get("role") == "introduction"]
+    planning_warnings = list(raw.get("planning_warnings") or [])
+    if (research_model.get("template_hash") or
+            (constraints.get("template") or {}).get("configured")) and not case_sections:
+        planning_warnings.append(
+            "模板没有明确的 case_analysis 章节；案例未被自动路由，请确认章节角色。")
     for section in sections:
         section["cases"] = []
-    analysis["cases"] = [str(x.get("case_id")) for x in selected_cases.get(
-        "cases", []) if x.get("case_id")]
+        section["research_questions"] = list(dict.fromkeys(section["research_questions"]))
+    if intro_sections and valid_rqs:
+        intro_sections[0]["research_questions"] = sorted(valid_rqs)
+
+    # Bind claims to model-planned sections first; otherwise choose an
+    # explicit role, never the last section by accident.
+    claims_by_id = {x["claim_id"]: x for x in argument_plan.get("claims", [])}
     for section in sections:
-        section["research_questions"] = sorted(valid_rqs)
-    analysis["claims"] = sorted(valid_claims)
-    conclusion["claims"] = sorted(valid_claims)
+        section["claims"] = list(dict.fromkeys(section["claims"]))
     for claim_id in valid_claims:
-        if not any(claim_id in x["claims"] for x in sections):
-            analysis["claims"].append(claim_id)
-    for rq_id in valid_rqs:
-        if not any(rq_id in x["research_questions"] for x in sections):
-            analysis["research_questions"].append(rq_id)
+        if any(claim_id in x["claims"] for x in sections):
+            continue
+        claim = claims_by_id.get(claim_id) or {}
+        planned = [section_by_id.get(str(x)) for x in claim.get("planned_sections") or []]
+        target = next((x for x in planned if x), None)
+        target = target or (case_sections[0] if case_sections else
+                            (conclusion_sections[0] if conclusion_sections else sections[0]))
+        target["claims"].append(claim_id)
+
     # Bound per-section case load and guarantee every selected case has a
-    # section.  A section that plans 8 cases cannot realistically develop all
-    # of them, which otherwise produces impossible validation errors.
+    # section only when the template explicitly allows case analysis.
     case_claims: Dict[str, set] = {}
     for claim in argument_plan.get("claims", []):
         for case_id in claim.get("project_evidence") or []:
@@ -1072,21 +1162,24 @@ def build_academic_outline(
     selected_ids = {str(x.get("case_id")) for x in selected_cases.get("cases", [])}
     selected_by_id = {str(x.get("case_id")): x
                       for x in selected_cases.get("cases", [])}
+    template_configured = bool((constraints.get("template") or {}).get("configured"))
     for section in sections:
         section["cases"] = section["cases"][:max(4, len(selected_ids))]
     assigned = {case_id for section in sections for case_id in section["cases"]}
     for case_id in sorted(selected_ids - assigned):
-        if case_id not in case_claims and selected_by_id.get(case_id, {}).get(
-                "case_type") != "synthetic_contrast":
+        if not template_configured and case_id not in case_claims and \
+                selected_by_id.get(case_id, {}).get("case_type") != "synthetic_contrast":
             # Zone-coverage candidates without a claim binding do not need a
             # section; forcing them in would create impossible validation.
             continue
-        best = analysis if selected_by_id.get(case_id, {}).get(
-            "case_type") == "synthetic_contrast" else max(
-                sections, key=lambda x: len(
-                    set(x["claims"]) & (case_claims.get(case_id) or set())))
+        if not case_sections:
+            planning_warnings.append(
+                f"案例 {case_id} 没有可用的 case_analysis 章节，未强行写入其他章节。")
+            continue
+        best = max(
+            case_sections, key=lambda x: len(
+                set(x["claims"]) & (case_claims.get(case_id) or set())))
         best["cases"].append(case_id)
-    claims_by_id = {x["claim_id"]: x for x in argument_plan.get("claims", [])}
     for section in sections:
         for claim_id in section["claims"]:
             global_claim = claims_by_id.get(claim_id) or {}
@@ -1112,9 +1205,12 @@ def build_academic_outline(
         }
     artifact = {
         "schema_version": VERSIONS["outline_version"],
-            "report_constraints": constraints,
+        "report_constraints": constraints,
+        "template_hash": (constraints.get("template") or {}).get("template_hash"),
+        "template_id": (constraints.get("template") or {}).get("template_id"),
         "sections": sections,
         "planner_fallback": fallback,
+        "planning_warnings": sorted(set(planning_warnings)),
         "case_count_policy": {
             "status": selected_cases.get(
                 "authentic_selection_status", selected_cases.get("selection_status")),
@@ -1266,6 +1362,52 @@ def _section_packet(
     }
 
 
+def _writer_heading_key(value: Any) -> str:
+    value = re.sub(r"^\d+(?:\.\d+)*[.)、．]?\s+", "", str(value or "")).strip()
+    return re.sub(r"[\s:：.。、()（）\[\]【】_-]+", "", value.casefold())
+
+
+def _ensure_section_contract(text: str, section: Mapping[str, Any]) -> str:
+    """Keep required template headings visible even when the model omits them."""
+    required = list(section.get("required_subsections") or [])
+    lines = str(text or "").splitlines()
+    normalized = []
+    seen = set()
+    section_key = _writer_heading_key(section.get("title"))
+    for line in lines:
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line.strip())
+        if not match:
+            normalized.append(line)
+            continue
+        title = match.group(2).strip()
+        if _writer_heading_key(title) == section_key:
+            # _compose_report supplies the authoritative chapter heading.
+            continue
+        matched = next((item for item in required
+                        if _writer_heading_key(item.get("title")) ==
+                        _writer_heading_key(title)), None)
+        if matched:
+            heading_id = str(matched.get("heading_id") or "").strip()
+            prefix = str(matched.get("markdown_prefix") or (
+                "#" * (int(matched.get("level") or 2) + 1)))
+            normalized.append(f"{prefix} {heading_id} {matched.get('title')}")
+            seen.add(_writer_heading_key(matched.get("title")))
+        else:
+            normalized.append(line)
+    missing = [item for item in required
+               if _writer_heading_key(item.get("title")) not in seen]
+    if missing:
+        normalized.append("")
+        normalized.append("当前项目证据不足以自动补写以下模板要求的小节；请人工补充。")
+        for item in missing:
+            heading_id = str(item.get("heading_id") or "").strip()
+            prefix = str(item.get("markdown_prefix") or (
+                "#" * (int(item.get("level") or 2) + 1)))
+            normalized.extend(["", f"{prefix} {heading_id} {item.get('title')}",
+                               "当前项目证据不足以对此作进一步实证分析，需人工补充。"])
+    return "\n".join(normalized).strip()
+
+
 def _write_section(
     packet: Dict[str, Any], call_llm: Callable, provider: str, api_key: str,
     model: str, repair_issues: Optional[List[Dict[str, Any]]] = None,
@@ -1375,6 +1517,7 @@ def _write_section(
                   flags=re.DOTALL)
     if not text:
         raise RuntimeError("学术写作模型返回空章节")
+    text = _ensure_section_contract(text, packet.get("current_section") or {})
     return academic_validator.expand_evidence_tokens(text, packet_to_evidence(packet))
 
 
@@ -1424,6 +1567,65 @@ def _compose_report(sections: List[Dict[str, Any]]) -> str:
     return "\n\n".join(
         f"## {item['section_id']} {item['title']}\n\n{item['content'].strip()}"
         for item in sections) + "\n"
+
+
+def build_report_artifact(
+    report_md: str,
+    written: Sequence[Mapping[str, Any]],
+    outline: Mapping[str, Any],
+    constraints: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Create the structured report consumed by template-aware renderers."""
+    written_by_id = {str(x.get("section_id")): x for x in written}
+    sections = []
+    for plan in outline.get("sections") or []:
+        section_id = str(plan.get("section_id"))
+        item = written_by_id.get(section_id) or {}
+        content = str(item.get("content") or "")
+        heading_matches = list(re.finditer(
+            r"^#{3,6}\s+([^\s]+)(?:\s+(.+?))?\s*$", content, re.MULTILINE))
+        subsections = []
+        intro_content = content[:heading_matches[0].start()].strip() \
+            if heading_matches else content.strip()
+        for index, match in enumerate(heading_matches):
+            end = heading_matches[index + 1].start() \
+                if index + 1 < len(heading_matches) else len(content)
+            payload = re.sub(r"\s+", " ", match.group(2) or match.group(1)).strip()
+            subsections.append({
+                "heading_id": match.group(1),
+                "title": payload,
+                "level": len(match.group(0).split()[0]),
+                "content": content[match.end():end].strip(),
+            })
+        sections.append({
+            "section_id": section_id,
+            "role": plan.get("role") or "generic_section",
+            "title": plan.get("title") or item.get("title") or section_id,
+            "level": int(plan.get("level") or 1),
+            "required_subsections": list(plan.get("required_subsections") or []),
+            "content": content,
+            "intro_content": intro_content,
+            "subsections": subsections,
+            "cases": list(plan.get("cases") or []),
+        })
+    template_contract = constraints.get("template_contract")
+    identity = (template_contract or {}).get("template_identity") or {}
+    artifact = {
+        "schema_version": VERSIONS["report_artifact_version"],
+        "template_hash": constraints.get("template_hash") or identity.get("sha256"),
+        "template_id": constraints.get("template_id") or identity.get("template_id"),
+        "template_contract_version": constraints.get("template_contract_version") or
+        (template_contract or {}).get("schema_version"),
+        "renderer_version": report_template.RENDERER_VERSION,
+        "template_contract": template_contract,
+        "front_matter": list(constraints.get("front_matter") or []),
+        "sections": sections,
+        "back_matter": list(constraints.get("back_matter") or []),
+        "source_markdown_hash": academic_evidence.stable_hash(report_md),
+    }
+    artifact["content_hash"] = academic_evidence.stable_hash(
+        {k: v for k, v in artifact.items() if k != "content_hash"})
+    return artifact
 
 
 _QUOTE_LINE = re.compile(
@@ -2000,17 +2202,22 @@ def _quality_status(
         "statistics_validation": academic_validator.statistics_validation_status(
             validation),
         "case_eligibility": academic_validator.case_eligibility_status(validation),
+        "template_compliance": (validation.get("template_compliance") or {}).get(
+            "status", "not_configured"),
         "deterministic_validation": validation.get("status", "fail"),
         "general_review": review.get("status", "review_required"),
         "literature_support_review": literature_support_review.get(
             "status", "not_applicable"),
     }
-    if validation.get("status") == "fail":
+    template_status = dimensions["template_compliance"]
+    if validation.get("status") == "fail" or template_status == "fail":
         return "fail", dimensions
-    if review.get("status") == "review_required" or grounding_status == "review_required" \
+    if template_status == "review_required" or review.get("status") == "review_required" \
+            or grounding_status == "review_required" \
             or literature_support_review.get("status") == "review_required":
         return "review_required", dimensions
-    if validation.get("status") == "pass_with_warnings" or review.get("issues") \
+    if validation.get("status") == "pass_with_warnings" or template_status == "pass_with_warnings" \
+            or review.get("issues") \
             or evidence.get("limitations") or metadata_status == "pass_with_warnings" \
             or grounding_status == "pass_with_warnings" \
             or literature_support_review.get("issues"):
@@ -2382,12 +2589,15 @@ def run_academic_pipeline(
         academic["forced_sections"] = []
         report_md = _compose_report(written)
         report_md = finalize_report_tokens(report_md, evidence, selected_cases, outline)
+        report_artifact = build_report_artifact(
+            report_md, written, outline, research_model.get("report_constraints") or {})
 
         stage("validation", "【学术写作 8/10】执行确定性证据与结构验证...")
         validation = academic_validator.validate_academic_report(
             report_md, evidence, research_model, argument_plan, selected_cases, outline,
             literature_sources_artifact, literature_evidence_artifact,
-            literature_claims_artifact, human_entries, synthetic_validation)
+            literature_claims_artifact, human_entries, synthetic_validation,
+            report_artifact.get("template_contract"), report_artifact)
         validation = _locate_validation_issues(validation, written)
         validation_runs.append(validation)
 
@@ -2453,10 +2663,14 @@ def run_academic_pipeline(
                                sections_dep, VERSIONS["writer_version"])
                 report_md = _compose_report(written)
                 report_md = finalize_report_tokens(report_md, evidence, selected_cases, outline)
+                report_artifact = build_report_artifact(
+                    report_md, written, outline,
+                    research_model.get("report_constraints") or {})
                 validation = academic_validator.validate_academic_report(
                     report_md, evidence, research_model, argument_plan, selected_cases, outline,
                     literature_sources_artifact, literature_evidence_artifact,
-                    literature_claims_artifact, human_entries, synthetic_validation)
+                    literature_claims_artifact, human_entries, synthetic_validation,
+                    report_artifact.get("template_contract"), report_artifact)
                 validation = _locate_validation_issues(validation, written)
                 validation_runs.append(validation)
                 review = _semantic_review(
@@ -2548,6 +2762,41 @@ def run_academic_pipeline(
                              + [x.get("issue_id") for x in plan["text_repairs"]],
                 "completed_at": _now(),
             })
+        # Quality repair may change chapter text after the first validation;
+        # rebuild the structured artifact and run the deterministic template
+        # gate on the final report before recording completion.
+        report_artifact = build_report_artifact(
+            report_md, written, outline,
+            research_model.get("report_constraints") or {})
+        validation = academic_validator.validate_academic_report(
+            report_md, evidence, research_model, argument_plan, selected_cases, outline,
+            literature_sources_artifact, literature_evidence_artifact,
+            literature_claims_artifact, human_entries, synthetic_validation,
+            report_artifact.get("template_contract"), report_artifact)
+        validation = _locate_validation_issues(validation, written)
+        validation_runs.append(validation)
+        report_dep = academic_evidence.stable_hash({
+            "report": report_artifact["content_hash"],
+            "template": report_artifact.get("template_hash"),
+            "version": VERSIONS["report_artifact_version"],
+        })
+        _save_artifact(state, artifact_dir, "report", report_artifact,
+                       report_dep, VERSIONS["report_artifact_version"])
+        validation_artifact = {**validation, "runs": validation_runs[-2:]}
+        validation_artifact["content_hash"] = academic_evidence.stable_hash(
+            {k: v for k, v in validation_artifact.items() if k != "content_hash"})
+        validation_dep = academic_evidence.stable_hash({
+            "report": academic_evidence.stable_hash(report_md),
+            "evidence": evidence["content_hash"],
+            "validator": VERSIONS["validator_version"],
+            "template": report_artifact.get("template_hash"),
+            "synthetic": synthetic_validation["content_hash"],
+            "literature_sources": literature_sources_artifact["content_hash"],
+            "literature_evidence": literature_evidence_artifact["content_hash"],
+            "literature_claims": literature_claims_artifact["content_hash"],
+        })
+        _save_artifact(state, artifact_dir, "validation", validation_artifact,
+                       validation_dep, VERSIONS["validator_version"])
         quality_dep = academic_evidence.stable_hash({
             "report": academic_evidence.stable_hash(report_md),
             "argument": argument_plan["content_hash"],

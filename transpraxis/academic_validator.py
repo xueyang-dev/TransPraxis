@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from .academic_evidence import (
     is_eligible_revision_case, literature_index, segment_index, stable_hash,
 )
-from . import case_analysis, literature_evidence, synthetic_cases, thesis_constraints
+from . import case_analysis, literature_evidence, report_template, synthetic_cases, thesis_constraints
 
 SCHEMA_VERSION = "academic-validation-v2"
 VALIDATOR_VERSION = "validator-v9"
@@ -327,6 +327,223 @@ def _has_english_prose_paragraph(text: str) -> bool:
     return False
 
 
+def _template_heading_records(report_md: str) -> List[Dict[str, Any]]:
+    records = []
+    for match in re.finditer(r"^(#{1,6})\s+(.+?)\s*$", report_md, re.MULTILINE):
+        payload = _norm(match.group(2))
+        parts = payload.split(None, 1)
+        records.append({
+            "level": len(match.group(1)),
+            "payload": payload,
+            "heading_id": parts[0] if parts else "",
+            "title": parts[1] if len(parts) > 1 else payload,
+            "start": match.start(),
+        })
+    return records
+
+
+def _template_heading_key(value: Any) -> str:
+    value = _norm(value).casefold()
+    value = re.sub(r"^\d+(?:\.\d+)*[.)、．]?\s*", "", value)
+    value = re.sub(r"^第\s*[一二三四五六七八九十百千万]+\s*章\s*", "", value)
+    return re.sub(r"[\s:：.。、()（）\[\]【】_\-]+", "", value)
+
+
+def _template_structure_records(contract: Mapping[str, Any]) -> tuple[list, list]:
+    structure = contract.get("document_structure") or {}
+    chapters = list(structure.get("chapters") or [])
+    top_level = int(structure.get("top_level") or 1)
+    expected = []
+    for chapter in chapters:
+        expected.append({
+            "section_id": str(chapter.get("section_id") or ""),
+            "title": str(chapter.get("title") or ""),
+            "role": str(chapter.get("role") or "generic_section"),
+            "level": 2,
+            "required_subsections": [
+                dict(item) for item in chapter.get("required_subsections") or []
+                if isinstance(item, Mapping)
+            ],
+        })
+    return expected, [top_level]
+
+
+def validate_template_compliance(
+    report_md: str,
+    template_contract: Optional[Mapping[str, Any]],
+    outline: Optional[Mapping[str, Any]] = None,
+    report_artifact: Optional[Mapping[str, Any]] = None,
+    selected_cases: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Validate the generated report against the immutable template contract."""
+    if not template_contract:
+        return {"status": "not_configured", "issues": [],
+                "template_hash": None, "checked": False}
+    issues: List[Dict[str, Any]] = []
+    identity = template_contract.get("template_identity") or {}
+    template_hash = str(identity.get("sha256") or "")
+    expected, _ = _template_structure_records(template_contract)
+    records = _template_heading_records(report_md)
+    chapters = [x for x in records if x.get("level") == 2]
+    expected_ids = [x["section_id"] for x in expected]
+    actual_ids = [x.get("heading_id") for x in chapters]
+    if actual_ids != expected_ids:
+        if len(actual_ids) != len(expected_ids):
+            issues.append(_issue(
+                "template_chapter_count_mismatch",
+                f"模板要求 {len(expected_ids)} 个正文一级章节，报告实际有 {len(actual_ids)} 个。",
+                suggested_action="恢复模板章节数量与顺序，不要让模型新增或删除一级章节。"))
+        for index, item in enumerate(expected):
+            if index >= len(chapters):
+                issues.append(_issue(
+                    "template_missing_chapter",
+                    f"报告缺少模板章节“{item['section_id']} {item['title']}”。",
+                    section_id=item["section_id"],
+                    suggested_action="保留该模板章节，并在证据不足时写明有限解释。"))
+                continue
+            actual = chapters[index]
+            if str(actual.get("heading_id")) != item["section_id"]:
+                issues.append(_issue(
+                    "template_chapter_order_mismatch",
+                    f"模板章节顺序错误：第 {index + 1} 个应为 {item['section_id']}。",
+                    section_id=item["section_id"],
+                    suggested_action="按 Template Contract 恢复章节顺序。"))
+            if _template_heading_key(actual.get("title")) != \
+                    _template_heading_key(item["title"]):
+                issues.append(_issue(
+                    "template_chapter_title_mismatch",
+                    f"章节 {item['section_id']} 标题应为“{item['title']}”。",
+                    section_id=item["section_id"],
+                    suggested_action="恢复模板原始标题，不要改名。"))
+    for index, item in enumerate(expected):
+        if index >= len(chapters):
+            continue
+        actual = chapters[index]
+        if str(actual.get("heading_id")) == item["section_id"] and \
+                _template_heading_key(actual.get("title")) != \
+                _template_heading_key(item["title"]):
+            issues.append(_issue(
+                "template_chapter_title_mismatch",
+                f"章节 {item['section_id']} 标题应为“{item['title']}”。",
+                section_id=item["section_id"],
+                suggested_action="恢复模板原始标题，不要改名。"))
+        next_start = chapters[index + 1]["start"] if index + 1 < len(chapters) \
+            else len(report_md)
+        body = report_md[actual["start"]:next_start]
+        body_records = _template_heading_records(body)
+        matched_positions = []
+        for subsection in item.get("required_subsections") or []:
+            heading_id = str(subsection.get("heading_id") or "")
+            title = str(subsection.get("title") or "")
+            level = max(3, int(subsection.get("level") or 2) + 1)
+            found_any_level = next((record for record in body_records
+                                    if str(record.get("heading_id")) == heading_id
+                                    and _template_heading_key(record.get("title")) ==
+                                    _template_heading_key(title)), None)
+            found = found_any_level if found_any_level and \
+                found_any_level.get("level") == level else None
+            if found_any_level and found is None:
+                issues.append(_issue(
+                    "template_subsection_level_mismatch",
+                    f"小节 {heading_id} {title} 的标题层级不符合模板。",
+                    section_id=item["section_id"],
+                    suggested_action="恢复模板规定的小节标题层级。"))
+            if found_any_level:
+                matched_positions.append((heading_id, found_any_level["start"]))
+            if not found:
+                if not found_any_level:
+                    issues.append(_issue(
+                        "template_missing_subsection",
+                        f"章节 {item['section_id']} 缺少模板小节“{heading_id} {title}”。",
+                        section_id=item["section_id"],
+                        suggested_action="保留模板小节标题，并在证据不足时保留有限解释。"))
+        expected_order = [str(x.get("heading_id") or "")
+                          for x in item.get("required_subsections") or []]
+        actual_order = [heading_id for heading_id, _position in
+                        sorted(matched_positions, key=lambda value: value[1])]
+        if actual_order and actual_order != expected_order[:len(actual_order)]:
+            issues.append(_issue(
+                "template_subsection_order_mismatch",
+                f"章节 {item['section_id']} 的模板小节顺序不一致。",
+                section_id=item["section_id"],
+                suggested_action="按模板规定的小节顺序组织正文。"))
+        for record in body_records:
+            if record.get("level") > 2 and not any(
+                    str(x.get("heading_id")) == str(record.get("heading_id")) and
+                    _template_heading_key(x.get("title")) ==
+                    _template_heading_key(record.get("title"))
+                    for x in item.get("required_subsections") or []):
+                issues.append(_issue(
+                    "template_extra_subsection",
+                    f"章节 {item['section_id']} 出现未在模板中定义的小节“{record.get('payload')}”。",
+                    severity="warning", section_id=item["section_id"],
+                    suggested_action="确认该小节确实属于模板；否则删除模型新增的小节。"))
+    if len(chapters) > len(expected):
+        for actual in chapters[len(expected):]:
+            issues.append(_issue(
+                "template_extra_chapter",
+                f"报告新增了模板未定义的一级章节“{actual.get('payload')}”。",
+                suggested_action="删除未在模板中定义的一级章节。"))
+
+    outline = outline or {}
+    if template_hash:
+        for artifact_name, artifact in (("outline", outline),
+                                        ("report_artifact", report_artifact or {})):
+            value = str((artifact or {}).get("template_hash") or "")
+            if value and value != template_hash:
+                issues.append(_issue(
+                    "template_hash_mismatch",
+                    f"{artifact_name} 使用的模板哈希与当前模板不一致。",
+                    suggested_action="使所有下游产物重新依赖当前模板后再导出。"))
+    structure = template_contract.get("document_structure") or {}
+    if report_artifact is not None:
+        for matter_key, artifact_key in (("front_matter", "front_matter"),
+                                          ("back_matter", "back_matter")):
+            required_matter = list(structure.get(matter_key) or [])
+            actual_matter = list((report_artifact or {}).get(artifact_key) or [])
+            required_titles = [_template_heading_key(x.get("title")) for x in required_matter]
+            actual_titles = [_template_heading_key(x.get("title")) for x in actual_matter]
+            if required_titles != actual_titles:
+                issues.append(_issue(
+                    "template_matter_mismatch",
+                    f"模板{('前置' if matter_key == 'front_matter' else '后置')}部分未完整保留。",
+                    suggested_action="由模板渲染器保留固定前后置内容，不要由模型重建。"))
+
+    case_sections = [x for x in (outline.get("sections") or [])
+                     if x.get("cases")]
+    case_roles = {str(x.get("section_id")): str(x.get("role") or "")
+                  for x in (outline.get("sections") or [])}
+    if (selected_cases or {}).get("cases") and not any(
+            case_roles.get(str(x.get("section_id"))) == "case_analysis"
+            for x in case_sections):
+        issues.append(_issue(
+            "template_case_role_missing",
+            "报告有已选案例，但模板没有承担案例分析的明确章节。",
+            severity="warning",
+            suggested_action="标记 case_analysis 章节；没有该角色时保留警告并请求人工规划。"))
+    for section in case_sections:
+        if str(section.get("role") or "") != "case_analysis":
+            issues.append(_issue(
+                "template_case_role_mismatch",
+                f"案例被路由到非 case_analysis 章节 {section.get('section_id')}。",
+                severity="warning",
+                section_id=str(section.get("section_id")),
+                suggested_action="将案例只路由到模板角色为 case_analysis 的章节。"))
+
+    status = "fail" if any(x.get("severity") == "error" for x in issues) else \
+        "review_required" if any(x.get("type") in {
+            "template_case_role_missing", "template_case_role_mismatch"
+        } for x in issues) else "pass_with_warnings" if issues else "pass"
+    return {
+        "status": status,
+        "issues": issues,
+        "checked": True,
+        "template_hash": template_hash,
+        "expected_chapters": len(expected),
+        "actual_chapters": len(chapters),
+    }
+
+
 def validate_academic_report(
     report_md: str,
     evidence: Dict[str, Any],
@@ -339,6 +556,8 @@ def validate_academic_report(
     literature_claims_artifact: Optional[Dict[str, Any]] = None,
     human_evidence: Optional[Iterable[Dict[str, Any]]] = None,
     synthetic_artifact: Optional[Dict[str, Any]] = None,
+    template_contract: Optional[Mapping[str, Any]] = None,
+    report_artifact: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Validate identity, provenance, statistics, citations and structure."""
     issues: List[Dict[str, Any]] = []
@@ -409,10 +628,16 @@ def validate_academic_report(
             suggested_action="按 report_constraints 中的语言配置调整论述文本。"))
 
     configured_ids = list(required_chapters)
+    configured_template = bool((constraints.get("template") or {}).get("configured"))
+    role_by_id = {str(x.get("section_id")): str(x.get("role") or "")
+                  for x in constraints.get("chapters") or []}
+    role_id = lambda role: next((section_id for section_id, value in role_by_id.items()
+                                 if value == role), "")
+    legacy_fallback = configured_ids[-1] if configured_ids and not configured_template else ""
     conclusion_id = str((constraints.get("research_question_policy") or {}).get(
-        "answer_in_section") or (configured_ids[-1] if configured_ids else ""))
+        "answer_in_section") or role_id("conclusion_reflection") or legacy_fallback)
     analysis_id = str((constraints.get("research_question_policy") or {}).get(
-        "develop_in_section") or (configured_ids[-1] if configured_ids else ""))
+        "develop_in_section") or role_id("case_analysis") or legacy_fallback)
     conclusion = sections.get(conclusion_id, "") if required_chapters else ""
     conclusion_case_ids = set(_SEGMENT_REF.findall(conclusion)) | set(
         _SYNTHETIC_CASE_ID.findall(conclusion))
@@ -1119,6 +1344,11 @@ def validate_academic_report(
                     section_id=section_id,
                     suggested_action="逐字依据 INITIAL/TARGET 记录描述实际变化。"))
 
+    template_contract = template_contract or research_model.get("template_contract") \
+        or (report_artifact or {}).get("template_contract")
+    template_compliance = validate_template_compliance(
+        report_md, template_contract, outline, report_artifact, selected_cases)
+    issues.extend(template_compliance.get("issues") or [])
     for i, item in enumerate(issues, 1):
         item["issue_id"] = f"AV-{i:03d}"
     counts = Counter(x["severity"] for x in issues)
@@ -1144,6 +1374,7 @@ def validate_academic_report(
             "research_question_markers": len(_RQ.findall(report_md)),
         },
     }
+    result["template_compliance"] = template_compliance
     result["content_hash"] = stable_hash({k: v for k, v in result.items()
                                           if k != "content_hash"})
     return result
@@ -1158,6 +1389,9 @@ def render_warnings_markdown(
 ) -> str:
     lines = ["# 学术证据与质量警告", ""]
     lines.append(f"- 确定性验证：{validation.get('status', 'unknown')}")
+    if validation.get("template_compliance"):
+        lines.append("- 模板合规：" + str(
+            (validation.get("template_compliance") or {}).get("status", "unknown")))
     if review:
         lines.append(f"- 语义审稿：{review.get('status', 'unknown')}")
     if literature_review:

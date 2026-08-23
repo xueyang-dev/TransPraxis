@@ -21,6 +21,7 @@ from transpraxis import delivery as _delivery
 from transpraxis import knowledge as _knowledge
 from transpraxis import literature_evidence as _literature_evidence
 from transpraxis import report_evidence as _report_evidence
+from transpraxis import report_template as _report_template
 
 # Older Streamlit versions (including the Python 3.9-compatible line) do not
 # expose persist_state; widget keys provide the fallback there.
@@ -1935,6 +1936,74 @@ def _remove_literature_registry():
         st.session_state.get("literature_registry_generation", 0) + 1
 
 
+def _remove_report_template():
+    for key in ("report_template_input", "report_template_error",
+                "report_template_signature"):
+        st.session_state.pop(key, None)
+    st.session_state.report_template_removed = True
+    st.session_state.report_template_uploader_generation = \
+        st.session_state.get("report_template_uploader_generation", 0) + 1
+
+
+def _render_report_template_input():
+    """Capture the DOCX template separately from reference-material uploads."""
+    template = st.session_state.get("report_template_input")
+    if template:
+        summary = _report_template.contract_summary(template.get("contract"))
+        st.markdown(
+            f'<div class="tp-attachment"><div><strong>{escape(str(template.get("name") or "模板.docx"))}</strong>'
+            f'<span>已解析 · {summary.get("chapter_count", 0)} 个章节 · '
+            f'{summary.get("subsection_count", 0)} 个小节</span></div></div>',
+            unsafe_allow_html=True)
+        st.button("移除报告模板", key="remove_report_template",
+                  on_click=_remove_report_template, width="stretch")
+        with st.expander("查看模板结构与格式契约", expanded=False):
+            st.caption(
+                f"模板哈希：{str(summary.get('template_hash') or '')[:16]} · "
+                "模板章节、标题层级、前后置部分与 DOCX 样式将作为报告约束。")
+            structure = template["contract"].get("document_structure") or {}
+            for chapter in structure.get("chapters") or []:
+                subs = "、".join(str(x.get("title")) for x in
+                                  chapter.get("required_subsections") or [])
+                st.markdown(
+                    f"- **{chapter.get('section_id')} {chapter.get('title')}**"
+                    f"（{chapter.get('role')}）"
+                    + (f"：{subs}" if subs else ""))
+            if structure.get("front_matter"):
+                st.caption("前置部分：" + "、".join(
+                    str(x.get("title")) for x in structure["front_matter"]))
+            if structure.get("back_matter"):
+                st.caption("后置部分：" + "、".join(
+                    str(x.get("title")) for x in structure["back_matter"]))
+        return
+
+    uploaded = st.file_uploader(
+        "论文 / 翻译实践报告模板（DOCX，可选但推荐）",
+        type=["docx"],
+        key=f"report_template_uploader_"
+            f"{st.session_state.get('report_template_uploader_generation', 0)}",
+        help="模板会固定报告章节、标题层级、前后置部分和 Word 样式；未上传时使用通用 DOCX。",
+    )
+    if uploaded:
+        raw = uploaded.getvalue()
+        signature = (uploaded.name, len(raw), raw[:32])
+        if signature != st.session_state.get("report_template_signature"):
+            try:
+                contract = _report_template.parse_docx_template(uploaded.name, raw)
+                st.session_state.report_template_input = {
+                    "name": uploaded.name, "bytes": raw, "contract": contract,
+                }
+                st.session_state.report_template_error = None
+                st.session_state.report_template_signature = signature
+                st.session_state.report_template_removed = False
+                st.rerun()
+            except _report_template.TemplateParseError as exc:
+                st.session_state.report_template_error = str(exc)
+                st.session_state.report_template_signature = signature
+    if st.session_state.get("report_template_error"):
+        st.error("报告模板无法使用：" + str(st.session_state.report_template_error))
+
+
 def _render_literature_inputs():
     """Show user-facing reference uploads; registry JSON stays an advanced escape hatch."""
     uploads = st.session_state.get("literature_uploads") or []
@@ -3286,6 +3355,7 @@ def _render_workspace_report_context(job_id, state):
     quality_label = _report_quality_label(quality)
     report_stage = _workspace_report_stage(job_id, state)
     validation = artifacts.get("validation") or {}
+    template = core.load_report_template(job_id)
     groups = _report_issue_groups(artifacts, academic)
     if not state.get("p3_md"):
         st.markdown('<div class="tp-info-card"><h3>报告状态</h3>'
@@ -3301,6 +3371,16 @@ def _render_workspace_report_context(job_id, state):
                 f'<div class="tp-info-stat"><span>文献证据</span><b>{escape(_report_literature_status(artifacts))}</b></div>'
                 f'<div class="tp-info-stat"><span>待处理问题</span><b>{len(groups):,}</b></div>'
                 '</div>', unsafe_allow_html=True)
+    if template:
+        summary = template.get("summary") or {}
+        compliance = (validation.get("template_compliance") or {}).get(
+            "status", "not_configured")
+        st.markdown('<div class="tp-info-card"><h3>报告模板</h3>'
+                    f'<div class="tp-info-stat"><span>文件</span><b>{escape(str(summary.get("filename") or "—"))}</b></div>'
+                    f'<div class="tp-info-stat"><span>结构</span><b>{summary.get("chapter_count", 0)} 章 · {summary.get("subsection_count", 0)} 节</b></div>'
+                    f'<div class="tp-info-stat"><span>合规</span><b>{escape(_report_validation_label(compliance))}</b></div>'
+                    f'<p class="tp-tech-detail">哈希 {escape(str(summary.get("template_hash") or "")[:16])}</p>'
+                    '</div>', unsafe_allow_html=True)
     st.markdown('<div class="tp-info-card"><h3>当前工作稿</h3>'
                 f'<div class="tp-info-stat"><span>报告状态</span><b>{escape(report_stage)}</b></div>'
                 '<p class="tp-tech-detail">报告可继续编辑；最终交付确认仍在“交付”页面完成。</p>'
@@ -3753,13 +3833,21 @@ _REPORT_STATISTIC_ISSUES = {
     "unknown_project_statistic", "wrong_project_statistic",
     "unresolved_statistic_token", "unmarked_project_statistic",
 }
+_REPORT_TEMPLATE_ISSUES = {
+    "template_chapter_count_mismatch", "template_missing_chapter",
+    "template_chapter_order_mismatch", "template_chapter_title_mismatch",
+    "template_missing_subsection", "template_subsection_level_mismatch",
+    "template_subsection_order_mismatch", "template_extra_subsection",
+    "template_extra_chapter", "template_hash_mismatch", "template_matter_mismatch",
+    "template_case_role_missing", "template_case_role_mismatch",
+}
 
 
 def _report_artifacts(job_id):
     return {
         name: core.load_academic_artifact(job_id, name)
         for name in (
-            "selected_cases", "outline", "validation", "review",
+            "selected_cases", "outline", "report", "validation", "review",
             "literature_sources", "literature_evidence", "literature_claims",
             "literature_support_review", "academic_quality",
             "human_evidence_questions",
@@ -3780,6 +3868,7 @@ def _report_validation_label(status):
     return {
         "pass": "通过", "pass_with_warnings": "通过 · 有警告",
         "fail": "需要复核", "review_required": "需要复核",
+        "not_configured": "未配置模板",
     }.get(status, "未生成")
 
 
@@ -3804,14 +3893,11 @@ def _report_updated_label(job_id, state, academic):
 
 
 def _report_docx_bytes(state, frozen_assets=None):
-    """Use the same markdown_to_word path for Report and Delivery surfaces."""
-    if frozen_assets and frozen_assets.get("stage3_report.docx"):
-        return frozen_assets["stage3_report.docx"]
-    report = state.get("p3_md")
-    if not report:
+    """Use the persisted template renderer for Report and Delivery surfaces."""
+    job_id = st.session_state.get("active_job_id")
+    if not job_id:
         return None
-    return core.markdown_to_word(
-        report, state.get("theory") or "翻译实践").getvalue()
+    return core.report_docx_bytes(job_id, state, frozen_assets=frozen_assets)
 
 
 def _report_heading_title(value):
@@ -3885,6 +3971,8 @@ def _report_issue_category(issue):
         return "案例不足"
     if issue_type in _REPORT_STATISTIC_ISSUES:
         return "统计验证失败"
+    if issue_type in _REPORT_TEMPLATE_ISSUES:
+        return "模板合规"
     if "citation" in issue_type or issue_type in {
             "unregistered_formal_citation", "uncitable_literature_source"}:
         return "引用需要确认"
@@ -3906,6 +3994,8 @@ def _report_issue_detail(category, issue):
         return "存在需要核对的引用来源或作者—年份信息。"
     if category == "统计验证失败":
         return "报告中的项目统计与证据库不一致，或统计来源未能解析。"
+    if category == "模板合规":
+        return "报告与上传模板的章节、标题、层级或角色不一致。"
     if category == "章节需要重新生成":
         section_id = issue.get("section_id")
         return f"第 {section_id} 节存在结构或论证问题，建议定点重新生成。" \
@@ -3965,13 +4055,15 @@ def _report_issue_groups(artifacts, academic):
         add("需要人工补充", "报告质量状态仍要求人工复核。")
 
     ordered = []
-    for category in ("案例不足", "文献证据缺失", "引用需要确认",
+    for category in ("模板合规", "案例不足", "文献证据缺失", "引用需要确认",
                      "统计验证失败", "章节需要重新生成", "需要人工补充"):
         if category not in groups:
             continue
         group = groups[category]
         sections = sorted(group["sections"], key=str)
-        if category == "案例不足":
+        if category == "模板合规":
+            action = "查看验证结果"
+        elif category == "案例不足":
             action = "查看案例选择"
         elif category == "文献证据缺失":
             action = "查看文献证据"
@@ -4024,6 +4116,11 @@ def _render_workspace_report(job_id, state):
     quality_label = _report_quality_label(quality)
     validation_label = _report_validation_label(
         (artifacts.get("validation") or {}).get("status"))
+    validation = artifacts.get("validation") or {}
+    template = core.load_report_template(job_id)
+    template_summary = (template or {}).get("summary") or {}
+    template_compliance = (validation.get("template_compliance") or {}).get(
+        "status", "not_configured")
     st.markdown('<div class="tp-section-kicker">下游成果</div><h2>报告</h2>'
                 '<div class="tp-section-lead">以报告阅读为中心；复核与技术诊断按需展开。</div>',
                 unsafe_allow_html=True)
@@ -4032,18 +4129,35 @@ def _render_workspace_report(job_id, state):
                 '报告工作区</div><h3>翻译实践报告</h3>'
                 f'<div class="tp-report-meta">最后更新 {escape(updated)} · '
                 f'{chapter_count:,} 个章节 · {case_count:,} 个案例 · '
-                f'验证：{escape(validation_label)} · 质量：{escape(quality_label)}</div></div>'
+                f'验证：{escape(validation_label)} · 质量：{escape(quality_label)} · '
+                f'模板合规：{escape(_report_validation_label(template_compliance))}</div></div>'
                 f'<div class="tp-report-toolbar-status">{_workspace_status_badge(report_stage, tone)}'
                 '</div></div></div>', unsafe_allow_html=True)
 
     if report:
+        if template:
+            st.caption(
+                f"模板：{template_summary.get('filename') or '—'} · "
+                f"{template_summary.get('chapter_count', 0)} 章 / "
+                f"{template_summary.get('subsection_count', 0)} 节 · "
+                f"哈希 {str(template_summary.get('template_hash') or '')[:16]} · "
+                f"合规 {_report_validation_label(template_compliance)}")
+        else:
+            st.caption("未配置报告模板；当前 DOCX 将使用通用排版。")
         with st.container(key=f"report_actions_{job_id}"):
             action_a, action_b, action_c = st.columns([1.55, 1.25, 1.25], gap="small")
             docx_data = _report_docx_bytes(state)
             filename = Path(str(state.get("filename") or "report")).stem or "report"
             validation_status = (artifacts.get("validation") or {}).get("status")
-            draft_label = "导出当前草稿 DOCX" if quality != "pass" or \
-                validation_status != "pass" else "导出 DOCX"
+            if template:
+                draft_label = "导出模板化 DOCX"
+            elif not artifacts.get("report"):
+                # Preserve the old task workspace affordance until its first
+                # structured report artifact is created.
+                draft_label = "导出当前草稿 DOCX" if quality != "pass" or \
+                    validation_status != "pass" else "导出 DOCX"
+            else:
+                draft_label = "导出通用 DOCX"
             with action_a:
                 st.download_button(
                     draft_label, docx_data,
@@ -4374,6 +4488,12 @@ research_settings = st.session_state.get("research_settings", {
     "case_selection_policy": "mixed", "case_limit": 5,
     "analysis_dimensions": ["文本特征", "术语管理", "翻译策略", "译后编辑与质量控制"],
 })
+research_settings = dict(research_settings)
+template_input = st.session_state.get("report_template_input")
+if template_input:
+    research_settings["report_template_contract"] = template_input.get("contract")
+elif st.session_state.get("report_template_removed"):
+    research_settings.pop("report_template_contract", None)
 
 # ================= Main views =================
 setup_placeholder = st.empty()
@@ -4759,6 +4879,12 @@ with setup_placeholder.container():
                             "基于文本特征、案例证据与可用文献自动推荐理论框架"
                     else:
                         translation_theory = theory_choice
+                    with st.container(key="report_template_inputs"):
+                        st.markdown(
+                            '<div class="tp-output-section-head"><strong>报告结构模板</strong>'
+                            '<span>先固定结构，再将证据分配到章节</span></div>',
+                            unsafe_allow_html=True)
+                        _render_report_template_input()
                     with st.container(key="literature_inputs"):
                         st.markdown(
                             '<div class="tp-output-section-head"><strong>参考文献与理论资料</strong>'
@@ -4813,7 +4939,10 @@ with setup_placeholder.container():
                     else "用户调整"
             connection_status = st.session_state.get(
                 "provider_connection_status", "unverified")
-            can_start = bool(task_files and api_key and ai_model)
+            can_start = bool(task_files and api_key and ai_model) and not bool(
+                st.session_state.get("report_template_error"))
+            if st.session_state.get("report_template_error"):
+                st.warning("请移除或重新上传可解析的报告模板后再开始任务。")
             st.markdown(_summary_html(filename_summary, target_lang, preset_label,
                                       glossary_name, strategy_config, output_config,
                                       style_template, style_source),
@@ -4956,6 +5085,13 @@ if tasks:
     overall_bar = st.progress(0)
     for task_idx, task in enumerate(tasks):
         job_id, filename, file_bytes = task["job_id"], task["filename"], task["file_bytes"]
+        if st.session_state.get("report_template_removed"):
+            core.clear_report_template(job_id)
+            st.session_state.doc_states.pop(job_id, None)
+        if template_input:
+            core.save_report_template(
+                job_id, template_input.get("name") or "template.docx",
+                template_input.get("bytes") or b"")
         state = st.session_state.doc_states.get(job_id) or core.load_job_state(job_id) \
             or core.new_job_state(filename)
         st.session_state.doc_states[job_id] = state
