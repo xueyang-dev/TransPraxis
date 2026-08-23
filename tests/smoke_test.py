@@ -689,9 +689,27 @@ def test_review_fix_and_blocking():
                 return '[]'
             if "翻译审校专家" in system_prompt:
                 return json.dumps([
-                    {"segment_index": 0, "severity": "actionable", "reason": "术语不一致",
+                    {"segment_index": 0, "severity": "actionable",
+                     "category": "terminology_consistency",
+                     "summary": "术语不一致",
+                     "source_span": "第一段",
+                     "target_span": "修正后的译文",
+                     "explanation": "当前译法没有遵循项目术语约定。",
+                     "recommendation": "对照术语表确认并统一译法。",
+                     "confidence": 0.88,
+                     "detector": "Semantic QA",
+                     "reason": "术语不一致",
                      "suggested_target": "修正后的译文"},
-                    {"segment_index": 1, "severity": "blocking", "reason": "语义严重错误，需人工确认"},
+                    {"segment_index": 1, "severity": "blocking",
+                     "category": "semantic_accuracy",
+                     "summary": "语义可能发生严重偏移",
+                     "source_span": "第二段",
+                     "target_span": "译文：这是第二段，内容足够长以通过过滤。",
+                     "explanation": "当前译文可能改变原文的核心关系。",
+                     "recommendation": "回到原文核对核心语义后再决定处理方式。",
+                     "confidence": 0.92,
+                     "detector": "Semantic QA",
+                     "reason": "语义严重错误，需人工确认"},
                 ])
             if "学术翻译专家" in system_prompt:
                 return json.dumps([f"译文：{s}" for _, s in _numbered_sources(user_prompt)])
@@ -710,6 +728,8 @@ def test_review_fix_and_blocking():
         assert len(state["findings"]) == 1
         assert state["findings"][0]["severity"] == "blocking"
         assert state["findings"][0]["type"] == "review"
+        assert state["findings"][0]["explanation"]
+        assert state["findings"][0]["recommendation"]
         assert state["has_blocking"] is True
         report = core.findings_report_md(state)
         assert "blocking" in report and "待处理问题" in report

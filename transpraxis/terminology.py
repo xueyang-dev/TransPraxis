@@ -454,6 +454,13 @@ def check_glossary_compliance(
                 findings.append({
                     "type": "glossary", "severity": _preserve_severity(e["source"]),
                     "entry_id": e["id"], "segment_id": segment_id,
+                    "category": "terminology_consistency",
+                    "summary": f"译文遗漏锁定保留项「{e['source']}」",
+                    "source_span": e["source"], "target_span": None,
+                    "explanation": f"项目术语表要求保留项「{e['source']}」原样出现，但当前译文中没有找到它。",
+                    "recommendation": "确认该词是否确实需要保留；若需要，请补回原文形式并重新检查格式。",
+                    "confidence": None, "detector": "Terminology QA",
+                    "diagnostic_version": 1,
                     "reason": f"锁定保留项「{e['source']}」在译文中丢失",
                 })
         else:
@@ -463,6 +470,13 @@ def check_glossary_compliance(
                 findings.append({
                     "type": "glossary", "severity": "actionable",
                     "entry_id": e["id"], "segment_id": segment_id,
+                    "category": "terminology_consistency",
+                    "summary": f"术语「{e['source']}」未使用首选译名",
+                    "source_span": e["source"], "target_span": None,
+                    "explanation": f"项目术语表将「{e['source']}」锁定为首选译名「{preferred}」，但当前译文中未出现该译名。",
+                    "recommendation": "检查当前语境是否有合理例外；如果没有，请统一为项目术语表中的首选译名。",
+                    "confidence": None, "detector": "Terminology QA",
+                    "diagnostic_version": 1,
                     "reason": f"锁定术语「{e['source']}」未使用首选译名「{preferred}」",
                 })
             for fb in e.get("forbidden") or []:
@@ -470,6 +484,13 @@ def check_glossary_compliance(
                     findings.append({
                         "type": "glossary", "severity": "actionable",
                         "entry_id": e["id"], "segment_id": segment_id,
+                        "category": "terminology_consistency",
+                        "summary": f"术语「{e['source']}」使用了禁止译名",
+                        "source_span": e["source"], "target_span": fb,
+                        "explanation": f"当前译文使用了术语「{e['source']}」的禁止译名「{fb}」，与已锁定术语规则冲突。",
+                        "recommendation": "改用项目术语表中的首选译名，并检查同一术语在相邻段落中的译法。",
+                        "confidence": None, "detector": "Terminology QA",
+                        "diagnostic_version": 1,
                         "reason": f"术语「{e['source']}」使用了禁止译名「{fb}」",
                     })
     return findings
@@ -526,6 +547,13 @@ def detect_glossary_conflicts(
                     findings.append({
                         "type": "glossary", "severity": "actionable",
                         "entry_id": e["id"], "segment_id": i, "conflict": True,
+                        "category": "terminology_consistency",
+                        "summary": f"术语「{e['source']}」在同一范围内出现多种译法",
+                        "source_span": e["source"], "target_span": label,
+                        "explanation": f"同一范围内的术语「{e['source']}」出现了不同译法，可能破坏项目术语的一致性。",
+                        "recommendation": "检查这些译法是否由语境差异造成；若无明确理由，请统一为项目术语表中的译法。",
+                        "confidence": None, "detector": "Terminology QA",
+                        "diagnostic_version": 1,
                         "reason": f"锁定术语「{e['source']}」在同一范围内出现多种译法"
                                   f"（段 {i} 为{kind}译法「{label}」），需人工统一",
                     })

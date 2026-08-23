@@ -217,6 +217,7 @@ def test_frozen_snapshot_is_visible_in_workspace_and_history():
         at.session_state["active_job_id"] = job_id
         at.session_state["app_view"] = "workspace"
         at.session_state["workspace_mode"] = True
+        at.session_state["workspace_section"] = "delivery"
         at.run()
         assert not at.exception, at.exception
         assert any("最终交付版本 v1" in item.value for item in at.success)

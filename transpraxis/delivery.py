@@ -25,6 +25,18 @@ SEVERITY_LABELS = {
 }
 SEVERITY_ORDER = {"blocking": 0, "actionable": 1, "informational": 2}
 _DETECTED_TEXT_RE = re.compile(r"[「『“\"]([^」』”\"]+)[」』”\"]")
+_CATEGORY_LABELS = {
+    "semantic_accuracy": "语义准确性",
+    "terminology_consistency": "术语一致性",
+    "completeness": "完整性",
+    "translation_completion": "翻译完成度",
+    "format_integrity": "格式完整性",
+    "source_language_residue": "源语残留",
+    "deterministic_qa": "确定性检查",
+    "review_finding": "审校发现",
+    "fluency": "语言表达",
+    "style": "风格一致性",
+}
 
 
 def now_iso() -> str:
@@ -106,6 +118,11 @@ def _merge_finding(target: Dict[str, Any], incoming: Dict[str, Any]) -> None:
             target["suggested_targets"] = all_targets
     for key in ("detected_text", "review_detail"):
         if incoming.get(key) and not target.get(key):
+            target[key] = incoming[key]
+    for key in ("category", "summary", "source_span", "target_span",
+                "explanation", "recommendation", "confidence", "detector",
+                "diagnostic_version"):
+        if incoming.get(key) is not None and not target.get(key):
             target[key] = incoming[key]
 
 
@@ -203,23 +220,56 @@ def finding_context(state: Dict[str, Any], finding: Dict[str, Any]) -> Dict[str,
     """Build the review card context from persisted translation/evidence state."""
     index = _segment_index(finding)
     event_id = finding.get("review_event_id") or finding.get("finding_instance_id")
+    finding_evidence_refs = set(_values(finding.get("evidence_refs")))
     pairs = state.get("pairs") or []
     pair = pairs[index] if index is not None and 0 <= index < len(pairs) else {}
     review_evidence = []
     for entry in state.get("review_evidence") or []:
         segment_ids = entry.get("segment_ids") or []
         if (index in segment_ids or str(index) in {str(x) for x in segment_ids}) \
-                and (not event_id or not entry.get("review_event_id")
-                     or entry.get("review_event_id") == event_id):
+                and ((event_id and entry.get("review_event_id") == event_id)
+                     or (not event_id and finding.get("type") == "review"
+                         and not entry.get("review_event_id"))):
+            trace_evidence_ids = [str(item) for item in entry.get("evidence_ids") or []
+                                  if str(item) in finding_evidence_refs]
+            trace_requests = [dict(request) for request in entry.get("requests") or []
+                              if str(request.get("evidence_id")) in finding_evidence_refs]
             review_evidence.append({
                 "phase": entry.get("phase"),
                 "decision": entry.get("decision"),
-                "evidence_ids": list(entry.get("evidence_ids") or []),
-                "requests": list(entry.get("requests") or []),
+                "evidence_ids": trace_evidence_ids,
+                "requests": trace_requests,
                 "completion_receipt": entry.get("completion_receipt") or {},
                 "review_event_id": entry.get("review_event_id"),
             })
     detected = finding_detected_text(finding)
+    finding_type = str(finding.get("type") or "")
+    category = str(finding.get("category") or "").strip()
+    if not category:
+        if finding_type in {"review", "semantic"}:
+            category = "semantic_accuracy"
+        elif finding_type in {"glossary", "glossary_stale", "knowledge_conflict"}:
+            category = "terminology_consistency"
+        elif finding.get("kind") == "source_residue":
+            category = "source_language_residue"
+        elif finding_type == "check":
+            category = "deterministic_qa"
+        else:
+            category = finding_type or "review_finding"
+    detector = str(finding.get("detector") or "").strip()
+    if not detector:
+        detector = {
+            "review": "Semantic QA", "glossary": "Terminology QA",
+            "glossary_stale": "Terminology QA", "knowledge_conflict": "Knowledge QA",
+            "check": "Deterministic QA",
+        }.get(finding_type, "审校记录")
+    evidence_ids = list(dict.fromkeys(_values(finding.get("evidence_refs"))))
+    for trace in review_evidence:
+        evidence_ids.extend(str(item) for item in trace.get("evidence_ids") or [])
+    evidence_ids = list(dict.fromkeys(evidence_ids))
+    required_diagnostics = ("summary", "explanation", "recommendation")
+    diagnostic_complete = all(str(finding.get(field) or "").strip()
+                               for field in required_diagnostics)
     return {
         "finding_id": finding_id(finding),
         "segment_index": index,
@@ -227,6 +277,18 @@ def finding_context(state: Dict[str, Any], finding: Dict[str, Any]) -> Dict[str,
         "severity": finding.get("severity"),
         "severity_label": severity_label(finding.get("severity")),
         "reason": str(finding.get("reason") or "审校发现问题"),
+        "category": category,
+        "category_label": _CATEGORY_LABELS.get(category, category),
+        "summary": str(finding.get("summary") or "").strip(),
+        "source_span": str(finding.get("source_span") or "").strip(),
+        "target_span": str(finding.get("target_span") or "").strip(),
+        "explanation": str(finding.get("explanation") or "").strip(),
+        "recommendation": str(finding.get("recommendation") or "").strip(),
+        "confidence": finding.get("confidence"),
+        "detector": detector,
+        "diagnostic_version": finding.get("diagnostic_version"),
+        "diagnostic_complete": diagnostic_complete,
+        "legacy_diagnostic": not diagnostic_complete,
         "detected_text": detected,
         "source": str(pair.get("source") or ""),
         "target": str(pair.get("target") or ""),
@@ -235,6 +297,7 @@ def finding_context(state: Dict[str, Any], finding: Dict[str, Any]) -> Dict[str,
         "proper_noun_candidate": is_source_residue_finding(finding)
         and likely_proper_noun(detected),
         "evidence_refs": _values(finding.get("evidence_refs")),
+        "evidence_ids": evidence_ids,
         "review_evidence": review_evidence,
         "duplicate_count": int(finding.get("duplicate_count") or 1),
         "review_event_id": event_id,

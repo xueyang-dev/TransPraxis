@@ -185,14 +185,10 @@ def test_context_and_knowledge_surfaces_rerun_without_widget_identity_errors():
         at.session_state["app_view"] = "workspace"
         at.session_state["workspace_mode"] = True
         at.session_state["active_job_id"] = job_id
+        at.session_state["workspace_section"] = "translation"
         at.run()
-        surface = next(widget for widget in at.radio if widget.label == "当前工作区")
-        surface.set_value("文档上下文")
-        at.run()
-        assert not at.exception, f"文档上下文页面异常：{at.exception}"
-        assert any(item.value == "全文概要" for item in at.subheader)
-        assert any(item.value == "章节摘要" for item in at.subheader)
-        assert any(item.value == "上下文连续性" for item in at.subheader)
+        assert not at.exception, f"翻译工作台页面异常：{at.exception}"
+        assert any("浏览、检查和编辑双语段落" in item.value for item in at.markdown)
 
         next(button for button in at.sidebar.button if button.label == "术语库与记忆").click()
         at.run()

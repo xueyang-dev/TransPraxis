@@ -99,6 +99,58 @@ def test_evidence_requests_are_bounded_and_traced():
     assert trace["requests"][0]["result"][0]["segment_id"] == 0
 
 
+def test_review_findings_keep_actionable_diagnostics_and_exact_spans():
+    index = TranslationEvidenceIndex(
+        ["The source span matters."],
+        [{"source": "The source span matters.", "target": "这个片段很重要。"}],
+        [])
+    reply = json.dumps({"findings": [{
+        "segment_id": 0,
+        "category": "semantic_accuracy",
+        "severity": "blocking",
+        "summary": "译文遗漏限制条件",
+        "source_span": "source span",
+        "target_span": "这个片段",
+        "explanation": "原文中的限定关系没有在译文中保留。",
+        "recommendation": "检查限定范围并补回必要表达。",
+        "confidence": 0.91,
+        "detector": "Semantic QA",
+        "evidence_refs": [],
+    }]})
+    findings, failed, _ = review_translation_batch_with_evidence(
+        ["The source span matters."], ["这个片段很重要。"], "", "", "中文",
+        "DeepSeek", "k", "m", index, call_llm=lambda *args, **kwargs: reply)
+    assert not failed and len(findings) == 1
+    finding = findings[0]
+    assert finding["diagnostic_version"] == 1
+    assert finding["category"] == "semantic_accuracy"
+    assert finding["source_span"] == "source span"
+    assert finding["target_span"] == "这个片段"
+    assert finding["confidence"] == 0.91
+
+
+def test_deterministic_findings_explain_rule_failures_without_fake_confidence():
+    findings = core.check_translation_batch(
+        ["The source contains a placeholder %s."], [""], [], "中文")
+    assert findings[0]["category"] == "completeness"
+    assert findings[0]["summary"] == "译文为空"
+    assert findings[0]["explanation"]
+    assert findings[0]["recommendation"]
+    assert findings[0]["confidence"] is None
+
+
+def test_incomplete_new_diagnostic_payload_is_not_accepted_as_complete():
+    index = TranslationEvidenceIndex(["source"], [{"target": "target"}], [])
+    findings, failed, trace = review_translation_batch_with_evidence(
+        ["source"], ["target"], "", "", "中文", "DeepSeek", "k", "m", index,
+        call_llm=lambda *args, **kwargs: json.dumps({"findings": [{
+            "segment_id": 0, "category": "semantic_accuracy",
+            "severity": "blocking", "summary": "摘要",
+        }] }))
+    assert findings == [] and failed
+    assert trace["completion_receipt"]["status"] == "failed"
+
+
 def test_shadow_overlay_and_checkpoint_recovery(tmp_path):
     overlay = repair.create_overlay(
         ["初译"], ["修复"], [{"segment_index": 0}], "deterministic",

@@ -83,8 +83,9 @@ def test_recovery_ui():
         assert at.session_state["active_job_id"] == job_id
         at.run()
         assert not at.exception, f"恢复后的当前任务面板异常：{at.exception}"
-        assert any("任务状态与自动保存" in s.value for s in at.subheader)
-        print("  ✓ Recovery UI：History 状态、断点继续与批次重做范围可见")
+        assert any("<h2>概览</h2>" in s.value for s in at.markdown)
+        assert any("最近活动" in s.value for s in at.markdown)
+        print("  ✓ Recovery UI：History 状态、断点继续与 workspace 恢复可见")
     finally:
         core.run_job_pipeline = original_pipeline
         core.OUTPUT_DIR = old_dir

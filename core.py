@@ -776,22 +776,51 @@ def is_incomplete_translation(src, tgt):
     return False
 
 
+def _deterministic_finding(segment_index, severity, category, summary,
+                           explanation, recommendation, *, source_span=None,
+                           target_span=None, reason=None, kind=None,
+                           detected_text=None, **extra):
+    """Build an evidence-free but actionable deterministic QA finding."""
+    finding = {
+        "segment_index": segment_index, "segment_id": segment_index,
+        "type": "check", "severity": severity,
+        "category": category, "summary": summary,
+        "source_span": source_span, "target_span": target_span,
+        "explanation": explanation, "recommendation": recommendation,
+        "confidence": None, "detector": "Deterministic QA",
+        "diagnostic_version": 1,
+        "reason": reason or summary,
+    }
+    if kind:
+        finding["kind"] = kind
+    if detected_text:
+        finding["detected_text"] = detected_text
+    finding.update({key: value for key, value in extra.items() if value is not None})
+    return finding
+
+
 def check_translation_batch(sources, targets, glossary, target_lang,
                             section_profile=None):
     """确定性检查一批译文：空译、保留项丢失、源语残留、锁定术语合规（scope 感知）。"""
     findings = []
     for i, (src, tgt) in enumerate(zip(sources, targets)):
         if not tgt.strip():
-            findings.append({"segment_index": i, "type": "check", "severity": "blocking",
-                             "reason": "译文为空"})
+            findings.append(_deterministic_finding(
+                i, "blocking", "completeness", "译文为空",
+                "原文存在，但当前段落没有任何译文内容，无法确认信息是否被完整传达。",
+                "补译本段后，检查是否覆盖原文的全部句子、限制条件和专有名词。",
+                source_span=src, target_span=""))
             continue
         # 完整性检查：拦截截断译文。
         # 实测根因：审校/修复环节的整段替换把长段译文换成了一句修正。
         if is_incomplete_translation(src, tgt):
-            findings.append({"segment_index": i, "type": "check", "severity": "blocking",
-                             "reason": f"疑似漏译/截断：原文 {len(src)} 字符"
-                                       f"/{_count_sentences(src)} 句，译文仅 {len(tgt.strip())} 字符"
-                                       f"/{_count_sentences(tgt)} 句"})
+            reason = (f"疑似漏译/截断：原文 {len(src)} 字符/{_count_sentences(src)} 句，"
+                      f"译文仅 {len(tgt.strip())} 字符/{_count_sentences(tgt)} 句")
+            findings.append(_deterministic_finding(
+                i, "blocking", "completeness", "译文疑似遗漏或被截断",
+                "原文长度和句子数量与当前译文不匹配，译文可能没有覆盖完整内容。",
+                "对照原文逐句补齐缺失内容，并确认修复后的译文通过完整性复验。",
+                source_span=src, target_span=tgt, reason=reason))
         source_words = re.findall(r"[A-Za-z]+", src or "")
         whole_source_preserved = any(
             str(entry.get("behavior") or "") == "preserve"
@@ -803,18 +832,30 @@ def check_translation_batch(sources, targets, glossary, target_lang,
                 and re.sub(r"\s+", " ", src or "").strip().casefold() \
                 == re.sub(r"\s+", " ", tgt or "").strip().casefold() \
                 and not whole_source_preserved:
-            findings.append({
-                "segment_index": i, "type": "check", "severity": "actionable",
-                "reason": "译文与英文源段完全相同，疑似整段未翻译"})
+            findings.append(_deterministic_finding(
+                i, "actionable", "translation_completion", "译文仍保留整段源文",
+                "当前译文与英文原文完全相同，除非这是明确的保留项，否则可能尚未完成翻译。",
+                "确认该段是否属于项目规定的保留内容；若不是，请重新翻译并保留专有名词的必要形式。",
+                source_span=src, target_span=tgt,
+                reason="译文与英文源段完全相同，疑似整段未翻译"))
         for token, kind in extract_preserved_tokens(src).items():
             if token not in tgt:
-                findings.append({"segment_index": i, "type": "check",
-                                 "severity": PRESERVE_SEVERITY.get(kind, "actionable"),
-                                 "reason": f"保留项 {kind}「{token}」在译文中丢失"})
+                severity = PRESERVE_SEVERITY.get(kind, "actionable")
+                findings.append(_deterministic_finding(
+                    i, severity, "format_integrity",
+                    f"译文遗漏必须保留的{kind}「{token}」",
+                    f"原文包含必须保留的 {kind}「{token}」，但当前译文中找不到该内容。",
+                    "补回该保留项后重新检查占位符、链接或引用格式，确认其余译文未被破坏。",
+                    source_span=token, target_span="",
+                    reason=f"保留项 {kind}「{token}」在译文中丢失", kind=kind))
         for residual, sev in find_residuals(src, tgt, target_lang):
-            findings.append({"segment_index": i, "type": "check", "severity": sev,
-                             "kind": "source_residue", "detected_text": residual,
-                             "reason": f"疑似残留源语片段「{residual}」"})
+            findings.append(_deterministic_finding(
+                i, sev, "source_language_residue", f"译文残留源语片段「{residual}」",
+                "当前译文仍包含原文语言片段，可能意味着该部分未完成翻译，或未经确认地保留了源语。",
+                "确认该片段是否为有意保留的专名或术语；若不是，请翻译后检查术语和上下文一致性。",
+                source_span=residual if residual in src else None,
+                target_span=residual, reason=f"疑似残留源语片段「{residual}」",
+                kind="source_residue", detected_text=residual))
         findings.extend(check_glossary_compliance(
             src, tgt, glossary, segment_id=i, section_profile=section_profile))
         for f in findings:
@@ -1643,7 +1684,16 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                     record = {
                         "segment_id": segment_id, "segment_index": segment_id,
                         "severity": sev, "type": "review",
-                        "reason": str(rf.get("reason") or "审校发现问题"),
+                        "category": rf.get("category") or "semantic_accuracy",
+                        "summary": str(rf.get("summary") or rf.get("reason") or "审校发现问题"),
+                        "source_span": rf.get("source_span"),
+                        "target_span": rf.get("target_span"),
+                        "explanation": rf.get("explanation"),
+                        "recommendation": rf.get("recommendation"),
+                        "confidence": rf.get("confidence"),
+                        "detector": rf.get("detector") or "Semantic QA",
+                        "diagnostic_version": rf.get("diagnostic_version"),
+                        "reason": str(rf.get("reason") or rf.get("summary") or "审校发现问题"),
                         "evidence_refs": list(rf.get("evidence_refs") or []),
                         "review_event_id": review_event_id,
                     }
@@ -1722,10 +1772,12 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
         for f in findings:
             if f["severity"] in ("blocking", "actionable", "informational"):
                 segment_id = offset + f["segment_index"]
-                findings_all.append({"segment_id": segment_id,
-                                     "segment_index": segment_id,
-                                     "severity": f["severity"], "type": "check",
-                                     "reason": f["reason"]})
+                record = dict(f)
+                record.update({"segment_id": segment_id,
+                               "segment_index": segment_id,
+                               "severity": f["severity"], "type": "check",
+                               "detector": f.get("detector") or "Deterministic QA"})
+                findings_all.append(record)
 
         # 5) 批后知识反馈：只进入 candidate queue，不改变 frozen glossary。
         accepted_for_knowledge = []
@@ -1761,6 +1813,14 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                     "segment_id": segment_id, "segment_index": segment_id,
                     "severity": "actionable",
                     "type": "knowledge_conflict",
+                    "category": "terminology_consistency",
+                    "summary": "观察到的译法与锁定术语不一致",
+                    "source_span": event.get("source"),
+                    "target_span": event.get("observed_target"),
+                    "explanation": "翻译流中观察到的译法与项目锁定术语的首选译名不同，可能造成术语漂移。",
+                    "recommendation": "核对当前语境是否构成合理例外；若不是，请统一为锁定术语的首选译名。",
+                    "confidence": None, "detector": "Knowledge QA",
+                    "diagnostic_version": 1,
                     "reason": event.get("reason") or "翻译流观察译法与锁定术语不一致",
                     "source": event.get("source"),
                     "observed_target": event.get("observed_target"),
@@ -1882,19 +1942,41 @@ ANNOTATION_LABELS = {"rare": "生僻词/难词", "domain": "专业名词（特�
 
 
 def _apply_doc_fonts(doc):
-    """默认字体：西文 Times New Roman，中文宋体（Normal + 标题样式一并设置）。"""
+    """默认字体与可编辑学术文档的基础版式。"""
     from docx.oxml.ns import qn
-    for style_name in ("Normal", "Heading 1", "Heading 2", "Heading 3", "Title"):
+    from docx.shared import Cm, Pt
+    for section in doc.sections:
+        section.top_margin = Cm(2.54)
+        section.bottom_margin = Cm(2.54)
+        section.left_margin = Cm(2.54)
+        section.right_margin = Cm(2.54)
+    style_sizes = {
+        "Normal": 12, "Heading 1": 15, "Heading 2": 13.5,
+        "Heading 3": 12.5, "Heading 4": 12, "Title": 18,
+    }
+    for style_name in ("Normal", "Heading 1", "Heading 2", "Heading 3",
+                       "Heading 4", "Title", "Intense Quote", "List Bullet",
+                       "List Number"):
         try:
             style = doc.styles[style_name]
         except KeyError:
             continue
         style.font.name = EN_FONT
+        if style_name in style_sizes:
+            style.font.size = Pt(style_sizes[style_name])
         rpr = style.element.get_or_add_rPr()
         rfonts = rpr.get_or_add_rFonts()
         rfonts.set(qn("w:ascii"), EN_FONT)
         rfonts.set(qn("w:hAnsi"), EN_FONT)
         rfonts.set(qn("w:eastAsia"), CN_FONT)
+        if style_name == "Normal":
+            style.paragraph_format.line_spacing = 1.5
+            style.paragraph_format.space_after = Pt(6)
+            style.paragraph_format.first_line_indent = Cm(0.74)
+        elif style_name not in {"Title", "Heading 1", "Heading 2", "Heading 3", "Heading 4"}:
+            style.paragraph_format.line_spacing = 1.5
+            style.paragraph_format.space_after = Pt(6)
+            style.paragraph_format.first_line_indent = None
 
 
 def _apply_run_fonts(run):
@@ -2040,8 +2122,43 @@ def _add_formatted_runs(paragraph, text):
     parts = text.split('**')
     for i, part in enumerate(parts):
         run = paragraph.add_run(part)
+        _apply_run_fonts(run)
         if i % 2 != 0:
             run.bold = True
+
+
+def _markdown_table_row(line):
+    value = str(line or "").strip()
+    if value.startswith("|"):
+        value = value[1:]
+    if value.endswith("|"):
+        value = value[:-1]
+    return [cell.strip() for cell in value.split("|")]
+
+
+def _is_markdown_table_separator(line):
+    cells = _markdown_table_row(line)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+
+def _add_markdown_table(doc, rows):
+    columns = max(len(row) for row in rows)
+    table = doc.add_table(rows=1, cols=columns)
+    table.style = "Table Grid"
+    for row_index, values in enumerate(rows):
+        cells = table.rows[0].cells if row_index == 0 else table.add_row().cells
+        for col_index in range(columns):
+            cell = cells[col_index]
+            cell.text = ""
+            paragraph = cell.paragraphs[0]
+            paragraph.paragraph_format.line_spacing = 1.35
+            paragraph.paragraph_format.space_after = 0
+            paragraph.paragraph_format.first_line_indent = None
+            run = paragraph.add_run(values[col_index] if col_index < len(values) else "")
+            _apply_run_fonts(run)
+            if row_index == 0:
+                run.bold = True
+    return table
 
 
 def markdown_to_word(md_text, theory):
@@ -2054,24 +2171,51 @@ def markdown_to_word(md_text, theory):
         "SIMULATED": "模拟初译",
         "OPTIMIZED": "优化译文",
     }
+    quote_labels.update({"SOURCE": "原文", "INITIAL": "初译", "TARGET": "终译"})
     md_text = re.sub(
-        r'(?m)^>\s*\[(SYNTHETIC_SOURCE|SIMULATED|OPTIMIZED)\s+(SC-\d{4,})\]:\s*',
-        lambda match: f"> {quote_labels[match.group(1)]}（{match.group(2)}）：",
-        md_text)
+        r'(?m)^>\s*\[(SYNTHETIC_SOURCE|SIMULATED|OPTIMIZED|SOURCE|INITIAL|TARGET)\s+'
+        r'(?:SC-\d{4,}|seg-[A-Za-z0-9_-]+)\]:\s*',
+        lambda match: f"> {quote_labels[match.group(1)]}：", md_text)
+    lines = md_text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and re.match(r"^#\s+翻译实践报告", lines[0], re.IGNORECASE):
+        lines.pop(0)
+    deduped = []
+    for line in lines:
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line.strip())
+        if heading:
+            title = re.sub(r"\s+#+\s*$", "", heading.group(2)).strip()
+            previous = next((value for value in reversed(deduped) if value.strip()), "")
+            previous_heading = re.match(r"^#{1,6}\s+(.+?)\s*$", previous.strip())
+            if previous_heading:
+                previous_title = re.sub(r"\s+#+\s*$", "", previous_heading.group(1)).strip()
+                if re.sub(r"^\d+(?:\.\d+)*[.、．]?\s*", "", title).casefold() == \
+                        re.sub(r"^\d+(?:\.\d+)*[.、．]?\s*", "", previous_title).casefold():
+                    continue
+        deduped.append(line)
     title = doc.add_heading(f'翻译实践报告：基于{theory}', 0)
     title.alignment = 1
-    for line in md_text.split('\n'):
+    index = 0
+    while index < len(deduped):
+        line = deduped[index].strip()
+        if ("|" in line and index + 1 < len(deduped)
+                and _is_markdown_table_separator(deduped[index + 1])):
+            rows = [_markdown_table_row(line)]
+            index += 2
+            while index < len(deduped) and "|" in deduped[index] and deduped[index].strip():
+                rows.append(_markdown_table_row(deduped[index]))
+                index += 1
+            _add_markdown_table(doc, rows)
+            continue
         line = line.strip()
         if not line:
+            index += 1
             continue
-        if line.startswith('#### '):
-            doc.add_heading(line[5:], level=3)
-        elif line.startswith('### '):
-            doc.add_heading(line[4:], level=2)
-        elif line.startswith('## '):
-            doc.add_heading(line[3:], level=1)
-        elif line.startswith('# '):
-            doc.add_heading(line[2:], level=1)
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if heading:
+            heading_level = max(1, min(4, len(heading.group(1)) - 1))
+            doc.add_heading(heading.group(2).strip(), level=heading_level)
         elif line.startswith(('- ', '* ')):
             p = doc.add_paragraph(style='List Bullet')
             _add_formatted_runs(p, line[2:])
@@ -2081,6 +2225,7 @@ def markdown_to_word(md_text, theory):
         else:
             p = doc.add_paragraph()
             _add_formatted_runs(p, line)
+        index += 1
     doc_io = io.BytesIO()
     doc.save(doc_io)
     doc_io.seek(0)
@@ -2223,6 +2368,159 @@ def save_job_state(job_id, state):
     tmp = d / "state.json.tmp"
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(d / "state.json")
+
+
+def _recount_reviewed_segments(state):
+    """Keep the segment review count in sync with the canonical pair records."""
+    state.setdefault("review_stats", {})["reviewed_segments"] = sum(
+        bool(pair.get("reviewed")) for pair in state.get("pairs") or [])
+
+
+def translation_terms_for_pair(state, pair):
+    """Resolve only glossary entries explicitly attached to one pair."""
+    ids = {str(item) for item in pair.get("glossary_entry_ids") or []}
+    entries = state.get("glossary") or []
+    if not entries:
+        frozen = state.get("glossary_frozen") or {}
+        entries = frozen.get("entries") or [] if isinstance(frozen, dict) else []
+    if not entries:
+        versions = state.get("glossary_versions") or []
+        if versions and isinstance(versions[-1], dict):
+            entries = versions[-1].get("entries") or []
+    if not ids or not isinstance(entries, list):
+        return []
+    terms = []
+    for entry in entries:
+        if not isinstance(entry, dict) or str(entry.get("id") or "") not in ids:
+            continue
+        source = str(entry.get("source") or "")
+        if source:
+            terms.append((source, str(entry.get("preferred") or entry.get("target") or "—"),
+                          "项目术语"))
+    return terms[:8]
+
+
+def translation_visible_indexes(state, search="", status_filter="全部",
+                               filter_terms=False, filter_edited=False,
+                               filter_issues=False, filter_tm=False,
+                               issue_indexes=None):
+    """Return visible pair indexes without mutating the loaded state."""
+    pairs = state.get("pairs") or []
+    query = str(search or "").strip().casefold()
+    issue_indexes = set(issue_indexes or [])
+    visible = []
+    for index, pair in enumerate(pairs):
+        source = str(pair.get("source") or "")
+        target = str(pair.get("target") or "")
+        if query:
+            paragraph_query = query.lstrip("#").strip()
+            if paragraph_query.isdigit():
+                if int(paragraph_query) != index + 1:
+                    continue
+            elif query not in f"{source}\n{target}".casefold():
+                continue
+        if status_filter == "待审" and pair.get("reviewed"):
+            continue
+        if status_filter == "已审校" and not pair.get("reviewed"):
+            continue
+        if filter_terms and not translation_terms_for_pair(state, pair):
+            continue
+        if filter_edited and not pair.get("human_edited"):
+            continue
+        if filter_tm and not pair.get("from_tm"):
+            continue
+        if filter_issues and index not in issue_indexes:
+            continue
+        visible.append(index)
+    return visible
+
+
+def save_translation_edit(job_id, index, target, actor="user"):
+    """Save one human translation edit through the state/business layer.
+
+    A manual edit is a new working translation: it preserves the paragraph
+    identity, clears segment review, removes TM reuse provenance, and invalidates
+    mutable final approval while leaving historical frozen snapshots untouched.
+    """
+    from transpraxis import delivery as _delivery
+
+    state = load_job_state(job_id)
+    if state is None:
+        raise ValueError(f"找不到任务 {job_id}")
+    pairs = state.get("pairs") or []
+    if not (0 <= index < len(pairs)):
+        raise IndexError(f"段落索引超出范围：{index}")
+    pair = pairs[index]
+    new_target = str(target or "").strip()
+    if not pair.get("human_edited"):
+        pair["_translation_edit_restore"] = {
+            "target": pair.get("target") or "",
+            "reviewed": bool(pair.get("reviewed")),
+            "review_status": pair.get("review_status", "not_reviewed"),
+            "target_provenance": pair.get("target_provenance", "generated"),
+            "from_tm": bool(pair.get("from_tm")),
+        }
+    pair["target"] = new_target
+    pair["human_edited"] = True
+    pair["reviewed"] = False
+    pair["review_status"] = "not_reviewed"
+    pair["target_provenance"] = "human_edit"
+    pair["from_tm"] = False
+    _recount_reviewed_segments(state)
+
+    if state.get("delivery_status") in ("approved", "final") \
+            or state.get("delivery_approved_by_human"):
+        _invalidate_final_delivery_state(state)
+    else:
+        state["delivery_status"] = _delivery.compute_delivery_status(state)
+    state.setdefault("human_actions", []).append({
+        "finding_id": f"segment-{index}",
+        "action": "translation_edit",
+        "note": "人工修改译文",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "actor": actor,
+    })
+    save_job_state(job_id, state)
+    return state
+
+
+def restore_translation_edit(job_id, index, actor="user"):
+    """Restore the translation state that existed before the first edit."""
+    from transpraxis import delivery as _delivery
+
+    state = load_job_state(job_id)
+    if state is None:
+        raise ValueError(f"找不到任务 {job_id}")
+    pairs = state.get("pairs") or []
+    if not (0 <= index < len(pairs)):
+        raise IndexError(f"段落索引超出范围：{index}")
+    pair = pairs[index]
+    restore = pair.pop("_translation_edit_restore", None)
+    if restore is None and not pair.get("human_edited"):
+        return state
+    restore = restore or {}
+    pair["target"] = restore.get("target") or pair.get("initial_target") or ""
+    pair["reviewed"] = bool(restore.get("reviewed"))
+    pair["review_status"] = restore.get("review_status", "not_reviewed")
+    pair["target_provenance"] = restore.get("target_provenance", "generated")
+    pair["from_tm"] = bool(restore.get("from_tm"))
+    pair.pop("human_edited", None)
+    _recount_reviewed_segments(state)
+
+    if state.get("delivery_status") in ("approved", "final") \
+            or state.get("delivery_approved_by_human"):
+        _invalidate_final_delivery_state(state)
+    else:
+        state["delivery_status"] = _delivery.compute_delivery_status(state)
+    state.setdefault("human_actions", []).append({
+        "finding_id": f"segment-{index}",
+        "action": "translation_restore",
+        "note": "恢复修改前的译文",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "actor": actor,
+    })
+    save_job_state(job_id, state)
+    return state
 
 
 def list_jobs():
@@ -2501,6 +2799,13 @@ def _apply_glossary_staleness(state):
             "severity": "blocking",
             "type": "glossary_stale",
             "entry_id": None,
+            "category": "terminology_consistency",
+            "summary": "冻结术语表已变更，本段需要重新确认",
+            "source_span": None, "target_span": None,
+            "explanation": f"冻结术语表已从当前版本变更为 v{fg.get('version')}，本段原有译文可能不再符合最新术语规则。",
+            "recommendation": "检查本段涉及的术语；确认译法后标记已处理，或使用最新术语重新翻译。",
+            "confidence": None, "detector": "Terminology QA",
+            "diagnostic_version": 1,
             "reason": f"冻结术语表已变更（当前 v{fg.get('version')}），本段需复核或重译",
         })
 

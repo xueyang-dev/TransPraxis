@@ -15,6 +15,7 @@ import streamlit as st
 
 import core
 from transpraxis import assets as _assets
+from transpraxis import academic_validator as _academic_validator
 from transpraxis import context as _context
 from transpraxis import delivery as _delivery
 from transpraxis import knowledge as _knowledge
@@ -1166,7 +1167,281 @@ label:has(input[type="checkbox"]:not([role="switch"]):focus-visible) > div:first
  }
 }
 """
-st.markdown("<style>" + _CSS + "</style>", unsafe_allow_html=True)
+
+# Workspace-specific shell.  The setup flow keeps the existing product shell;
+# once a task is open this replaces it with a focused project workspace.
+_WORKSPACE_CSS = """
+.stApp:has(.tp-workspace-shell) [data-testid="stSidebar"] { display: none !important; }
+[data-testid="stMainBlockContainer"]:has(.tp-workspace-shell) {
+ width: min(100%, 1440px); max-width: 1440px; margin: 0 auto;
+ padding: 28px 40px 56px;
+}
+.tp-workspace-shell { min-height: 2px; }
+.st-key-workspace_exit_actions { margin-bottom:8px; }
+.st-key-workspace_exit_actions .stButton > button {
+ min-height:32px; padding:0 10px; border-color:transparent; background:transparent;
+ color:var(--tp-sub); font-size:12px; justify-content:flex-start;
+}
+.st-key-workspace_exit_actions .stButton > button:hover {
+ border-color:var(--tp-line); background:#fff; color:var(--tp-ink);
+}
+.tp-workspace-topbar {
+ display:flex; align-items:flex-start; justify-content:space-between; gap:24px;
+ padding: 4px 0 22px; border-bottom:1px solid var(--tp-line);
+}
+.tp-workspace-topbar h1 { margin:0; font-size:24px !important; line-height:1.25 !important; }
+.tp-workspace-eyebrow { margin-bottom:8px; color:var(--tp-sub); font-size:12px; font-weight:600; letter-spacing:.04em; text-transform:uppercase; }
+.tp-workspace-meta { margin-top:8px; color:var(--tp-sub); font-size:13px; }
+.tp-workspace-status { display:flex; align-items:center; gap:8px; padding-top:7px; color:var(--tp-sub); font-size:13px; white-space:nowrap; }
+.tp-status-dot { width:9px; height:9px; border-radius:50%; background:#f59e0b; }
+.tp-status-dot.is-success { background:var(--tp-success); }
+.tp-status-dot.is-danger { background:var(--tp-danger); }
+.tp-status-dot.is-neutral { background:#94a3b8; }
+.tp-workspace-layout { margin-top:24px; }
+.st-key-workspace_nav_col, .st-key-workspace_context_col, .st-key-workspace_main_col { min-width:0; }
+.st-key-workspace_nav_col {
+ position:sticky; top:24px; align-self:flex-start; z-index:10;
+ padding-right:18px; border-right:1px solid var(--tp-line-subtle);
+ min-height:calc(100vh - 140px);
+}
+.tp-workspace-nav-title { margin:4px 0 12px; color:var(--tp-ink); font-size:12px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
+.tp-workspace-nav-caption { margin:0 0 14px; color:var(--tp-sub); font-size:12px; line-height:1.55; }
+.st-key-workspace_nav .stButton > button {
+ min-height:42px; margin:2px 0; justify-content:flex-start; padding:0 12px;
+ border-color:transparent; background:transparent; color:#536176; font-size:14px;
+}
+.st-key-workspace_nav .stButton > button:hover { background:#f4f7fb; border-color:transparent; color:var(--tp-ink); }
+.st-key-workspace_nav .stButton > button[kind="primary"] {
+ background:var(--tp-primary-soft); border-color:transparent; color:var(--tp-brand-ink); font-weight:650;
+}
+.st-key-workspace_nav [class*="st-key-workspace_nav_item_"] {
+ margin:2px 0; border-radius:9px;
+}
+.st-key-workspace_nav [class*="st-key-workspace_nav_item_"] [data-testid="stHorizontalBlock"] {
+ align-items:center; gap:4px;
+}
+.tp-nav-badge {
+ display:inline-flex; align-items:center; justify-content:center; min-width:20px; height:20px;
+ padding:0 6px; border-radius:999px; background:#fff0ef; color:#b42318;
+ font-size:11px; font-weight:750; line-height:1; font-variant-numeric:tabular-nums;
+}
+.tp-workspace-nav-item { display:flex; align-items:center; gap:10px; }
+.tp-workspace-nav-item i { width:7px; height:7px; border:1.5px solid currentColor; border-radius:50%; }
+.tp-workspace-nav-item.is-active i { background:currentColor; }
+.st-key-workspace_main_col { padding:0 26px; }
+.tp-workspace-main h2 { margin:2px 0 5px; font-size:22px !important; }
+.tp-workspace-main h3 { margin:0; font-size:15px !important; }
+.tp-section-kicker { color:var(--tp-sub); font-size:12px; font-weight:650; text-transform:uppercase; letter-spacing:.06em; }
+.tp-section-lead { margin:5px 0 22px; color:var(--tp-sub); font-size:14px; }
+.tp-overview-hero { padding:22px 24px; border:1px solid #d8e5fa; border-radius:14px; background:linear-gradient(135deg,#f8fbff,#fff); }
+.tp-overview-hero strong { display:block; color:var(--tp-ink); font-size:19px; }
+.tp-overview-hero p { margin:8px 0 16px; color:var(--tp-sub); font-size:13px; }
+.tp-status-badge { display:inline-flex; align-items:center; gap:6px; padding:5px 10px; border-radius:999px; background:#fff7e6; color:#9a6700; font-size:12px; font-weight:700; }
+.tp-status-badge.is-success { background:#eaf8f1; color:#147a4a; }
+.tp-status-badge.is-danger { background:#fff0f0; color:#b42318; }
+.tp-status-badge.is-neutral { background:#f1f4f8; color:#536176; }
+.tp-card-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:18px 0 26px; }
+.tp-summary-card { min-height:142px; padding:17px 17px 14px; border:1px solid var(--tp-line); border-radius:12px; background:#fff; }
+.tp-summary-card strong { display:block; color:var(--tp-ink); font-size:14px; }
+.tp-summary-card b { display:block; margin-top:15px; color:var(--tp-ink); font-size:23px; line-height:1; }
+.tp-summary-card span { display:block; margin-top:7px; color:var(--tp-sub); font-size:12px; }
+.tp-stage-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:18px 0 28px; }
+.tp-stage-card { min-height:142px; padding:17px; border:1px solid var(--tp-line); border-radius:12px; background:#fff; }
+.tp-stage-card strong { display:block; color:var(--tp-ink); font-size:14px; }
+.tp-stage-card b { display:block; margin-top:14px; color:var(--tp-ink); font-size:21px; line-height:1; font-variant-numeric:tabular-nums; }
+.tp-stage-card span { display:block; margin-top:8px; color:var(--tp-sub); font-size:12px; }
+.tp-stage-card.is-active { border-color:#b9d3f8; background:#f8fbff; }
+.tp-stage-card.is-done strong::before { content:"✓"; margin-right:7px; color:var(--tp-success); }
+.tp-stage-card.is-active strong::before { content:"●"; margin-right:7px; color:var(--tp-primary); font-size:11px; vertical-align:1px; }
+[class*="st-key-overview_stage_card_"] {
+ min-height:178px; padding:0 17px 14px; border:1px solid var(--tp-line);
+ border-radius:12px; background:#fff;
+}
+[class*="st-key-overview_stage_card_"]:has(.tp-stage-card-content.is-active) {
+ border-color:#b9d3f8; background:#f8fbff;
+}
+[class*="st-key-overview_stage_card_"] .stButton > button { margin-top:12px; }
+.tp-stage-card-content { padding-top:17px; }
+.tp-stage-card-content strong { display:block; color:var(--tp-ink); font-size:14px; }
+.tp-stage-card-content b { display:block; margin-top:14px; color:var(--tp-ink); font-size:21px; line-height:1; font-variant-numeric:tabular-nums; }
+.tp-stage-card-content span { display:block; margin-top:8px; color:var(--tp-sub); font-size:12px; }
+.tp-stage-card-content.is-done strong::before { content:"✓"; margin-right:7px; color:var(--tp-success); }
+.tp-stage-card-content.is-active strong::before { content:"●"; margin-right:7px; color:var(--tp-primary); font-size:11px; vertical-align:1px; }
+.tp-overview-progress { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:0 0 28px; padding:10px 0; border-top:1px solid var(--tp-line-subtle); border-bottom:1px solid var(--tp-line-subtle); }
+.tp-progress-step { display:inline-flex; align-items:center; gap:6px; color:var(--tp-ink); font-size:12px; white-space:nowrap; }
+.tp-progress-step i { font-style:normal; color:var(--tp-success); font-size:14px; }
+.tp-progress-step.is-active i { color:var(--tp-primary); }
+.tp-progress-step.is-pending i { color:#94a3b8; }
+.tp-step-connector { color:#b6c0ce; font-size:13px; }
+.tp-section-label { margin:0 0 10px; color:var(--tp-ink); font-size:14px; font-weight:700; }
+.tp-activity { position:relative; margin-left:5px; padding:5px 0 2px 20px; border-left:1px solid #dbe3ee; }
+.tp-activity-date { margin:0 0 5px; color:var(--tp-faint); font-size:12px; font-variant-numeric:tabular-nums; }
+.tp-activity-row { position:relative; display:block; padding:8px 0; color:var(--tp-ink); font-size:13px; }
+.tp-activity-row::before { content:""; position:absolute; left:-25px; top:14px; width:8px; height:8px; border:2px solid #fff; border-radius:50%; background:#9bbdf0; box-shadow:0 0 0 1px #9bbdf0; }
+.tp-activity-row time { display:none; }
+.st-key-workspace_context_col {
+ position:sticky; top:24px; align-self:flex-start; padding-left:18px;
+}
+.tp-info-card { padding:17px; border:1px solid var(--tp-line); border-radius:12px; background:#fff; }
+.tp-info-card + .tp-info-card { margin-top:12px; }
+.tp-info-card h3 { margin:0 0 13px; }
+.tp-info-stat { display:flex; align-items:baseline; justify-content:space-between; gap:8px; padding:8px 0; border-bottom:1px solid var(--tp-line-subtle); }
+.tp-info-stat:last-child { border-bottom:0; }
+.tp-info-stat span { color:var(--tp-sub); font-size:12px; }
+.tp-info-stat b { color:var(--tp-ink); font-size:15px; font-variant-numeric:tabular-nums; }
+.st-key-translation_inspector {
+ padding-left:6px; color:var(--tp-ink);
+}
+.tp-translation-inspector-head {
+ display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+ padding:2px 0 14px; border-bottom:1px solid var(--tp-line);
+}
+.tp-translation-inspector-head h3 { margin:0; font-size:16px !important; }
+.tp-translation-inspector-position { color:var(--tp-sub); font-size:12px; white-space:nowrap; }
+.tp-inspector-section { padding:15px 0; border-bottom:1px solid var(--tp-line-subtle); }
+.tp-inspector-section:last-child { border-bottom:0; }
+.tp-inspector-section h4 {
+ margin:0 0 10px; color:var(--tp-ink); font-size:12px; font-weight:750;
+ letter-spacing:.02em;
+}
+.tp-inspector-status { display:flex; align-items:center; gap:7px; color:var(--tp-sub); font-size:12px; }
+.tp-inspector-status strong { color:var(--tp-ink); font-weight:650; }
+.tp-inspector-term { display:flex; justify-content:space-between; gap:12px; padding:7px 0; font-size:12px; }
+.tp-inspector-term span { color:var(--tp-sub); }
+.tp-inspector-term b { color:var(--tp-ink); font-weight:650; text-align:right; }
+.tp-inspector-empty { color:var(--tp-sub); font-size:12px; }
+.tp-inspector-preview { margin:0; color:var(--tp-sub); font-size:12px; line-height:1.55; }
+.tp-inspector-preview + .tp-inspector-preview { margin-top:10px; }
+.tp-inspector-preview strong { display:block; margin-bottom:3px; color:var(--tp-faint); font-size:11px; font-weight:650; }
+.st-key-translation_inspector .stTextArea textarea { min-height:150px; font-size:13px; line-height:1.65; }
+.st-key-translation_inspector [data-testid="stExpander"] { border:0; border-top:1px solid var(--tp-line-subtle); border-radius:0; }
+.st-key-translation_inspector [data-testid="stExpander"] summary { padding:12px 0; }
+.st-key-translation_inspector .stButton > button { min-height:36px; }
+.tp-translation-table-note { margin:8px 0 10px; color:var(--tp-faint); font-size:11px; }
+.tp-review-head { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:16px; }
+.tp-review-count { color:var(--tp-sub); font-size:13px; }
+.tp-focus-head { display:flex; justify-content:space-between; gap:12px; margin:8px 0 14px; color:var(--tp-sub); font-size:13px; font-weight:650; }
+.tp-focus-text { min-height:300px; padding:18px; border:1px solid var(--tp-line); border-radius:12px; background:#fff; }
+.tp-focus-text label { display:block; margin-bottom:12px; color:var(--tp-sub); font-size:11px !important; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
+.tp-focus-text p { margin:0; color:var(--tp-ink); font-size:15px; line-height:1.85; white-space:pre-wrap; }
+.tp-filter-strip { display:flex; align-items:center; gap:8px; padding:9px 0 13px; border-top:1px solid var(--tp-line-subtle); border-bottom:1px solid var(--tp-line); }
+.tp-filter-chip { padding:5px 10px; border:1px solid var(--tp-line); border-radius:999px; color:var(--tp-sub); font-size:12px; }
+.tp-filter-chip.is-blocking { border-color:#f3c0bd; color:#b42318; background:#fff8f7; }
+.tp-review-pane { min-height:530px; padding:16px; border:1px solid var(--tp-line); border-radius:12px; background:#fff; }
+.tp-review-pane + .tp-review-pane { margin-left:-1px; border-radius:0 12px 12px 0; }
+.tp-review-pane.is-queue { border-radius:12px 0 0 12px; background:#fbfcfe; }
+.tp-review-pane.is-evidence { border-radius:0 12px 12px 0; background:#fbfcfe; }
+.tp-review-queue-count { color:var(--tp-sub); font-size:13px; font-weight:500; }
+.tp-review-section-label { margin:18px 0 7px; color:var(--tp-sub); font-size:12px; font-weight:700; }
+.tp-review-long-text {
+ padding:12px 0 16px; border-bottom:1px solid var(--tp-line-subtle);
+ color:var(--tp-ink); font-size:14px; line-height:1.75; white-space:pre-wrap;
+}
+.tp-review-diagnostic-label { margin-top:18px; color:var(--tp-sub); font-size:11px; font-weight:750; letter-spacing:.02em; }
+.tp-review-diagnostic-copy { margin:6px 0 0; color:var(--tp-ink); font-size:14px; line-height:1.7; white-space:pre-wrap; }
+.tp-review-summary { padding:12px 14px; border-left:3px solid #f59e0b; border-radius:0 8px 8px 0; background:#fff9eb; color:#5f4600; }
+.tp-review-span { padding:1px 3px; border-radius:3px; background:#fff0bd; box-shadow:inset 0 -1px 0 #e5b93f; }
+.tp-review-location-note { margin:6px 0 0; color:var(--tp-faint); font-size:11px; line-height:1.5; }
+.tp-review-legacy { margin:14px 0; padding:10px 12px; border:1px solid #d9e2ef; border-radius:8px; background:#f8fafc; color:var(--tp-sub); font-size:12px; line-height:1.55; }
+.tp-review-evidence-detail { color:var(--tp-sub); font-size:12px; line-height:1.55; }
+.tp-review-evidence-title { margin:0 0 14px; font-size:16px !important; }
+.tp-review-evidence-row {
+ display:flex; align-items:baseline; justify-content:space-between; gap:12px;
+ padding:9px 0; border-bottom:1px solid var(--tp-line-subtle); font-size:12px;
+}
+.tp-review-evidence-row span { color:var(--tp-sub); }
+.tp-review-evidence-row b { color:var(--tp-ink); text-align:right; }
+.tp-review-evidence-label { margin-top:16px; color:var(--tp-sub); font-size:11px; font-weight:750; }
+.tp-review-evidence-copy { margin:5px 0 0; color:var(--tp-ink); font-size:12px; line-height:1.65; white-space:pre-wrap; }
+.tp-queue-item { padding:11px 10px; border-bottom:1px solid var(--tp-line-subtle); }
+.tp-queue-item strong { display:block; color:var(--tp-ink); font-size:13px; line-height:1.4; }
+.tp-queue-item span { display:block; margin-top:4px; color:var(--tp-sub); font-size:11px; line-height:1.35; }
+.tp-queue-item.is-selected { margin:0 -10px; padding-left:20px; border-left:3px solid var(--tp-primary); background:#eef5ff; }
+.tp-segment-label { color:var(--tp-sub); font-size:12px; font-weight:650; }
+.tp-finding-reason { margin:14px 0; padding:13px 15px; border-left:3px solid #f59e0b; border-radius:0 8px 8px 0; background:#fff9eb; color:#6c4d00; font-size:13px; line-height:1.6; }
+.tp-text-card { min-height:130px; padding:14px; border:1px solid var(--tp-line); border-radius:10px; background:#fbfcfe; }
+.tp-text-card label { display:block; margin-bottom:9px; color:var(--tp-sub); font-size:11px !important; font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
+.tp-text-card p { margin:0; color:var(--tp-ink); font-size:14px; line-height:1.7; white-space:pre-wrap; }
+.tp-evidence-card { padding:13px; border:1px solid var(--tp-line); border-radius:10px; background:#fff; }
+.tp-evidence-card p { margin:0; color:var(--tp-sub); font-size:12px; line-height:1.6; }
+.tp-report-header, .tp-delivery-header { padding:20px 22px; border:1px solid var(--tp-line); border-radius:14px; background:#fff; }
+.tp-report-header h3, .tp-delivery-header h3 { margin:0; font-size:19px !important; }
+.tp-report-toolbar { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; }
+.tp-report-toolbar h3 { margin:0; color:var(--tp-ink); font-size:20px !important; line-height:1.3 !important; }
+.tp-report-toolbar-copy { min-width:0; }
+.tp-report-toolbar-kicker { margin-bottom:7px; color:var(--tp-sub); font-size:11px; font-weight:750; letter-spacing:.08em; text-transform:uppercase; }
+.tp-report-meta { margin-top:8px; color:var(--tp-sub); font-size:12px; line-height:1.55; }
+.tp-report-toolbar-status { display:flex; align-items:center; gap:8px; padding-top:3px; color:var(--tp-ink); font-size:13px; white-space:nowrap; }
+.tp-report-actions { display:flex; align-items:center; gap:8px; margin-top:14px; }
+.st-key-report_actions [data-testid="stDownloadButton"] > button,
+.st-key-report_actions .stButton > button { min-height:38px; }
+.st-key-report-actions-caption { margin-top:8px; color:var(--tp-faint); font-size:11px; line-height:1.5; }
+.tp-report-outline { margin:16px 0 0; padding:14px 16px; border:1px solid var(--tp-line); border-radius:10px; background:#fbfcfe; }
+.tp-report-outline-title { margin-bottom:8px; color:var(--tp-ink); font-size:12px; font-weight:750; }
+.tp-report-outline a { display:block; padding:4px 0; color:var(--tp-sub); font-size:12px; line-height:1.45; text-decoration:none; }
+.tp-report-outline a:hover, .tp-report-outline a:focus-visible { color:var(--tp-primary); text-decoration:underline; }
+.tp-report-outline a.is-chapter { color:var(--tp-ink); font-weight:650; }
+.tp-report-outline a.is-subsection { padding-left:16px; }
+.tp-report-review { margin-top:16px; padding:15px 16px; border:1px solid #f2d39a; border-radius:10px; background:#fffaf0; }
+.tp-report-review-title { color:#704d00; font-size:13px; font-weight:750; }
+.tp-report-review-item { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:10px 0; border-top:1px solid #f3e5c8; }
+.tp-report-review-copy { min-width:0; }
+.tp-report-review-copy strong { display:block; color:#5e4300; font-size:13px; }
+.tp-report-review-copy span { display:block; margin-top:3px; color:#786442; font-size:12px; line-height:1.55; }
+.tp-report-review-item .stButton > button { min-height:32px; padding:0 9px; border-color:#e6c98f; background:#fff; color:#704d00; font-size:11px; white-space:nowrap; }
+.tp-report-body { margin-top:16px; padding:30px 34px 36px; border:1px solid var(--tp-line); border-radius:12px; background:#fff; }
+.tp-report-body h1, .tp-report-body h2, .tp-report-body h3, .tp-report-body h4 { color:var(--tp-ink); }
+.tp-report-body h1 { margin:0 0 1.1em; font-size:25px !important; line-height:1.35 !important; }
+.tp-report-body h2 { margin:1.55em 0 .55em; font-size:21px !important; line-height:1.45 !important; }
+.tp-report-body h3 { margin:1.25em 0 .45em; font-size:17px !important; line-height:1.5 !important; }
+.tp-report-body h4 { margin:1.15em 0 .4em; font-size:15px !important; }
+.tp-report-body p, .tp-report-body li { max-width:72ch; color:#283548; font-size:15px; line-height:1.9; }
+.tp-report-body p { margin:0 0 1em; }
+.tp-report-body ul, .tp-report-body ol { margin:0 0 1em; padding-left:1.5em; }
+.tp-report-body blockquote { max-width:72ch; margin:18px 0; padding:12px 18px; border-left:3px solid #b7cdf0; border-radius:0 8px 8px 0; background:#f7faff; color:#43536b; }
+.tp-report-body blockquote p { color:#43536b; font-size:14px; line-height:1.75; }
+.tp-report-body table { display:block; max-width:100%; overflow-x:auto; margin:18px 0 22px; border-collapse:collapse; }
+.tp-report-body th, .tp-report-body td { min-width:110px; padding:8px 10px; border:1px solid var(--tp-line); font-size:13px; line-height:1.6; text-align:left; }
+.tp-report-body th { background:#f7f9fc; color:var(--tp-ink); font-weight:700; }
+.tp-report-body hr { margin:24px 0; border:0; border-top:1px solid var(--tp-line-subtle); }
+.tp-report-body a { color:var(--tp-primary); }
+.tp-report-empty-note { margin-top:9px; color:var(--tp-faint); font-size:12px; line-height:1.6; }
+.tp-report-tech-note { color:var(--tp-sub); font-size:12px; line-height:1.6; }
+.tp-checklist { margin:16px 0 22px; border-top:1px solid var(--tp-line-subtle); }
+.tp-check-row { display:flex; gap:11px; align-items:center; padding:12px 0; border-bottom:1px solid var(--tp-line-subtle); color:var(--tp-ink); font-size:13px; }
+.tp-check-row i { font-style:normal; width:20px; text-align:center; color:var(--tp-success); font-size:16px; }
+.tp-check-row.is-warning i { color:#d97706; }
+.tp-version-list { display:grid; gap:8px; margin-top:14px; }
+.tp-version { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border:1px solid var(--tp-line); border-radius:9px; background:#fff; }
+.tp-version strong { color:var(--tp-ink); font-size:13px; }
+.tp-version span { color:var(--tp-sub); font-size:12px; }
+.tp-asset-list { display:grid; gap:8px; margin-top:16px; }
+.tp-asset-row { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:13px 14px; border:1px solid var(--tp-line); border-radius:10px; background:#fff; }
+.tp-asset-copy { min-width:0; }
+.tp-asset-copy strong { display:block; color:var(--tp-ink); font-size:13px; }
+.tp-asset-copy span { display:block; margin-top:4px; color:var(--tp-sub); font-size:11px; }
+.tp-empty { padding:34px 20px; border:1px dashed #cbd5e1; border-radius:12px; background:#fbfcfe; color:var(--tp-sub); text-align:center; }
+.tp-tech-detail { color:var(--tp-sub); font-size:12px; }
+@media (max-width: 1050px) {
+ [data-testid="stMainBlockContainer"]:has(.tp-workspace-shell) { padding:22px 24px 48px; }
+ .st-key-workspace_main_col { padding:0 18px; }
+ .st-key-workspace_context_col { padding-left:0; margin-top:20px; }
+ .st-key-translation_inspector { padding-left:0; }
+ .st-key-workspace_nav_col { position:static; min-height:auto; padding-right:0; padding-bottom:14px; border-right:0; border-bottom:1px solid var(--tp-line-subtle); }
+ .tp-card-grid, .tp-stage-grid { grid-template-columns:1fr; }
+}
+@media (max-width: 760px) {
+ [data-testid="stMainBlockContainer"]:has(.tp-workspace-shell) { padding:16px 14px 40px; }
+ .tp-workspace-topbar { display:block; }
+ .tp-workspace-status { padding-top:12px; }
+ .st-key-workspace_main_col { padding:0; }
+ .tp-review-pane, .tp-review-pane + .tp-review-pane { min-height:auto; margin:0; border-radius:12px; }
+ .tp-report-toolbar { display:block; }
+ .tp-report-toolbar-status { padding-top:12px; }
+ .tp-report-body { padding:20px 17px; }
+}
+"""
+st.markdown("<style>" + _CSS + _WORKSPACE_CSS + "</style>", unsafe_allow_html=True)
 
 # ================= 术语审核面板工具函数 =================
 _EVIDENCE_LABELS = {
@@ -2522,6 +2797,1460 @@ def _merge_edited_entries(entries, edited_rows):
     merged.extend(new_rows)
     return merged
 
+
+# ================= Task workspace =================
+def _workspace_review_contexts(state):
+    findings = _delivery.review_queue_findings(state)
+    return sorted([_delivery.finding_context(state, finding) for finding in findings],
+                  key=_review_sort_key)
+
+
+def _workspace_status(state, job_id=""):
+    snapshot = core.delivery_snapshot_status(job_id, state) if job_id else {"current": False}
+    if state.get("delivery_status") == "final" and snapshot.get("current"):
+        return "已冻结", "success"
+    if _delivery.unresolved_blocking(state):
+        return "待审查", "warning"
+    if state.get("p2_done") and (state.get("p3_done") or not state.get("report_enabled", True)):
+        return "可交付", "success"
+    if state.get("p1_done"):
+        return "处理中", "neutral"
+    return "未开始", "neutral"
+
+
+def _workspace_status_badge(label, tone="neutral"):
+    return f'<span class="tp-status-badge is-{tone}"><span class="tp-status-dot is-{tone}"></span>{escape(label)}</span>'
+
+
+def _workspace_findings_counts(state):
+    contexts = _workspace_review_contexts(state)
+    return contexts, {
+        severity: sum(1 for item in contexts if item.get("severity") == severity)
+        for severity in _delivery.SEVERITY_LABELS
+    }
+
+
+def _workspace_activity(job_id, state):
+    try:
+        saved_at = _workspace_saved_label(job_id, state)
+    except Exception:
+        saved_at = "最近"
+    rows = []
+    if state.get("p3_done"):
+        rows.append((saved_at, "生成实践报告"))
+    if state.get("findings") is not None and state.get("p2_done"):
+        rows.append((saved_at, "完成审校"))
+    if state.get("auto_terms"):
+        rows.append((saved_at, "完成术语抽取"))
+    if state.get("p2_done"):
+        rows.append((saved_at, "完成翻译"))
+    elif state.get("p1_done"):
+        rows.append((saved_at, "完成文档解析"))
+    return rows[:4]
+
+
+def _workspace_saved_label(job_id, state):
+    if not job_id:
+        return "最近"
+    value = (core.recovery_summary(job_id, state) or {}).get("last_saved_at")
+    if not value:
+        return "最近"
+    match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})[ T](\d{1,2}):(\d{2})", str(value))
+    if match:
+        return f"{int(match.group(2))} 月 {int(match.group(3))} 日 {int(match.group(4)):02d}:{match.group(5)}"
+    return _format_saved_at(value)[:16]
+
+
+def _workspace_project_title(filename):
+    stem = Path(str(filename or "")).stem.strip()
+    candidate = re.split(r"提取自", stem, maxsplit=1)[-1].strip()
+    candidate = re.sub(r"^\d+\s*", "", candidate)
+    candidate = re.sub(r"\s*\([^)]*\)\s*$", "", candidate).strip()
+    candidate = re.sub(r"\s+", " ", candidate)
+    if not candidate:
+        return stem or "未命名项目"
+    words = candidate.split(" ")
+    small_words = {"a", "an", "and", "as", "at", "by", "for", "in",
+                   "of", "on", "or", "the", "to", "via"}
+    if len(words) > 1:
+        words = [words[0]] + [word.lower() if word.lower() in small_words else word
+                              for word in words[1:]]
+    return " ".join(words)
+
+
+def _workspace_report_stage(job_id, state):
+    if not state.get("p3_done"):
+        return "处理中"
+    quality = (state.get("academic_state") or {}).get("quality_status") \
+        or (state.get("academic_state") or {}).get("status")
+    if quality in ("fail", "failed", "review_required"):
+        return "需要复核"
+    snapshot = core.delivery_snapshot_status(job_id, state) if job_id else {"current": False}
+    return "已冻结" if snapshot.get("current") else "草稿已生成"
+
+
+def _render_workspace_topbar(job_id, state):
+    filename = str(state.get("filename") or "未命名项目")
+    part_match = re.search(r"\bPart\s*([A-Za-z0-9IVX]+)", filename, re.IGNORECASE)
+    part_label = f"Part {part_match.group(1)}" if part_match else "当前项目"
+    project_title = _workspace_project_title(filename)
+    term_count = len(state.get("glossary") or state.get("auto_terms") or [])
+    status, tone = _workspace_status(state, job_id)
+    try:
+        saved_at = _workspace_saved_label(job_id, state)
+    except Exception:
+        saved_at = "最近"
+    with st.container(key="workspace_exit_actions"):
+        back_col, home_col, _ = st.columns([1.35, 1.15, 5.5], gap="small")
+        with back_col:
+            if st.button("返回任务列表", icon=":material/arrow_back:",
+                         key=f"workspace_back_{job_id}", width="stretch"):
+                st.session_state.update(app_view="history", workspace_mode=False)
+                st.rerun()
+        with home_col:
+            if st.button("回到主页", icon=":material/home:",
+                         key=f"workspace_home_{job_id}", width="stretch"):
+                st.session_state.update(app_view="new", workspace_mode=False, task_step=1)
+                st.rerun()
+    st.markdown(
+        '<div class="tp-workspace-shell"></div>'
+        '<div class="tp-workspace-topbar">'
+        '<div><div class="tp-workspace-eyebrow">TransPraxis · Translation Practice Workspace</div>'
+        f'<h1>{escape(project_title)}</h1>'
+        f'<div class="tp-workspace-meta">{escape(part_label)} · '
+        f'{len(state.get("paras") or []):,} 段 · {term_count:,} 个术语 · 最近保存 {escape(saved_at)}</div></div>'
+        f'<div class="tp-workspace-status"><span class="tp-status-dot is-{tone}"></span>'
+        f'<strong>{escape(status)}</strong></div></div>', unsafe_allow_html=True)
+
+
+def _render_workspace_nav(section, state, job_id=""):
+    st.markdown('<div class="tp-workspace-nav-title">项目导航</div>'
+                '<div class="tp-workspace-nav-caption">从这里进入每个工作阶段。</div>',
+                unsafe_allow_html=True)
+    contexts, counts = _workspace_findings_counts(state)
+    terms_done = bool(state.get("glossary_frozen") or state.get("quality_bypass")
+                      or (state.get("auto_terms") and not state.get("quality_mode")))
+    snapshot = core.delivery_snapshot_status(job_id, state) if job_id else {"current": False}
+    statuses = {
+        "translation": "done" if state.get("p2_done") else "pending",
+        "terms": "done" if terms_done else "active" if state.get("p1_done") else "pending",
+        "review": "active" if contexts else "done" if state.get("p2_done") else "pending",
+        "report": "done" if state.get("p3_done") else "active" if state.get("p2_done") else "pending",
+        "delivery": "done" if snapshot.get("current") else "pending",
+    }
+    labels = [("overview", "概览", None), ("translation", "翻译", None),
+              ("terms", "术语", None), ("review", "审校", counts["blocking"] or None),
+              ("report", "报告", None), ("delivery", "交付", None)]
+    with st.container(key="workspace_nav"):
+        for value, label, count in labels:
+            active = value == section
+            status = statuses.get(value, "active" if active else "pending")
+            icon = (":material/radio_button_checked:" if active
+                    else ":material/check_circle:" if status == "done"
+                    else ":material/radio_button_unchecked:")
+            with st.container(key=f"workspace_nav_item_{value}"):
+                label_col, badge_col = st.columns([5, 1], gap="small")
+                with label_col:
+                    if st.button(label, icon=icon, key=f"workspace_nav_{value}", width="stretch",
+                                 type="primary" if active else "secondary"):
+                        st.session_state.workspace_section = value
+                        st.rerun()
+                if count:
+                    with badge_col:
+                        st.markdown(f'<span class="tp-nav-badge">{count}</span>',
+                                    unsafe_allow_html=True)
+
+
+def _render_workspace_project_details(state):
+    with st.expander("项目详情", expanded=False):
+        st.caption(f"源文件：{state.get('filename') or '—'}")
+        st.caption(f"段落：{len(state.get('paras') or []):,} · 目标语言：{state.get('target_lang') or '简体中文'}")
+
+
+def _translation_pair_status(pair):
+    if pair.get("human_edited"):
+        return "↻"
+    if pair.get("reviewed"):
+        return "✓"
+    return "●"
+
+
+def _translation_pair_status_label(pair):
+    if pair.get("human_edited"):
+        return "已修改"
+    if pair.get("reviewed"):
+        return "已审校"
+    return "待审"
+
+
+def _translation_pair_flags(state, pair):
+    flags = []
+    if pair.get("from_tm"):
+        flags.append("M")
+    if _translation_terms_for_pair(state, pair):
+        flags.append("T")
+    return " · ".join(flags) or "—"
+
+
+def _translation_terms_for_pair(state, pair):
+    return core.translation_terms_for_pair(state, pair)
+
+
+def _translation_preview(value, limit=170):
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _translation_segment_id(job_id, index, pair):
+    for key in ("segment_id", "segment_uid", "seg_id"):
+        if pair.get(key) is not None:
+            return str(pair[key])
+    # Reuse the identity already used by exported translation assets.
+    return _assets.segment_id(job_id, index)
+
+
+def _translation_segment_records(job_id, state):
+    return [{
+        "segment_id": _translation_segment_id(job_id, index, pair),
+        "index": index,
+        "pair": pair,
+    } for index, pair in enumerate(state.get("pairs") or [])]
+
+
+def _translation_selected_segment(job_id, state, visible_records=None):
+    records = _translation_segment_records(job_id, state)
+    by_id = {record["segment_id"]: record for record in records}
+    selected_id = st.session_state.get("selected_segment_id")
+    if selected_id is not None:
+        selected_id = str(selected_id)
+    if selected_id in by_id and (visible_records is None or
+                                selected_id in {item["segment_id"] for item in visible_records}):
+        st.session_state["selected_segment_id"] = selected_id
+        return by_id[selected_id]
+    if selected_id is None and visible_records is None:
+        return None
+    candidates = visible_records or records
+    if not candidates:
+        st.session_state["selected_segment_id"] = None
+        return None
+    selected = candidates[0]
+    st.session_state["selected_segment_id"] = selected["segment_id"]
+    return selected
+
+
+def _translation_segment_findings(state, index):
+    return [
+        _delivery.finding_context(state, finding)
+        for finding in _delivery.review_queue_findings(state)
+        if finding.get("segment_index") == index
+    ]
+
+
+def _save_translation_edit(job_id, index, text):
+    core.save_translation_edit(job_id, index, text)
+
+
+def _restore_translation_pair(job_id, index):
+    core.restore_translation_edit(job_id, index)
+
+
+def _explain_translation_segment(job_id, index, state):
+    if not api_key:
+        return "请先配置 API Key。"
+    pair = state["pairs"][index]
+    terms = _translation_terms_for_pair(state, pair)
+    term_text = "；".join(f"{source} → {target}" for source, target, _ in terms) or "无锁定术语"
+    system = "你是严谨的翻译实践导师。用简体中文解释当前译法，聚焦语义、术语和上下文，不改写译文。"
+    prompt = (f"原文：{pair.get('source', '')}\n当前译文：{pair.get('target', '')}\n"
+              f"相关术语：{term_text}\n"
+              "请用 2-4 句话说明当前译法的主要决策和可能的注意点。")
+    try:
+        return core.call_llm(ai_provider, api_key, ai_model, system, prompt, temperature=0.2)
+    except Exception as exc:
+        return f"解释失败：{str(exc)[:160]}"
+
+
+def _render_workspace_translation_context(job_id, state):
+    selected_segment = _translation_selected_segment(job_id, state)
+    if selected_segment is None:
+        st.markdown('<div class="tp-empty">翻译开始后，这里会显示选中段落。</div>',
+                    unsafe_allow_html=True)
+        return
+    pairs = state.get("pairs") or []
+    index = selected_segment["index"]
+    pair = selected_segment["pair"]
+    selected_id = selected_segment["segment_id"]
+    terms = _translation_terms_for_pair(state, pair)
+    findings = _translation_segment_findings(state, index)
+    status_symbol = _translation_pair_status(pair)
+    status_label = _translation_pair_status_label(pair)
+
+    st.markdown(
+        f'<div class="tp-translation-inspector-head"><div><h3>当前段落 · #{index + 1}</h3>'
+        f'<div class="tp-inspector-status"><span>{status_symbol}</span><strong>{escape(status_label)}</strong></div>'
+        f'</div><span class="tp-translation-inspector-position">{index + 1} / {len(pairs)}</span></div>',
+        unsafe_allow_html=True)
+    if findings:
+        issue_label = f"⚠ {len(findings)} 个审校问题"
+        st.markdown(f'<div class="tp-inspector-section"><div class="tp-inspector-status">'
+                    f'<span>{escape(issue_label)}</span></div></div>', unsafe_allow_html=True)
+        if st.button("查看对应审校", key=f"translation_open_review_{job_id}_{selected_id}",
+                     width="stretch", type="secondary"):
+            st.session_state.workspace_section = "review"
+            st.rerun()
+
+    st.markdown('<div class="tp-inspector-section"><h4>原文</h4>'
+                f'<p class="tp-inspector-preview">{escape(pair.get("source") or "—")}</p></div>',
+                unsafe_allow_html=True)
+
+    edited_key = f"translation_editor_{selected_id}"
+    st.markdown('<div class="tp-inspector-section"><h4>当前译文</h4>', unsafe_allow_html=True)
+    st.text_area("当前译文", value=pair.get("target") or "", key=edited_key,
+                 height=160, label_visibility="collapsed")
+    save_col, retranslate_col = st.columns([1.35, 1])
+    with save_col:
+        if st.button("保存修改", type="primary", key=f"translation_save_{selected_id}",
+                     width="stretch"):
+            _save_translation_edit(job_id, index, st.session_state.get(edited_key, ""))
+            st.session_state.pop(edited_key, None)
+            st.rerun()
+    with retranslate_col:
+        if st.button("✨ AI 重译", key=f"translation_retranslate_{selected_id}",
+                     disabled=not api_key, width="stretch"):
+            with st.spinner("正在重新翻译当前段落…"):
+                core.retranslate_segments(job_id, [index], ai_provider, api_key, ai_model,
+                                           target_lang, style_rules=style_rules,
+                                           on_caption=lambda text: st.caption(text))
+            st.session_state.pop(edited_key, None)
+            st.rerun()
+    if pair.get("human_edited") and st.button("恢复原译", key=f"translation_restore_{selected_id}",
+                                                width="stretch"):
+        _restore_translation_pair(job_id, index)
+        st.session_state.pop(edited_key, None)
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="tp-inspector-section"><h4>相关术语</h4>', unsafe_allow_html=True)
+    if terms:
+        for source, target, provenance in terms:
+            st.markdown(f'<div class="tp-inspector-term"><span>{escape(source)}<br/>'
+                        f'<small>{escape(provenance)}</small></span><b>→ {escape(target)}</b></div>',
+                        unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="tp-inspector-empty">本段无项目术语</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="tp-inspector-section"><h4>翻译记忆</h4>', unsafe_allow_html=True)
+    if pair.get("from_tm"):
+        st.markdown('<div class="tp-inspector-status"><span>✓</span><strong>已匹配并复用</strong></div>'
+                    f'<p class="tp-inspector-preview" style="margin-top:8px">源：{escape(_translation_preview(pair.get("source"), 100))}</p>'
+                    f'<p class="tp-inspector-preview">译：{escape(_translation_preview(pair.get("target"), 100))}</p>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="tp-inspector-empty">暂无匹配</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    with st.expander("上下文", expanded=False):
+        if index:
+            previous = pairs[index - 1].get("source") or "—"
+            st.markdown(f'<p class="tp-inspector-preview"><strong>上一段</strong>{escape(_translation_preview(previous, 180))}</p>',
+                        unsafe_allow_html=True)
+        if index + 1 < len(pairs):
+            following = pairs[index + 1].get("source") or "—"
+            st.markdown(f'<p class="tp-inspector-preview"><strong>下一段</strong>{escape(_translation_preview(following, 180))}</p>',
+                        unsafe_allow_html=True)
+        if not index and index + 1 >= len(pairs):
+            st.caption("没有相邻段落。")
+
+    with st.expander("当前译法依据", expanded=False):
+        explanation_key = f"translation_explanation_{selected_id}"
+        if st.session_state.get(explanation_key):
+            st.write(st.session_state[explanation_key])
+        else:
+            st.caption("可让 AI 解释当前译法的语义、术语与上下文决策。")
+        if st.button("解释当前译法", key=f"translation_explain_{selected_id}",
+                     disabled=not api_key, width="stretch"):
+            with st.spinner("正在分析当前译法…"):
+                st.session_state[explanation_key] = _explain_translation_segment(job_id, index, state)
+            st.rerun()
+
+    with st.expander("翻译设置", expanded=False):
+        profile = state.get("document_profile") or {}
+        st.caption(f"风格：{profile.get('register') or '正式书面语'}")
+        st.caption(f"文档画像：{profile.get('domain') or '未标注领域'} · {profile.get('genre') or '未标注文本类型'}")
+        st.caption("源文件：" + str(state.get("filename") or "—"))
+
+
+def _render_workspace_terms_context(state):
+    entries = state.get("glossary") or []
+    term_count = len(entries) if isinstance(entries, list) else len(state.get("auto_terms") or {})
+    status = "已冻结" if state.get("glossary_frozen") else "已采用建议" if state.get("quality_bypass") else "待确认"
+    st.markdown('<div class="tp-info-card"><h3>术语详情</h3>'
+                f'<div class="tp-info-stat"><span>当前状态</span><b>{status}</b></div>'
+                f'<div class="tp-info-stat"><span>项目术语</span><b>{term_count:,}</b></div>'
+                '<p class="tp-tech-detail" style="margin-top:12px">锁定后的术语会注入后续翻译批次。</p>'
+                '</div>', unsafe_allow_html=True)
+    _render_workspace_project_details(state)
+
+
+def _review_highlight(text, span):
+    text = str(text or "")
+    span = str(span or "").strip()
+    if not text or not span:
+        return escape(text or "—"), False
+    start = text.find(span)
+    if start < 0:
+        return escape(text), False
+    end = start + len(span)
+    return (escape(text[:start]) + '<mark class="tp-review-span">'
+            + escape(text[start:end]) + '</mark>' + escape(text[end:])), True
+
+
+def _review_confidence_label(value):
+    if value is None or value == "":
+        return "未提供"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return escape(str(value))
+
+
+def _render_workspace_review_context(job_id, state):
+    contexts, _ = _workspace_findings_counts(state)
+    selected_id = str(st.session_state.get("selected_finding_id") or "")
+    selected = next((item for item in contexts if item.get("finding_id") == selected_id), None)
+    if not selected:
+        st.markdown('<div class="tp-empty">当前没有选中的审校发现。</div>',
+                    unsafe_allow_html=True)
+        return
+    raw_selected = next(
+        (finding for finding in state.get("findings") or []
+         if _delivery.finding_id(finding) == selected_id), {})
+    traces = selected.get("review_evidence") or []
+    evidence_ids = selected.get("evidence_ids") or []
+    stages = list(dict.fromkeys(_review_phase_label(trace.get("phase"))
+                                for trace in traces if trace.get("phase")))
+    evidence_count = len(evidence_ids)
+    evidence_rows = [
+        ("检测器", selected.get("detector") or "未提供"),
+        ("问题类型", selected.get("category_label") or "未分类"),
+        ("严重性", selected.get("severity_label") or "未提供"),
+        ("置信度", _review_confidence_label(selected.get("confidence"))),
+        ("证据记录", f"{evidence_count} 条" if evidence_count else "未提供"),
+    ]
+    if stages:
+        evidence_rows.append(("QA 阶段", "、".join(stages)))
+    if raw_selected.get("created_at"):
+        evidence_rows.append(("创建时间", str(raw_selected["created_at"])))
+    st.markdown('<h3 class="tp-review-evidence-title">审校依据</h3>',
+                unsafe_allow_html=True)
+    for label, value in evidence_rows:
+        st.markdown(f'<div class="tp-review-evidence-row"><span>{escape(str(label))}</span>'
+                    f'<b>{escape(str(value))}</b></div>', unsafe_allow_html=True)
+    if selected.get("detected_text"):
+        st.markdown('<div class="tp-review-evidence-label">检测到的片段</div>'
+                    f'<p class="tp-review-evidence-copy">{escape(selected["detected_text"])}</p>',
+                    unsafe_allow_html=True)
+    if not evidence_ids and not traces:
+        st.markdown('<p class="tp-review-evidence-detail">该 finding 未附带证据记录；置信度也未提供。</p>',
+                    unsafe_allow_html=True)
+    with st.expander("查看证据详情", expanded=False):
+        if selected.get("evidence_refs"):
+            st.markdown('<div class="tp-review-evidence-detail">Finding 引用：'
+                        f'{escape("、".join(selected["evidence_refs"]))}</div>',
+                        unsafe_allow_html=True)
+        if evidence_ids:
+            st.markdown('<div class="tp-review-evidence-detail">关联证据：'
+                        f'{escape("、".join(evidence_ids))}</div>',
+                        unsafe_allow_html=True)
+        if not traces:
+            st.caption("没有可展开的审校证据记录。")
+        for trace in traces[-3:]:
+            receipt = trace.get("completion_receipt") or {}
+            st.markdown(f'**{escape(_review_phase_label(trace.get("phase")))}** · '
+                        f'结论 {escape(str(trace.get("decision") or "—"))} · '
+                        f'状态 {escape(str(receipt.get("status") or "—"))}')
+            if trace.get("requests"):
+                st.json(trace["requests"])
+
+
+def _render_workspace_report_context(job_id, state):
+    academic = state.get("academic_state") or {}
+    artifacts = _report_artifacts(job_id)
+    outline = artifacts.get("outline") or {}
+    cases = artifacts.get("selected_cases") or {}
+    real_case_count = sum(
+        item.get("case_type") != "synthetic_contrast"
+        for item in cases.get("cases") or [])
+    quality = academic.get("quality_status") or academic.get("status") or "not_started"
+    quality_label = _report_quality_label(quality)
+    report_stage = _workspace_report_stage(job_id, state)
+    validation = artifacts.get("validation") or {}
+    groups = _report_issue_groups(artifacts, academic)
+    if not state.get("p3_md"):
+        st.markdown('<div class="tp-info-card"><h3>报告状态</h3>'
+                    '<div class="tp-info-stat"><span>当前状态</span><b>尚未生成</b></div>'
+                    '<p class="tp-tech-detail">完成翻译后，报告草稿与验证结果会显示在这里。</p>'
+                    '</div>', unsafe_allow_html=True)
+        _render_workspace_project_details(state)
+        return
+    st.markdown('<div class="tp-info-card"><h3>报告概况</h3>'
+                f'<div class="tp-info-stat"><span>验证状态</span><b>{escape(_report_validation_label(validation.get("status")))}</b></div>'
+                f'<div class="tp-info-stat"><span>质量状态</span><b>{escape(quality_label)}</b></div>'
+                f'<div class="tp-info-stat"><span>真实案例数量</span><b>{real_case_count:,}</b></div>'
+                f'<div class="tp-info-stat"><span>文献证据</span><b>{escape(_report_literature_status(artifacts))}</b></div>'
+                f'<div class="tp-info-stat"><span>待处理问题</span><b>{len(groups):,}</b></div>'
+                '</div>', unsafe_allow_html=True)
+    st.markdown('<div class="tp-info-card"><h3>当前工作稿</h3>'
+                f'<div class="tp-info-stat"><span>报告状态</span><b>{escape(report_stage)}</b></div>'
+                '<p class="tp-tech-detail">报告可继续编辑；最终交付确认仍在“交付”页面完成。</p>'
+                '</div>', unsafe_allow_html=True)
+    _render_workspace_project_details(state)
+
+
+def _render_workspace_delivery_context(job_id, state):
+    snapshot = core.delivery_snapshot_status(job_id, state)
+    latest = snapshot.get("latest") or {}
+    approval = latest.get("approval") or {}
+    st.markdown('<div class="tp-info-card"><h3>版本信息</h3>'
+                f'<div class="tp-info-stat"><span>当前版本</span><b>{("v" + str(latest.get("snapshot_version"))) if latest else "工作版本"}</b></div>'
+                f'<div class="tp-info-stat"><span>状态</span><b>{"已冻结" if snapshot.get("current") else "未冻结"}</b></div>'
+                f'<div class="tp-info-stat"><span>确认人</span><b>{escape(str(approval.get("actor") or "—"))}</b></div>'
+                '</div>', unsafe_allow_html=True)
+    if latest:
+        st.caption(f"确认时间：{str(approval.get('timestamp') or latest.get('created_at') or '—')[:16]}")
+    _render_workspace_project_details(state)
+
+
+def _render_workspace_context(job_id, state, section):
+    if section == "translation":
+        with st.container(key="translation_inspector"):
+            _render_workspace_translation_context(job_id, state)
+    elif section == "terms":
+        _render_workspace_terms_context(state)
+    elif section == "review":
+        _render_workspace_review_context(job_id, state)
+    elif section == "report":
+        _render_workspace_report_context(job_id, state)
+    elif section == "delivery":
+        _render_workspace_delivery_context(job_id, state)
+
+
+def _render_workspace_overview(job_id, state):
+    contexts, counts = _workspace_findings_counts(state)
+    status, tone = _workspace_status(state, job_id)
+    blockers = counts["blocking"]
+    st.markdown('<h2>概览</h2>'
+                '<div class="tp-section-lead">当前任务与项目进度</div>',
+                unsafe_allow_html=True)
+    action_text = (f"{blockers} 个必须处理问题阻止最终交付。" if blockers
+                   else "当前没有交付阻塞，可以准备最终版本。")
+    st.markdown('<div class="tp-overview-hero">'
+                f'{_workspace_status_badge(status, tone)}'
+                f'<strong>{escape(action_text)}</strong>'
+                f'<p>已完成翻译 {len(state.get("pairs") or []):,} 段；审校队列还有 {len(contexts):,} 个未关闭发现。</p>'
+                '</div>', unsafe_allow_html=True)
+
+    total_segments = len(state.get("paras") or state.get("pairs") or [])
+    translated_segments = len(state.get("pairs") or []) if state.get("p2_done") else 0
+    reviewed_segments = (state.get("review_stats") or {}).get("reviewed_segments", 0)
+    case_count = len((core.load_academic_artifact(job_id, "selected_cases") or {}).get("cases") or [])
+    cards = [
+        ("翻译", f"{translated_segments:,} / {total_segments:,} 段",
+         "完成" if state.get("p2_done") else "处理中", "查看翻译", "translation",
+         "is-done" if state.get("p2_done") else "is-active"),
+        ("审校", f"{reviewed_segments:,} / {total_segments:,} 段",
+         f"{blockers} 阻塞 · {counts['actionable']} 建议", "继续审校", "review",
+         "is-done" if not contexts and state.get("p2_done") else "is-active"),
+        ("报告", f"{case_count:,} 个案例",
+         _workspace_report_stage(job_id, state), "查看报告", "report",
+         "is-done" if state.get("p3_done") else "is-active"),
+    ]
+    card_cols = st.columns(3)
+    for col, (title, value, sub, action, destination, tone) in zip(card_cols, cards):
+        with col:
+            with st.container(key=f"overview_stage_card_{destination}"):
+                st.markdown(f'<div class="tp-stage-card-content {tone}"><strong>{escape(title)}</strong>'
+                            f'<b>{escape(value)}</b><span>{escape(sub)}</span></div>',
+                            unsafe_allow_html=True)
+                if st.button(action + " →", key=f"overview_go_{destination}_{job_id}", width="stretch",
+                             type="primary" if destination == "review" and blockers else "secondary"):
+                    st.session_state.workspace_section = destination
+                    st.rerun()
+
+    progress = [
+        ("原文处理", bool(state.get("p1_done")), False),
+        ("术语提取", bool(state.get("auto_terms")), False),
+        ("翻译", bool(state.get("p2_done")), False),
+        ("人工审校", bool(state.get("p2_done") and not contexts), bool(contexts)),
+        ("报告草稿", bool(state.get("p3_done")), False),
+        ("最终交付", _workspace_status(state, job_id)[0] == "已冻结", False),
+    ]
+    progress_rows = []
+    for label, done, active in progress:
+        icon = "●" if active else "✓" if done else "○"
+        row_class = "is-active" if active else "is-done" if done else "is-pending"
+        if progress_rows:
+            progress_rows.append('<span class="tp-step-connector">→</span>')
+        progress_rows.append(f'<span class="tp-progress-step {row_class}"><i>{icon}</i>{label}</span>')
+    st.markdown('<div class="tp-section-label">项目进度</div>'
+                '<div class="tp-overview-progress">' + "".join(progress_rows) + '</div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="tp-section-label">最近活动</div><div class="tp-activity">',
+                unsafe_allow_html=True)
+    activities = _workspace_activity(job_id, state)
+    if activities:
+        st.markdown(f'<div class="tp-activity-date">{escape(activities[0][0])}</div>',
+                    unsafe_allow_html=True)
+        for _, text_value in activities[:3]:
+            st.markdown(f'<div class="tp-activity-row">{escape(text_value)}</div>',
+                        unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="tp-activity-row">暂无活动记录</div>',
+                    unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    _render_workspace_project_details(state)
+
+
+def _render_workspace_translation(job_id, state):
+    pairs = state.get("pairs") or []
+    st.markdown('<h2>翻译</h2>'
+                '<div class="tp-section-lead">浏览、检查和编辑双语段落。</div>',
+                unsafe_allow_html=True)
+    reviewed = (state.get("review_stats") or {}).get("reviewed_segments", 0)
+    total = len(pairs)
+    st.caption(f"{total:,} 段 · {reviewed:,} 已审校 · {max(0, total - reviewed):,} 待审 · TM 复用 {state.get('tm_used_count', 0):,}")
+    if not pairs:
+        st.markdown('<div class="tp-empty">翻译尚未开始。</div>', unsafe_allow_html=True)
+        return
+    toolbar_search, toolbar_primary, toolbar_filter, toolbar_more = st.columns(
+        [3.35, 2.35, 0.9, 0.9], gap="small")
+    with toolbar_search:
+        search = st.text_input("搜索段落", key=f"translation_search_{job_id}",
+                               placeholder="搜索原文或译文，或输入段落号…",
+                               label_visibility="collapsed")
+    with toolbar_primary:
+        filter_label = st.segmented_control(
+            "一级筛选", ["全部", "待审", "已审校"], default="全部",
+            key=f"translation_filter_{job_id}", label_visibility="collapsed",
+            width="stretch") or "全部"
+    with toolbar_filter:
+        with st.popover("筛选 ▾", use_container_width=True):
+            filter_terms = st.checkbox("含项目术语", key=f"translation_filter_terms_{job_id}")
+            filter_edited = st.checkbox("已修改", key=f"translation_filter_edited_{job_id}")
+            issue_only = st.checkbox("有审校问题", key=f"translation_filter_issue_{job_id}")
+            filter_tm = st.checkbox("使用翻译记忆", key=f"translation_filter_tm_{job_id}")
+    with toolbar_more:
+        with st.popover("更多", use_container_width=True):
+            mode = st.radio("显示模式", ["列表模式", "聚焦模式"],
+                            key=f"translation_mode_{job_id}")
+
+    issue_indexes = {item.get("segment_index") for item in _workspace_review_contexts(state)
+                     if item.get("segment_index") is not None}
+    visible_indexes = core.translation_visible_indexes(
+        state, search=search, status_filter=filter_label,
+        filter_terms=filter_terms, filter_edited=filter_edited,
+        filter_issues=issue_only, filter_tm=filter_tm,
+        issue_indexes=issue_indexes)
+    records = _translation_segment_records(job_id, state)
+    visible_records = [records[index] for index in visible_indexes]
+    if not visible_indexes:
+        st.session_state["selected_segment_id"] = None
+        st.markdown('<div class="tp-empty">没有符合当前筛选条件的段落。</div>', unsafe_allow_html=True)
+        return
+
+    selected_segment = _translation_selected_segment(job_id, state, visible_records)
+    selected_index = selected_segment["index"]
+    if mode == "聚焦模式":
+        pair = selected_segment["pair"]
+        st.markdown(f'<div class="tp-focus-head"><span>第 {selected_index + 1} 段</span>'
+                    f'<span>{escape(_translation_pair_status_label(pair))} · {selected_index + 1} / {total}</span></div>',
+                    unsafe_allow_html=True)
+        source_col, target_col = st.columns(2)
+        with source_col:
+            st.markdown(f'<div class="tp-focus-text"><label>原文</label><p>{escape(pair.get("source") or "—")}</p></div>',
+                        unsafe_allow_html=True)
+        with target_col:
+            st.markdown(f'<div class="tp-focus-text"><label>当前译文</label><p>{escape(pair.get("target") or "—")}</p></div>',
+                        unsafe_allow_html=True)
+        prev_col, next_col = st.columns(2)
+        if prev_col.button("← 上一段", key=f"translation_focus_prev_{job_id}", disabled=selected_index == visible_indexes[0], width="stretch"):
+            current = visible_indexes.index(selected_index)
+            next_index = visible_indexes[max(0, current - 1)]
+            st.session_state["selected_segment_id"] = records[next_index]["segment_id"]
+            st.rerun()
+        if next_col.button("下一段 →", key=f"translation_focus_next_{job_id}", disabled=selected_index == visible_indexes[-1], width="stretch"):
+            current = visible_indexes.index(selected_index)
+            next_index = visible_indexes[min(len(visible_indexes) - 1, current + 1)]
+            st.session_state["selected_segment_id"] = records[next_index]["segment_id"]
+            st.rerun()
+        return
+
+    rows = [{
+        "状态": _translation_pair_status(pair),
+        "#": f"#{index + 1}",
+        "原文": _translation_preview(pair.get("source")),
+        "当前译文": _translation_preview(pair.get("target")),
+    } for index in visible_indexes for pair in [pairs[index]]]
+    st.markdown('<div class="tp-translation-table-note">点击一行，在右侧 Inspector 中查看完整段落并编辑译文。</div>',
+                unsafe_allow_html=True)
+    table_revision = abs(hash((search, filter_label, filter_terms,
+                               filter_edited, issue_only, filter_tm,
+                               tuple(visible_indexes))))
+    table_key = f"translation_table_{job_id}_{table_revision}"
+    event = st.dataframe(
+        pd.DataFrame(rows), hide_index=True, width="stretch", height=610,
+        row_height=58,
+        on_select="rerun", selection_mode="single-row",
+        key=table_key,
+        column_config={
+            "状态": st.column_config.TextColumn("状态", width="small",
+                                                   help="✓ 已审校 · ● 待审 · ↻ 已修改"),
+            "#": st.column_config.TextColumn("#", width="small"),
+            "原文": st.column_config.TextColumn("原文", width="large"),
+            "当前译文": st.column_config.TextColumn("当前译文", width="large"),
+        })
+    selection = getattr(event, "selection", None)
+    selected_rows = list(getattr(selection, "rows", []) or [])
+    if selected_rows:
+        row_index = selected_rows[0]
+        if 0 <= row_index < len(visible_records):
+            st.session_state["selected_segment_id"] = visible_records[row_index]["segment_id"]
+
+
+def _render_workspace_terms(job_id, state):
+    entries = state.get("glossary") or []
+    if not isinstance(entries, list):
+        entries = []
+    if not entries and isinstance(state.get("auto_terms"), dict):
+        entries = [{"id": f"auto-{i}", "source": source,
+                    "target": value if isinstance(value, str) else "",
+                    "preferred": value if isinstance(value, str) else "",
+                    "status": "provisional"}
+                   for i, (source, value) in enumerate(state["auto_terms"].items())]
+    st.markdown('<div class="tp-section-kicker">语言资产</div><h2>术语</h2>'
+                '<div class="tp-section-lead">术语是项目记忆的一部分；锁定后会随翻译批次注入。</div>',
+                unsafe_allow_html=True)
+    frozen = state.get("glossary_frozen")
+    bypassed = state.get("quality_bypass")
+    if frozen:
+        st.success(f"术语已冻结 · v{frozen.get('version')}")
+    elif bypassed:
+        st.info("本任务跳过了人工冻结，当前使用 provisional 术语。")
+    elif not state.get("p2_done") and state.get("quality_mode"):
+        st.warning("术语尚未冻结；完成审核后才能继续翻译。")
+        _render_profile_editor(job_id, state)
+    if not entries:
+        st.markdown('<div class="tp-empty">暂无项目术语。</div>', unsafe_allow_html=True)
+        return
+    if not state.get("p2_done") and state.get("quality_mode") and state.get("glossary") is not None:
+        df = _glossary_dataframe(entries, state.get("paras") or [])
+        visible = ["选择", "source", "proposed_target", "preferred", "status", "domain", "note", "id", "payload"]
+        edited = st.data_editor(
+            df[[key for key in visible if key in df.columns]],
+            key=f"workspace_glossary_editor_{job_id}", num_rows="dynamic",
+            hide_index=True, width="stretch",
+            column_config={
+                "选择": st.column_config.CheckboxColumn("选择"),
+                "id": st.column_config.TextColumn("ID", disabled=True),
+                "source": st.column_config.TextColumn("源术语", required=True),
+                "proposed_target": st.column_config.TextColumn("建议译名"),
+                "preferred": st.column_config.TextColumn("首选译名"),
+                "status": st.column_config.SelectboxColumn(
+                    "状态", options=["candidate", "provisional", "locked", "rejected"]),
+                "domain": st.column_config.TextColumn("领域"),
+                "note": st.column_config.TextColumn("备注"),
+                "payload": st.column_config.TextColumn("payload", disabled=True),
+            })
+        chosen = edited[edited["选择"].fillna(False)] if "选择" in edited.columns else edited.iloc[0:0]
+        ids = [str(item) for item in chosen.get("id", []).tolist() if str(item)]
+        a, b, c = st.columns(3)
+        if a.button("保存草稿", key=f"workspace_terms_save_{job_id}", width="stretch"):
+            core.save_glossary_draft(job_id, _merge_edited_entries(entries, _df_to_entries(edited)))
+            st.rerun()
+        if b.button("锁定选中", key=f"workspace_terms_lock_{job_id}", disabled=not ids, width="stretch"):
+            core.set_glossary_entry_status(job_id, ids, "locked")
+            st.rerun()
+        if c.button("冻结并继续翻译", type="primary", key=f"workspace_terms_freeze_{job_id}", width="stretch"):
+            core.freeze_glossary(job_id, entries=_merge_edited_entries(entries, _df_to_entries(edited)), frozen_by="用户")
+            st.session_state.pending_continue_job = job_id
+            st.rerun()
+    else:
+        rows = [{"源术语": e.get("source", ""), "首选译名": e.get("preferred") or e.get("target", ""),
+                 "状态": e.get("status", "provisional"), "出现次数": len(e.get("occurrences") or [])}
+                for e in entries]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=430)
+
+
+def _render_workspace_review(job_id, state):
+    contexts, counts = _workspace_findings_counts(state)
+    st.markdown('<div class="tp-review-head"><div><div class="tp-section-kicker">人工工作区</div>'
+                '<h2>审校</h2></div>'
+                f'<div class="tp-review-count">{len(contexts):,} 个待审发现</div></div>',
+                unsafe_allow_html=True)
+    if not contexts:
+        st.session_state["selected_finding_id"] = None
+        st.markdown('<div class="tp-empty">所有审校发现都已处理，可以继续准备交付。</div>',
+                    unsafe_allow_html=True)
+        return
+    filter_options = [
+        f"必须处理 {counts['blocking']}",
+        f"建议 {counts['actionable']}",
+        f"参考 {counts['informational']}",
+        f"全部 {len(contexts)}",
+    ]
+    filter_key = f"workspace_review_filter_chips_{job_id}"
+    filter_default = filter_options[0] if counts["blocking"] else filter_options[-1]
+    if st.session_state.get(filter_key) not in filter_options:
+        st.session_state[filter_key] = filter_default
+    filter_value = st.segmented_control(
+        "筛选审校发现", filter_options,
+        default=None if filter_key in st.session_state else filter_default,
+        key=filter_key,
+        label_visibility="collapsed", width="stretch") or filter_options[-1]
+    filter_label = filter_value.rsplit(" ", 1)[0]
+    severity = {"必须处理": "blocking", "建议": "actionable",
+                "参考": "informational"}.get(filter_label)
+    visible = [item for item in contexts if severity is None or item.get("severity") == severity]
+    if not visible:
+        st.session_state["selected_finding_id"] = None
+        st.info("当前筛选下没有待处理发现。")
+        return
+    by_id = {item["finding_id"]: item for item in visible}
+    selected_id = str(st.session_state.get("selected_finding_id") or "")
+    if selected_id not in by_id:
+        selected_id = visible[0]["finding_id"]
+        st.session_state["selected_finding_id"] = selected_id
+    queue_col, editor_col = st.columns([1.05, 2.35], gap="medium")
+    with queue_col:
+        st.markdown(f'<h3>审校队列 <span class="tp-review-queue-count">{len(contexts)}</span></h3>',
+                    unsafe_allow_html=True)
+        st.caption(f'必须处理 {counts["blocking"]} · 建议 {counts["actionable"]} · 参考 {counts["informational"]}')
+        queue_labels = []
+        queue_label_to_id = {}
+        for item in visible:
+            base_label = (f'第 {item["segment_number"]} 段 · {item["severity_label"]}\n'
+                          f'{(item.get("summary") or item.get("reason") or "未提供问题摘要")[:56]}')
+            label = base_label
+            suffix = 1
+            while label in queue_label_to_id:
+                suffix += 1
+                label = f'{base_label} · 另一个发现 {suffix}'
+            queue_labels.append(label)
+            queue_label_to_id[label] = item["finding_id"]
+        queue_key = f"workspace_review_queue_{job_id}"
+        if st.session_state.get(queue_key) not in queue_label_to_id:
+            st.session_state[queue_key] = next(
+                label for label, finding_id in queue_label_to_id.items()
+                if finding_id == selected_id
+            )
+        selected_label = st.radio(
+            "审校队列", queue_labels, key=queue_key,
+            label_visibility="collapsed")
+        selected_id = queue_label_to_id[selected_label]
+        st.session_state["selected_finding_id"] = selected_id
+    selected = by_id[selected_id]
+    raw_selected = next(
+        (finding for finding in state.get("findings") or []
+         if _delivery.finding_id(finding) == selected_id),
+        {},
+    )
+    suggested_target = str(raw_selected.get("suggested_target") or "").strip()
+    with editor_col:
+        st.markdown(f'<div class="tp-segment-label">第 {selected["segment_number"]} 段 · '
+                    f'{escape(selected["severity_label"])} · '
+                    f'{escape(selected.get("category_label") or "未分类")}</div>',
+                    unsafe_allow_html=True)
+        summary = selected.get("summary") or selected.get("reason") or "未提供问题摘要"
+        st.markdown('<div class="tp-review-diagnostic-label">问题摘要</div>'
+                    f'<div class="tp-review-diagnostic-copy tp-review-summary">{escape(summary)}</div>',
+                    unsafe_allow_html=True)
+        if selected.get("legacy_diagnostic"):
+            st.markdown('<div class="tp-review-legacy">该审校记录来自旧版本，仅包含基础问题信息。'
+                        '未保存可验证的完整诊断字段。</div>', unsafe_allow_html=True)
+        st.markdown('<div class="tp-review-diagnostic-label">问题位置</div>',
+                    unsafe_allow_html=True)
+        source_markup, source_found = _review_highlight(
+            selected.get("source"), selected.get("source_span"))
+        target_markup, target_found = _review_highlight(
+            selected.get("target"), selected.get("target_span"))
+        st.markdown('<div class="tp-review-section-label">原文</div>'
+                    f'<div class="tp-review-long-text">{source_markup}</div>',
+                    unsafe_allow_html=True)
+        if selected.get("source_span") and not source_found:
+            st.markdown('<p class="tp-review-location-note">记录的原文片段无法在当前段落中可靠定位，未进行高亮。</p>',
+                        unsafe_allow_html=True)
+        elif not selected.get("source_span"):
+            st.markdown('<p class="tp-review-location-note">触发原文片段：未提供。</p>',
+                        unsafe_allow_html=True)
+        st.markdown('<div class="tp-review-section-label">当前译文</div>'
+                    f'<div class="tp-review-long-text">{target_markup}</div>',
+                    unsafe_allow_html=True)
+        if selected.get("target_span") and not target_found:
+            st.markdown('<p class="tp-review-location-note">记录的译文片段无法在当前译文中可靠定位，未进行高亮。</p>',
+                        unsafe_allow_html=True)
+        elif not selected.get("target_span"):
+            st.markdown('<p class="tp-review-location-note">触发译文片段：未提供。</p>',
+                        unsafe_allow_html=True)
+        st.markdown('<div class="tp-review-diagnostic-label">判断依据</div>'
+                    f'<p class="tp-review-diagnostic-copy">{escape(selected.get("explanation") or "该旧记录未保存判断依据，请结合原文、译文和右侧证据人工核对。")}</p>',
+                    unsafe_allow_html=True)
+        st.markdown('<div class="tp-review-diagnostic-label">建议处理</div>'
+                    f'<p class="tp-review-diagnostic-copy">{escape(selected.get("recommendation") or "请结合原文、译文和右侧证据人工核对后决定是否修改。")}</p>',
+                    unsafe_allow_html=True)
+        if suggested_target:
+            st.markdown(f'<div class="tp-review-location-note">系统建议译文：{escape(suggested_target)}</div>', unsafe_allow_html=True)
+        note_key = f"workspace_review_note_{selected_id}"
+        with st.expander("处理说明（可选）", expanded=False):
+            st.text_input("说明", key=note_key, label_visibility="collapsed",
+                          placeholder="添加说明…")
+        note = st.session_state.get(note_key, "")
+        action_a, action_b, action_c = st.columns(3)
+        if action_a.button("接受建议" if suggested_target else "标记已处理",
+                          type="primary", key=f"workspace_review_fix_{selected_id}", width="stretch"):
+            if suggested_target and selected.get("segment_index") is not None:
+                latest = core.load_job_state(job_id) or state
+                index = selected["segment_index"]
+                pairs = latest.get("pairs") or []
+                if 0 <= index < len(pairs):
+                    pairs[index]["target"] = suggested_target
+                    pairs[index]["accepted_target"] = suggested_target
+                    pairs[index]["target_provenance"] = "reviewed"
+                    pairs[index]["reviewed"] = True
+                    pairs[index]["review_status"] = "reviewed_clean"
+                    core.save_job_state(job_id, latest)
+            core.mark_findings_resolved(job_id, [selected_id], "human_fixed",
+                                        note or ("接受审校建议" if suggested_target else "人工核对后确认已处理"))
+            st.rerun()
+        can_retranslate = bool(api_key and selected.get("segment_index") is not None)
+        if action_b.button("重新翻译", disabled=not can_retranslate, key=f"workspace_review_retranslate_{selected_id}", width="stretch"):
+            core.retranslate_segments(job_id, [selected["segment_index"]], ai_provider, api_key, ai_model,
+                                       target_lang, style_rules=style_rules,
+                                       on_caption=lambda text: st.caption(text))
+            st.rerun()
+        if action_c.button("保留当前译文", disabled=not selected.get("proper_noun_candidate"),
+                          key=f"workspace_review_preserve_{selected_id}", width="stretch"):
+            core.mark_findings_resolved(job_id, [selected_id], "preserved", note or "人工确认保留当前译文")
+            st.rerun()
+        if not can_retranslate:
+            st.caption("重新翻译需要已配置 API Key。")
+
+
+_REPORT_CASE_ISSUES = {
+    "case_count_status_mismatch", "insufficient_core_revision_cases",
+    "invalid_selected_case", "non_revision_case_used_as_revision_analysis",
+    "synthetic_pipeline_unavailable", "synthetic_only_without_eligible_cases",
+    "ineligible_synthetic_case_selected", "synthetic_case_provenance_mismatch",
+}
+_REPORT_SECTION_ISSUES = {
+    "missing_required_section", "section_too_short", "missing_planned_claim",
+    "missing_research_question_link", "missing_selected_case",
+    "missing_planned_literature_claim", "missing_planned_literature_evidence",
+    "section_literature_outside_plan", "section_literature_claim_outside_plan",
+    "section_literature_evidence_outside_plan", "section_literature_source_outside_plan",
+}
+_REPORT_STATISTIC_ISSUES = {
+    "unknown_project_statistic", "wrong_project_statistic",
+    "unresolved_statistic_token", "unmarked_project_statistic",
+}
+
+
+def _report_artifacts(job_id):
+    return {
+        name: core.load_academic_artifact(job_id, name)
+        for name in (
+            "selected_cases", "outline", "validation", "review",
+            "literature_sources", "literature_evidence", "literature_claims",
+            "literature_support_review", "academic_quality",
+            "human_evidence_questions",
+        )
+    }
+
+
+def _report_quality_label(status):
+    return {
+        "pass": "已验证", "pass_with_warnings": "已验证 · 有警告",
+        "review_required": "需要复核", "fail": "需要复核",
+        "failed": "生成失败", "not_started": "未生成",
+        "stale": "需要重新生成", "in_progress": "生成中",
+    }.get(status, "—")
+
+
+def _report_validation_label(status):
+    return {
+        "pass": "通过", "pass_with_warnings": "通过 · 有警告",
+        "fail": "需要复核", "review_required": "需要复核",
+    }.get(status, "未生成")
+
+
+def _report_literature_status(artifacts):
+    sources = (artifacts.get("literature_sources") or {}).get("sources") or []
+    evidence = (artifacts.get("literature_evidence") or {}).get("items") or []
+    claims = (artifacts.get("literature_claims") or {}).get("items") or []
+    if not sources:
+        return "未使用"
+    if not evidence or not claims:
+        return "待补证据"
+    if any(item.get("evidence_grounded_status") in {"needs_review", "review_required"}
+           for item in claims):
+        return "需要复核"
+    return "已登记"
+
+
+def _report_updated_label(job_id, state, academic):
+    value = academic.get("updated_at") or \
+        (core.recovery_summary(job_id, state) or {}).get("last_saved_at")
+    return _format_saved_at(value) if value else "最近"
+
+
+def _report_docx_bytes(state, frozen_assets=None):
+    """Use the same markdown_to_word path for Report and Delivery surfaces."""
+    if frozen_assets and frozen_assets.get("stage3_report.docx"):
+        return frozen_assets["stage3_report.docx"]
+    report = state.get("p3_md")
+    if not report:
+        return None
+    return core.markdown_to_word(
+        report, state.get("theory") or "翻译实践").getvalue()
+
+
+def _report_heading_title(value):
+    value = re.sub(r"\s+#+\s*$", "", str(value or "")).strip()
+    return value
+
+
+def _report_heading_key(value):
+    value = _report_heading_title(value).casefold()
+    value = re.sub(r"^\d+(?:\.\d+)*[.、．]?\s*", "", value)
+    return re.sub(r"\s+", "", value)
+
+
+def _report_headings(report):
+    headings = []
+    for line_index, line in enumerate(str(report or "").splitlines()):
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        title = _report_heading_title(match.group(2))
+        if not title:
+            continue
+        headings.append({
+            "line_index": line_index,
+            "level": len(match.group(1)),
+            "title": title,
+            "anchor": f"report-heading-{len(headings) + 1}",
+        })
+    return headings
+
+
+def _report_markdown_with_anchors(report, headings):
+    lines = str(report or "").splitlines()
+    for item in reversed(headings):
+        lines.insert(item["line_index"],
+                     f'<a id="{escape(item["anchor"])}"></a>')
+    return "\n".join(lines)
+
+
+def _clean_report_for_display(report_md):
+    """Hide provenance and collapse adjacent duplicate headings in the reader."""
+    text = str(report_md or "")
+    text = re.sub(r"\\?<!--.*?-->\\?", "", text, flags=re.DOTALL)
+    text = re.sub(r"\\?\{\{TERM:[^}]+\}\}\\?", "", text)
+    text = re.sub(r"\b(?:seg|claim|rq|lit-claim|lit-evidence|human-ev)-[A-Za-z0-9_.:-]+\b",
+                  "对应证据", text)
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            title = _report_heading_title(match.group(2))
+            # The toolbar is the single report-title source.
+            if not any(value.strip() for value in cleaned) and \
+                    title.casefold().startswith("翻译实践报告"):
+                continue
+            previous = next((value for value in reversed(cleaned) if value.strip()), "")
+            previous_match = re.match(r"^#{1,6}\s+(.+?)\s*$", previous)
+            if previous_match and _report_heading_key(previous_match.group(1)) == \
+                    _report_heading_key(title):
+                continue
+        cleaned.append(line.rstrip())
+    text = "\n".join(cleaned)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _report_issue_category(issue):
+    issue_type = str(issue.get("type") or "")
+    if issue_type in _REPORT_CASE_ISSUES:
+        return "案例不足"
+    if issue_type in _REPORT_STATISTIC_ISSUES:
+        return "统计验证失败"
+    if "citation" in issue_type or issue_type in {
+            "unregistered_formal_citation", "uncitable_literature_source"}:
+        return "引用需要确认"
+    if "literature" in issue_type or "grounding" in issue_type:
+        return "文献证据缺失"
+    if issue_type in _REPORT_SECTION_ISSUES or issue.get("section_id"):
+        return "章节需要重新生成"
+    if "human" in issue_type:
+        return "需要人工补充"
+    return "需要人工补充"
+
+
+def _report_issue_detail(category, issue):
+    if category == "案例不足":
+        return "项目中可追溯、符合资格的案例数量或案例选择状态需要确认。"
+    if category == "文献证据缺失":
+        return "文献来源、逐字证据与论点之间的支持链路尚未完整。"
+    if category == "引用需要确认":
+        return "存在需要核对的引用来源或作者—年份信息。"
+    if category == "统计验证失败":
+        return "报告中的项目统计与证据库不一致，或统计来源未能解析。"
+    if category == "章节需要重新生成":
+        section_id = issue.get("section_id")
+        return f"第 {section_id} 节存在结构或论证问题，建议定点重新生成。" \
+            if section_id else "报告章节存在结构或论证问题，建议重新生成。"
+    if "human" in str(issue.get("type") or ""):
+        return "有需要作者确认或补充的项目过程信息。"
+    return "报告质量结果仍需人工核对后再作为最终学术结论使用。"
+
+
+def _report_issue_groups(artifacts, academic):
+    groups = {}
+
+    def add(category, detail, section_id=None):
+        group = groups.setdefault(category, {"category": category, "details": [],
+                                             "sections": set()})
+        if detail and detail not in group["details"]:
+            group["details"].append(detail)
+        if section_id:
+            group["sections"].add(str(section_id))
+
+    selected = artifacts.get("selected_cases") or {}
+    policy = selected.get("authentic_selection_status") or \
+        (selected.get("case_count_policy") or {}).get("status")
+    if policy == "insufficient_revision_cases":
+        add("案例不足", "符合资格的真实修订案例少于当前研究要求。")
+
+    validation = artifacts.get("validation") or {}
+    review = artifacts.get("review") or {}
+    literature_review = artifacts.get("literature_support_review") or {}
+    quality = artifacts.get("academic_quality") or {}
+    for issue in list(validation.get("issues") or []) \
+            + list(review.get("issues") or []) \
+            + list(literature_review.get("issues") or []) \
+            + list(quality.get("findings") or []):
+        category = _report_issue_category(issue)
+        add(category, _report_issue_detail(category, issue), issue.get("section_id"))
+
+    if _academic_validator.citation_validation_status(
+            validation, artifacts.get("literature_sources"),
+            artifacts.get("literature_evidence"), artifacts.get("literature_claims")) \
+            == "evidence_missing" and \
+            (artifacts.get("literature_sources") or {}).get("sources"):
+        add("文献证据缺失", "已登记文献来源，但逐字证据或文献主张尚未完整。")
+
+    dimensions = academic.get("quality_dimensions") or {}
+    if dimensions.get("literature_grounding") in {"review_required", "fail"}:
+        add("文献证据缺失", "文献证据的可核验性仍需处理。")
+    if dimensions.get("citation_validation") in {"review_required", "fail"}:
+        add("引用需要确认", "引用完整性检查未通过。")
+    if dimensions.get("statistics_validation") in {"review_required", "fail"}:
+        add("统计验证失败", "统计一致性检查未通过。")
+    human_status = academic.get("human_evidence_status") or {}
+    if human_status.get("unanswered") or human_status.get("critical_questions"):
+        add("需要人工补充", "仍有未回答的人类证据问题。")
+    if (academic.get("quality_status") or academic.get("status")) in {
+            "review_required", "fail", "failed"} and not groups:
+        add("需要人工补充", "报告质量状态仍要求人工复核。")
+
+    ordered = []
+    for category in ("案例不足", "文献证据缺失", "引用需要确认",
+                     "统计验证失败", "章节需要重新生成", "需要人工补充"):
+        if category not in groups:
+            continue
+        group = groups[category]
+        sections = sorted(group["sections"], key=str)
+        if category == "案例不足":
+            action = "查看案例选择"
+        elif category == "文献证据缺失":
+            action = "查看文献证据"
+        elif category in {"引用需要确认", "统计验证失败"}:
+            action = "查看验证结果"
+        elif category == "章节需要重新生成":
+            action = f"定位第 {sections[0]} 节" if len(sections) == 1 else "定位章节"
+        else:
+            action = "查看补充问题"
+        group["action"] = action
+        ordered.append(group)
+    return ordered
+
+
+def _render_report_issue_summary(job_id, groups):
+    st.markdown('<div class="tp-report-review"><div class="tp-report-review-title">'
+                '报告需要复核</div>', unsafe_allow_html=True)
+    for index, group in enumerate(groups):
+        details = " ".join(group["details"][:2])
+        st.markdown('<div class="tp-report-review-item"><div class="tp-report-review-copy">'
+                    f'<strong>{escape(group["category"])}</strong>'
+                    f'<span>{escape(details)}</span></div>', unsafe_allow_html=True)
+        action_col, _ = st.columns([1.1, 4.9], gap="small")
+        with action_col:
+            if st.button(group["action"], key=f"report_issue_action_{job_id}_{index}",
+                         width="stretch"):
+                st.session_state[f"report_review_open_{job_id}"] = True
+                st.session_state[f"report_review_focus_{job_id}"] = group["category"]
+                st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def _render_workspace_report(job_id, state):
+    academic = state.get("academic_state") or {}
+    quality = academic.get("quality_status") or academic.get("status") or "not_started"
+    report_stage = _workspace_report_stage(job_id, state)
+    tone = "warning" if quality in ("review_required", "fail", "failed") else \
+        "success" if report_stage == "已冻结" else "neutral"
+    artifacts = _report_artifacts(job_id)
+    selected_cases = artifacts.get("selected_cases") or {}
+    report = _clean_report_for_display(state.get("p3_md"))
+    headings = _report_headings(report)
+    outline = artifacts.get("outline") or {}
+    case_count = len(selected_cases.get("cases") or [])
+    chapter_count = len(outline.get("sections") or []) or sum(
+        item["level"] == 2 for item in headings)
+    groups = _report_issue_groups(artifacts, academic)
+    updated = _report_updated_label(job_id, state, academic)
+    quality_label = _report_quality_label(quality)
+    validation_label = _report_validation_label(
+        (artifacts.get("validation") or {}).get("status"))
+    st.markdown('<div class="tp-section-kicker">下游成果</div><h2>报告</h2>'
+                '<div class="tp-section-lead">以报告阅读为中心；复核与技术诊断按需展开。</div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="tp-report-header"><div class="tp-report-toolbar">'
+                '<div class="tp-report-toolbar-copy"><div class="tp-report-toolbar-kicker">'
+                '报告工作区</div><h3>翻译实践报告</h3>'
+                f'<div class="tp-report-meta">最后更新 {escape(updated)} · '
+                f'{chapter_count:,} 个章节 · {case_count:,} 个案例 · '
+                f'验证：{escape(validation_label)} · 质量：{escape(quality_label)}</div></div>'
+                f'<div class="tp-report-toolbar-status">{_workspace_status_badge(report_stage, tone)}'
+                '</div></div></div>', unsafe_allow_html=True)
+
+    if report:
+        with st.container(key=f"report_actions_{job_id}"):
+            action_a, action_b, action_c = st.columns([1.55, 1.25, 1.25], gap="small")
+            docx_data = _report_docx_bytes(state)
+            filename = Path(str(state.get("filename") or "report")).stem or "report"
+            validation_status = (artifacts.get("validation") or {}).get("status")
+            draft_label = "导出当前草稿 DOCX" if quality != "pass" or \
+                validation_status != "pass" else "导出 DOCX"
+            with action_a:
+                st.download_button(
+                    draft_label, docx_data,
+                    file_name=f"{filename}_翻译实践报告_草稿.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=f"report_docx_{job_id}", width="stretch")
+            with action_b:
+                st.download_button(
+                    "导出 Markdown", state.get("p3_md", "").encode("utf-8"),
+                    file_name=f"{filename}_翻译实践报告_草稿.md", mime="text/markdown",
+                    key=f"report_markdown_{job_id}", width="stretch")
+            with action_c:
+                if groups:
+                    if st.button("查看复核问题", key=f"report_review_{job_id}",
+                                 width="stretch"):
+                        st.session_state[f"report_review_open_{job_id}"] = True
+                        st.rerun()
+                else:
+                    st.caption("当前无待处理问题")
+        st.markdown('<div class="tp-report-empty-note">DOCX 是可继续编辑的报告草稿；'
+                    '这不代表最终交付审批。</div>', unsafe_allow_html=True)
+        if groups and st.session_state.get(f"report_review_open_{job_id}"):
+            _render_report_issue_summary(job_id, groups)
+        if headings:
+            outline_links = []
+            for item in headings:
+                css = "is-chapter" if item["level"] <= 2 else "is-subsection"
+                outline_links.append(
+                    f'<a class="{css}" href="#{escape(item["anchor"])}">'
+                    f'{escape(item["title"])}</a>')
+            st.markdown('<div class="tp-report-outline"><div class="tp-report-outline-title">'
+                        '报告目录</div>' + "".join(outline_links) + '</div>',
+                        unsafe_allow_html=True)
+        st.markdown('<div class="tp-report-body">', unsafe_allow_html=True)
+        st.markdown(_report_markdown_with_anchors(report, headings),
+                    unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="tp-empty">报告尚未生成。</div>', unsafe_allow_html=True)
+
+    with st.expander("技术详情 / 高级诊断", expanded=False):
+        st.markdown('<div class="tp-report-tech-note">这里保留验证产物、章节来源和原始报告，'
+                    '用于定位问题；正常阅读不会显示这些内部字段。</div>',
+                    unsafe_allow_html=True)
+        artifact_meta = academic.get("artifacts") or {}
+        if artifact_meta:
+            st.dataframe(pd.DataFrame([{
+                "产物": key, "版本": value.get("version", "—"),
+                "更新时间": str(value.get("updated_at", "—"))[:19],
+            } for key, value in artifact_meta.items()]), hide_index=True, width="stretch")
+        for label, artifact_name in (("验证产物", "validation"),
+                                     ("语义复核", "review"),
+                                     ("质量评估", "academic_quality")):
+            artifact = artifacts.get(artifact_name)
+            if artifact:
+                with st.expander(label, expanded=False):
+                    st.json(artifact)
+        if state.get("p3_md"):
+            st.code(state.get("p3_md"), language="markdown")
+
+
+def _render_workspace_delivery(job_id, state):
+    contexts, counts = _workspace_findings_counts(state)
+    blockers = _delivery.unresolved_blocking(state)
+    snapshot = core.delivery_snapshot_status(job_id, state)
+    latest = snapshot.get("latest")
+    frozen = bool(state.get("glossary_frozen") or state.get("quality_bypass") or not state.get("quality_mode"))
+    report_ready = bool(state.get("p3_done") or not state.get("report_enabled", True))
+    st.markdown('<div class="tp-section-kicker">工作流最后一步</div><h2>最终交付</h2>'
+                '<div class="tp-section-lead">确认后生成不可变版本；当前工作版本仍可继续修改。</div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="tp-delivery-header"><h3>准备状态</h3>'
+                '<div class="tp-checklist">'
+                f'<div class="tp-check-row"><i>✓</i>翻译完成</div>'
+                f'<div class="tp-check-row{"" if frozen else " is-warning"}"><i>{"✓" if frozen else "!"}</i>术语{"已冻结" if frozen else "尚未冻结"}</div>'
+                f'<div class="tp-check-row{"" if not blockers else " is-warning"}><i>{"✓" if not blockers else "!"}</i>审校{"完成" if not blockers else f"还有 {len(blockers)} 个必须处理问题"}</div>'
+                f'<div class="tp-check-row{"" if report_ready else " is-warning"}"><i>{"✓" if report_ready else "!"}</i>报告{"草稿已生成" if report_ready else "尚未生成"}</div>'
+                '</div></div>', unsafe_allow_html=True)
+    if blockers:
+        st.warning(f"{len(blockers)} 个必须处理问题仍会阻止最终版本。处理问题，或明确接受剩余风险。")
+        accept = st.checkbox("我已检查这些问题，并确认接受剩余风险", key=f"workspace_delivery_accept_{job_id}")
+        note = st.text_input("接受风险说明", key=f"workspace_delivery_note_{job_id}", placeholder="说明为什么可以接受…")
+        if st.button("接受风险并冻结最终版本", type="primary", disabled=not accept,
+                     key=f"workspace_delivery_accept_go_{job_id}", width="stretch"):
+            _, ok, errors = core.approve_delivery(job_id, note or "人工确认并接受剩余风险",
+                                                   accept_blocking=True, target_lang=target_lang,
+                                                   provider=ai_provider, model=ai_model)
+            if ok:
+                st.rerun()
+            for error in errors:
+                st.error(error)
+    elif not snapshot.get("current"):
+        note = st.text_input("交付说明（可选）", key=f"workspace_delivery_final_note_{job_id}", placeholder="例如：已完成人工审校…")
+        if st.button("确认并冻结最终版本", type="primary", key=f"workspace_delivery_final_{job_id}", width="stretch"):
+            _, ok, errors = core.approve_delivery(job_id, note or "人工确认最终交付",
+                                                   target_lang=target_lang, provider=ai_provider,
+                                                   model=ai_model)
+            if ok:
+                st.rerun()
+            for error in errors:
+                st.error(error)
+    else:
+        st.success(f"最终交付版本 v{latest.get('snapshot_version')} 已冻结；后续工作版本变更不会修改它。")
+
+    st.markdown('<div class="tp-section-label" style="margin-top:24px">版本历史</div>', unsafe_allow_html=True)
+    snapshots = core.list_delivery_snapshots(job_id)
+    if snapshots:
+        st.markdown('<div class="tp-version-list">', unsafe_allow_html=True)
+        filename = Path(str(state.get("filename") or "document")).stem or "document"
+        for item in reversed(snapshots):
+            approval = item.get("approval") or {}
+            st.markdown(f'<div class="tp-version"><strong>v{item.get("snapshot_version")} · Frozen</strong>'
+                        f'<span>{escape(str(approval.get("timestamp") or item.get("created_at") or "—"))[:19]}</span></div>',
+                        unsafe_allow_html=True)
+            archive = core.delivery_snapshot_archive(job_id, item.get("snapshot_version"))
+            if archive:
+                st.download_button(f"下载最终交付版本 v{item.get('snapshot_version')}", archive,
+                                   file_name=f"final_delivery_v{item.get('snapshot_version')}_{filename}.zip",
+                                   mime="application/zip", key=f"workspace_snapshot_{job_id}_{item.get('snapshot_version')}",
+                                   width="stretch")
+        st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        st.caption("尚无冻结版本；确认后将从 v1 开始记录。")
+
+    if not state.get("p2_done"):
+        st.markdown('<div class="tp-empty">翻译完成后，交付文件会显示在这里。</div>', unsafe_allow_html=True)
+        return
+    exported = _assets.export_all(state, job_id, target_lang, ai_provider, ai_model,
+                                  source_filename=state.get("filename", ""))
+    frozen_assets = core.delivery_snapshot_assets(job_id, latest.get("snapshot_version")) \
+        if snapshot.get("current") and latest else {}
+    def asset_bytes(name):
+        return frozen_assets.get(name) or exported.get(name)
+    term_count = len(state.get("glossary") or state.get("auto_terms") or [])
+    assets = [
+        ("双语文本", "bilingual.jsonl", f"translation.jsonl · {len(state.get('pairs') or []):,} segments", "application/x-jsonlines"),
+        ("术语库", "terms.tbx", f"terminology.tbx · {term_count:,} terms", "application/xml"),
+        ("翻译记忆", "memory.tmx", f"translation-memory.tmx · {len(state.get('pairs') or []):,} units", "application/xml"),
+        ("Delivery Manifest", "delivery_manifest.json", "manifest.json · 任务版本与资产清单", "application/json"),
+    ]
+    if state.get("findings"):
+        assets.append(("案例证据包", "segment_evidence.jsonl", "审校证据与段落 provenance", "application/x-jsonlines"))
+    if state.get("p3_md"):
+        report_docx = _report_docx_bytes(state, frozen_assets)
+        assets.append(("实践报告", "stage3_report.docx", "翻译实践报告 · DOCX", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
+    st.markdown('<div class="tp-section-label" style="margin-top:24px">交付文件</div><div class="tp-asset-list">', unsafe_allow_html=True)
+    for index, (label, key, description, mime) in enumerate(assets):
+        data = report_docx if key == "stage3_report.docx" else asset_bytes(key)
+        asset_col, action_col = st.columns([3, 1])
+        with asset_col:
+            st.markdown(f'<div class="tp-asset-row"><div class="tp-asset-copy"><strong>{escape(label)}</strong><span>{escape(description)}</span></div></div>', unsafe_allow_html=True)
+        with action_col:
+            if data is not None:
+                st.download_button("下载" if key != "delivery_manifest.json" else "下载 manifest", data,
+                                   file_name=key, mime=mime, key=f"workspace_asset_{job_id}_{index}", width="stretch")
+            if key == "delivery_manifest.json" and data:
+                with st.expander("查看 manifest", expanded=False):
+                    try:
+                        st.json(json.loads(data.decode("utf-8")))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        st.caption("manifest 当前不可预览。")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def _render_workspace_shell(job_id, state):
+    if not state:
+        _render_workspace_topbar(job_id or "", {"filename": "当前任务", "paras": [], "pairs": []})
+        st.markdown('<div class="tp-empty">还没有打开的任务。请从历史任务或新建任务进入。</div>', unsafe_allow_html=True)
+        return
+    _render_workspace_topbar(job_id, state)
+    section = st.session_state.get("workspace_section", "overview")
+    if section not in {"overview", "translation", "terms", "review", "report", "delivery"}:
+        section = "overview"
+        st.session_state.workspace_section = section
+    if section == "overview":
+        nav_col, main_col = st.columns([0.82, 4.63], gap="small")
+        with nav_col:
+            with st.container(key="workspace_nav_col"):
+                _render_workspace_nav(section, state, job_id)
+        with main_col:
+            with st.container(key="workspace_main_col"):
+                _render_workspace_overview(job_id, state)
+        return
+
+    # Translation needs the widest center surface; the inspector stays a
+    # compact, segment-driven utility column rather than a second dashboard.
+    shell_ratios = [0.82, 3.35, 1.28] if section == "translation" else [0.82, 3.05, 1.58]
+    nav_col, main_col, context_col = st.columns(shell_ratios, gap="small")
+    with nav_col:
+        with st.container(key="workspace_nav_col"):
+            _render_workspace_nav(section, state, job_id)
+    with main_col:
+        with st.container(key="workspace_main_col"):
+            if section == "translation":
+                _render_workspace_translation(job_id, state)
+            elif section == "terms":
+                _render_workspace_terms(job_id, state)
+            elif section == "review":
+                _render_workspace_review(job_id, state)
+            elif section == "report":
+                _render_workspace_report(job_id, state)
+            else:
+                _render_workspace_delivery(job_id, state)
+    with context_col:
+        with st.container(key="workspace_context_col"):
+            _render_workspace_context(job_id, state, section)
+
 # ================= Product shell / state =================
 providers = sorted(core.PROVIDERS, key=str.casefold)
 default_provider = "DeepSeek" if "DeepSeek" in providers else providers[0]
@@ -3105,59 +4834,7 @@ with setup_placeholder.container():
                 next_disabled=not can_start)
 
     elif app_view == "workspace":
-        # If a processing loop is about to resume (pending_continue_job), skip the
-        # static pipeline rendering — the processing loop below handles progress UI.
-        will_process = bool(st.session_state.get("pending_continue_job"))
-        if not will_process:
-            _page_title("任务工作区", "任务进度、质量状态与交付资产")
-            active_state = core.load_job_state(st.session_state.get("active_job_id")) \
-            if st.session_state.get("active_job_id") else None
-            if active_state and st.session_state.get("active_job_id"):
-                _render_recovery_panel(st.session_state["active_job_id"], active_state)
-            stage_label = core.progress_label(active_state) if active_state else "等待任务开始"
-            done_profile = bool(active_state and active_state.get("p1_done"))
-            done_translation = bool(active_state and active_state.get("p2_done"))
-            done_report = bool(active_state and active_state.get("p3_done"))
-            evidence_done = bool(done_report or (active_state and active_state.get("p2_done")
-                                                 and active_state.get("findings") is not None))
-            stage = active_state.get("stage") if active_state else ""
-            translating_or_queued = stage in ("TRANSLATING", "GLOSSARY_FROZEN") and not done_translation
-            pipeline_items = [
-                ("done" if done_profile else "active", "文档解析"),
-                ("done" if done_profile else "pending", "段落重建"),
-                ("done" if active_state and active_state.get("auto_terms") else "pending", "术语抽取"),
-                ("done" if done_translation else "active" if translating_or_queued else "pending", "批次翻译"),
-                ("done" if done_translation and active_state.get("review_stats") else "pending", "独立审校"),
-                ("done" if evidence_done else "pending", "Evidence"),
-                ("done" if done_report else "active" if evidence_done and active_state                 and active_state.get("report_enabled") else "pending", "实践报告"),
-            ]
-            pleft, pright = st.columns([1, 2.5])
-            with pleft:
-                rows = "".join(
-                    f'<div style="padding:6px 0;color:{"#111827" if state == "active" else "#16a34a" if state == "done" else "#9ca3af"}">'
-                    f'{"●" if state == "active" else "✓" if state == "done" else "○"}&nbsp;&nbsp;{label}</div>'
-                    for state, label in pipeline_items)
-                st.markdown(f'<div class="tp-pipeline" style="padding:16px 18px">'
-                            f'<div class="tp-section-sub" style="margin-bottom:8px">处理流程</div>{rows}</div>',
-                            unsafe_allow_html=True)
-            with pright:
-                st.subheader(stage_label)
-                if active_state:
-                    p_completed = sum(1 for s, _ in pipeline_items if s == "done")
-                    p_total = len(pipeline_items)
-                    st.progress(p_completed / p_total)
-                    _stage_map = {
-                        "INGESTED": "文档导入", "PROFILED": "文档画像", "TERMS_PREPARED": "术语准备",
-                        "GLOSSARY_FROZEN": "术语已冻结", "TRANSLATING": "翻译中", "TRANSLATED": "翻译完成",
-                        "ANNOTATED": "标注完成", "ACADEMIC_WRITING": "学术写作中",
-                        "ACADEMIC_REVIEW_REQUIRED": "等待学术复核",
-                        "ACADEMIC_FAILED": "学术写作失败", "REPORT_GENERATED": "已完成",
-                        "REVIEW_REQUIRED": "待审校处理", "FINAL": "已交付",
-                    }
-                    _raw = active_state.get("stage") or "PREPARE"
-                    st.caption(f"当前阶段：{_stage_map.get(_raw, '处理中')}")
-                else:
-                    st.caption("从“新建任务”开始，或在“历史任务”中继续已有任务。")
+        pass
     elif app_view == "history":
         _page_title("历史任务", "继续任务或查看已经生成的交付资产")
     elif app_view == "library":
@@ -3385,7 +5062,7 @@ if active is None and saved_jobs_after:
             break
 st.session_state.active_job_id = active
 
-if active:
+if active and not (app_view == "workspace" and st.session_state.get("active_job_id")):
     astate = core.load_job_state(active)
     if astate and astate.get("p1_done") and not astate.get("p2_done") \
             and astate.get("quality_mode") and astate.get("glossary") is not None \
@@ -3505,6 +5182,14 @@ if active:
             box.caption("翻译未开始：请先「冻结术语表并继续翻译」，"
                        "或选择跳过冻结（快速模式）。")
 
+# ================= New task workspace =================
+# Keep the legacy renderers below as implementation references for the
+# academic/context surfaces, but route the product workspace through the
+# compact shell above.
+if app_view == "workspace":
+    _render_workspace_shell(active, core.load_job_state(active) if active else None)
+    st.stop()
+
 # ================= 动态渲染过程资产面板（基于磁盘任务，刷新后仍可用）=================
 # Streamlit tabs execute both bodies on every rerun.  Use an explicit surface
 # switch so delivery controls are not constructed while the academic surface
@@ -3600,9 +5285,7 @@ def _render_delivery_surface():
  key=f"d2_{job['job_id']}", width="stretch")
             with col_d4:
                 if state.get("p3_md"):
-                    data = frozen_assets.get("stage3_report.docx") if snapshot_current \
-                        else core.markdown_to_word(
-                            state["p3_md"], state.get("theory") or translation_theory)
+                    data = _report_docx_bytes(state, frozen_assets)
                     st.download_button(
  "3. 翻译实践报告",
                         data,

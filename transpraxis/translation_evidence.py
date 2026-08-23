@@ -9,6 +9,10 @@ from . import terminology
 
 MAX_REQUESTS_PER_ROUND = 5
 MAX_EVIDENCE_PAYLOAD_BYTES = 24000
+DIAGNOSTIC_FIELDS = (
+    "category", "summary", "source_span", "target_span", "explanation",
+    "recommendation", "confidence", "detector",
+)
 
 
 def _bound_evidence(result: Any) -> Any:
@@ -231,6 +235,7 @@ def _normalize_findings(
     invalid_segments: Optional[List[Any]] = None,
     invalid_refs: Optional[List[str]] = None,
     valid_evidence_ids: Optional[Sequence[str]] = None,
+    invalid_diagnostics: Optional[List[Any]] = None,
 ) -> List[Dict[str, Any]]:
     if not isinstance(items, list):
         if invalid_segments is not None:
@@ -275,14 +280,39 @@ def _normalize_findings(
             for ref in evidence_refs:
                 if ref not in valid_refs and invalid_refs is not None:
                     invalid_refs.append(ref)
+        reason = str(item.get("reason") or item.get("summary") or "审校发现问题")
         record = {
             "segment_id": segment_id,
             "severity": severity,
-            "reason": str(item.get("reason") or "审校发现问题"),
+            "reason": reason,
             "evidence_refs": evidence_refs,
         }
         if item.get("suggested_target"):
             record["suggested_target"] = str(item["suggested_target"])
+        for field in DIAGNOSTIC_FIELDS:
+            value = item.get(field)
+            if field == "confidence":
+                if isinstance(value, bool):
+                    continue
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if not 0 <= value <= 1:
+                    continue
+            elif value is not None:
+                value = str(value).strip()
+                if not value:
+                    continue
+            if value is not None:
+                record[field] = value
+        has_diagnostics = any(field in item for field in DIAGNOSTIC_FIELDS)
+        if has_diagnostics:
+            record["diagnostic_version"] = 1
+            if invalid_diagnostics is not None and any(
+                    not str(item.get(field) or "").strip()
+                    for field in ("summary", "explanation", "recommendation")):
+                invalid_diagnostics.append(segment_id)
         out.append(record)
     return out
 
@@ -342,7 +372,19 @@ def review_translation_batch_with_evidence(
         "严格输出 JSON 对象：{\"findings\": [...], \"evidence_requests\": "
         "[{\"tool\": \"get_segment\", \"arguments\": {}}]}。"
         "finding 必须使用给出的全局 segment_id；不要输出 segment_index。"
-        "每个 finding 可带 evidence_refs（证据编号数组）。"
+        "每个 finding 必须包含 category、severity、summary、explanation、recommendation；"
+        "source_span 和 target_span 必须是原文/译文中的精确连续片段，无法可靠定位时为 null；"
+        "confidence 仅在检测依据支持时填写 0 到 1 的数字，否则为 null；"
+        "detector 填写检测器名称。没有充分证据不要生成 blocking finding。"
+        "每个 finding 可带 evidence_refs（证据编号数组）和 suggested_target。"
+        "推荐格式：{\"segment_id\": 0, \"category\": \"semantic_accuracy\", "
+        "\"severity\": \"actionable\", \"summary\": \"具体问题摘要\", "
+        "\"source_span\": \"原文中的精确片段或 null\", "
+        "\"target_span\": \"译文中的精确片段或 null\", "
+        "\"explanation\": \"为什么判定为问题\", "
+        "\"recommendation\": \"建议人工如何检查或处理\", "
+        "\"confidence\": 0.87, \"detector\": \"Semantic QA\", "
+        "\"evidence_refs\": [\"E1\"]}。"
         "若无问题 findings 必须为空数组。\n" + glossary_text + "\n" + style_rules
     )
     base_prompt = f"待审校段落（目标语言：{target_lang}）：\n{numbered}"
@@ -391,13 +433,14 @@ def review_translation_batch_with_evidence(
         if isinstance(payload, list):
             invalid_segments: List[Any] = []
             invalid_refs: List[str] = []
+            invalid_diagnostics: List[Any] = []
             latest_findings = _normalize_findings(
                 payload, segment_ids, invalid_segments, invalid_refs,
-                list(trace["evidence_ids"]))
+                list(trace["evidence_ids"]), invalid_diagnostics)
             trace["rounds"].append({"round": round_index, "findings": latest_findings,
                                     "requests": []})
-            if invalid_segments or invalid_refs:
-                return fail("finding 引用了无效的 segment_id/evidence_refs")
+            if invalid_segments or invalid_refs or invalid_diagnostics:
+                return fail("finding 引用了无效的定位、证据或诊断字段")
             return finish(latest_findings,
                           "clean" if not latest_findings else "findings")
         if not isinstance(payload, dict):
@@ -460,11 +503,12 @@ def review_translation_batch_with_evidence(
         if not evidence:
             invalid_segments = []
             invalid_refs: List[str] = []
+            invalid_diagnostics: List[Any] = []
             latest_findings = _normalize_findings(
                 payload.get("findings"), segment_ids, invalid_segments, invalid_refs,
-                list(trace["evidence_ids"]))
-            if invalid_segments or invalid_refs:
-                return fail("finding 或 evidence_refs 无效")
+                list(trace["evidence_ids"]), invalid_diagnostics)
+            if invalid_segments or invalid_refs or invalid_diagnostics:
+                return fail("finding 或诊断字段无效")
             return finish(latest_findings,
                           "findings" if latest_findings else "clean")
         prompt = base_prompt + (
