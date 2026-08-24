@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "transpraxis"
-version = "0.2.1"
+version = "0.3.0"
 description = "TransPraxis / 译践 — Translation & Report Copilot"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dynamic = ["dependencies"]
 authors = [

@@ -17,15 +17,15 @@ TransPraxis / 译践是一套面向长文档翻译实践的本地工作空间，
 
 ## Quick Start
 
-### 安装 v0.2.1
+### 安装 v0.3.0
 
 需要 Python 3.10 或更高版本。
 
 从 [GitHub Releases](https://github.com/xueyang-dev/TransPraxis/releases) 下载
-`transpraxis-0.2.1-py3-none-any.whl`，然后运行：
+`transpraxis-0.3.0-py3-none-any.whl`，然后运行：
 
 ```bash
-python -m pip install ./transpraxis-0.2.1-py3-none-any.whl
+python -m pip install ./transpraxis-0.3.0-py3-none-any.whl
 transpraxis
 ```
 
@@ -70,7 +70,7 @@ transpraxis
 
 ### 4. 交付与翻译记忆
 
-任务支持导出普通 DOCX、双语 DOCX、TMX 翻译记忆、JSONL 双语段落和 `delivery_manifest.json`，并可导出术语、审校发现和证据文件。仅通过审校的段落会进入翻译记忆；任务状态保存在本地，长文中断后可从已保存的进度继续处理。
+任务可按需导出纯译文/双语 DOCX、PDF、重点标注版、XLSX/TBX 术语、TMX 翻译记忆、JSONL 双语段落、证据文件和 `delivery_manifest.json`。仅通过审校的段落会进入翻译记忆；人工确认后的资产会冻结为可追溯的交付快照。任务状态保存在本地，长文中断后可从已保存的配置和进度继续处理。
 
 ### 5. 翻译实践报告
 
@@ -88,11 +88,11 @@ transpraxis
 
 常用输出包括：
 
-- 普通版 DOCX、双语 DOCX；
+- 纯译文/双语 DOCX、PDF、重点标注版 DOCX；
 - 术语表 XLSX、TBX；
 - TMX 翻译记忆、JSONL 双语段落；
 - `delivery_manifest.json`、证据文件、审校发现与审校报告；
-- 学术工作区和翻译实践报告草稿。
+- 学术工作区 ZIP 和翻译实践报告 DOCX/Markdown 草稿。
 
 ## Provider 与命令行
 
@@ -109,7 +109,7 @@ python scripts/translate_pdf.py "文档.pdf" --target-lang 简体中文 --qualit
 
 ## 使用说明与限制
 
-AI 生成的译文和实践报告仅作为工作稿，提交前应人工核对事实、术语、引文和理论判断。`--lan` 当前采用受信任局域网模式，不包含认证层；不应暴露到不受信任的网络。LAN 认证不在 v0.2.1 范围内。
+AI 生成的译文和实践报告仅作为工作稿，提交前应人工核对事实、术语、引文和理论判断。`--lan` 当前采用受信任局域网模式，不包含认证层；不应暴露到不受信任的网络。LAN 认证不在 v0.3.0 范围内。
 
 ## 文档
 
