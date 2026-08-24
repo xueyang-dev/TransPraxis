@@ -125,6 +125,51 @@ def test_report_review_is_draft_exportable_and_maps_user_facing_reasons(tmp_path
         assert any("案例不足" in item.value for item in at.markdown)
         assert not any("insufficient_core_revision_cases" in item.value
                        for item in at.markdown)
+        next(button for button in at.button if button.label == "查看案例选择").click()
+        at.run()
+        assert not at.exception, at.exception
+        assert any("选择状态：insufficient_revision_cases" in item.value
+                   for item in at.caption)
+        assert any(button.label == "重新选择案例并继续生成"
+                   for button in at.button)
+    finally:
+        core.OUTPUT_DIR = old_output
+
+
+def test_report_case_repair_invalidates_planning_and_resumes(tmp_path, monkeypatch):
+    state = _report_state(quality="review_required")
+    state["academic_state"]["artifacts"] = {
+        "selected_cases": {"file": "selected-cases.json"},
+        "outline": {"file": "academic-outline.json"},
+        "validation": {"file": "academic-validation.json"},
+    }
+    artifacts = _base_artifacts()
+    artifacts["selected-cases.json"]["authentic_selection_status"] = \
+        "insufficient_revision_cases"
+    artifacts["academic-validation.json"] = {
+        "status": "fail",
+        "issues": [{"type": "insufficient_core_revision_cases"}],
+    }
+    resumed = []
+    monkeypatch.setattr(core, "resume_job", lambda job_id, filename, kwargs,
+                        base_url=None: resumed.append((job_id, filename)) or True)
+    at, old_output = _render_report(tmp_path, state, artifacts)
+    try:
+        at.session_state["api_key_DeepSeek"] = "test-key"
+        at.run()
+        next(button for button in at.button if button.label == "查看复核问题").click()
+        at.run()
+        next(button for button in at.button if button.label == "查看案例选择").click()
+        at.run()
+        next(button for button in at.button
+             if button.label == "重新选择案例并继续生成").click()
+        at.run()
+        assert not at.exception, at.exception
+        assert resumed == [("reportui0000001", "report-fixture.docx")]
+        repaired = core.load_job_state("reportui0000001")
+        assert not repaired["p3_done"]
+        assert "selected_cases" not in repaired["academic_state"]["artifacts"]
+        assert repaired["p2_done"]
     finally:
         core.OUTPUT_DIR = old_output
 

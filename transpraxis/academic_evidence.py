@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from . import assets
 from . import report_evidence
 
-SCHEMA_VERSION = "academic-evidence-v4"
+SCHEMA_VERSION = "academic-evidence-v5"
 ALLOWED_SOURCE_STATUSES = {
     "metadata_verified", "user_provided", "imported_unverified", "candidate",
     "rejected",
@@ -405,6 +405,95 @@ def mine_candidate_cases(
     return sorted(chosen.values(), key=lambda x: (-x["score"], x["segment_index"]))
 
 
+def mine_translation_decision_cases(
+    segments: List[Dict[str, Any]],
+    glossary: Optional[List[Dict[str, Any]]] = None,
+    max_candidates: int = 40,
+) -> List[Dict[str, Any]]:
+    """Mine unchanged but evidence-rich decisions without inventing revisions."""
+    scored = []
+    for segment in segments:
+        if case_role(segment) != "non_revision_case" or segment.get("integrity_flags"):
+            continue
+        details = _candidate_features(segment, glossary or [])
+        features = details["features"]
+        has_decision_evidence = bool(
+            features["actionable_findings"]
+            or features["term_count"]
+            or features["clause_markers"] >= 2
+            or features["punctuation_count"] >= 5
+        )
+        if not has_decision_evidence or not segment.get("source") \
+                or not segment.get("final_target"):
+            continue
+        scored.append({
+            "case_id": f"TD-{int(segment['segment_index']) + 1:04d}",
+            "source_segment_id": segment["segment_id"],
+            "segment_index": segment["segment_index"],
+            "coverage_zone": segment["coverage_zone"],
+            "case_type": "translation_decision",
+            "case_role": "translation_decision_case",
+            "academic_candidate_status": "eligible",
+            "provenance": {"historical": True, "generated_for_analysis": False},
+            "decision_evidence": {
+                "initial_equals_final": True,
+                "finding_count": len(segment["process_evidence"].get("findings") or []),
+                "terminology_entry_ids": list(
+                    segment["process_evidence"].get("injected_glossary_entry_ids") or []),
+            },
+            "score": details["score"],
+            "reasons": ["unchanged_translation_decision", *details["reasons"]],
+            "features": features,
+        })
+    scored.sort(key=lambda x: (-x["score"], x["segment_index"]))
+    chosen: Dict[str, Dict[str, Any]] = {}
+    for zone in ("beginning", "middle", "end"):
+        item = next((x for x in scored if x["coverage_zone"] == zone), None)
+        if item:
+            chosen[item["case_id"]] = item
+    for item in scored:
+        if len(chosen) >= max_candidates:
+            break
+        chosen[item["case_id"]] = item
+    return sorted(chosen.values(), key=lambda x: (-x["score"], x["segment_index"]))
+
+
+def _workflow_evidence(state: Dict[str, Any], statistics: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose only workflow facts actually recorded by TransPraxis."""
+    return {
+        "source_filename": str(state.get("filename") or ""),
+        "target_language": str(state.get("target_lang") or ""),
+        "translation_scope": {
+            "segments": statistics.get("total_segments", 0),
+            "translated_segments": statistics.get("translated_segments", 0),
+        },
+        "pre_translation": {
+            "document_parsed": bool(state.get("paras")),
+            "document_profile_built": bool(state.get("document_profile")),
+            "terminology_extracted": bool(state.get("glossary") or state.get("auto_terms")),
+            "terminology_frozen": bool(state.get("glossary_frozen")),
+            "translation_memory_enabled": bool(state.get("use_tm")),
+        },
+        "translation": {
+            "initial_and_final_versions_recorded": statistics.get(
+                "segments_with_initial_final_data", 0),
+            "terminology_constraints_recorded": sum(
+                bool(pair.get("glossary_entry_ids")) for pair in state.get("pairs") or []),
+            "tm_reuse_records": statistics.get("tm_reuse_count", 0),
+        },
+        "post_translation": {
+            "reviewed_segments": statistics.get("reviewed_segments", 0),
+            "recorded_findings": sum(
+                statistics.get(key, 0) for key in (
+                    "recorded_blocking_findings", "recorded_actionable_findings",
+                    "recorded_informational_findings")),
+            "human_actions": len(state.get("human_actions") or []),
+            "meaningful_revisions": statistics.get("meaningfully_revised_segments", 0),
+            "delivery_status": str(state.get("delivery_status") or ""),
+        },
+    }
+
+
 def _project_statistics(state: Dict[str, Any], segments: List[Dict[str, Any]]) -> Dict[str, Any]:
     findings = state.get("findings") or []
     active_findings = [f for f in findings if not f.get("resolved")]
@@ -518,6 +607,8 @@ def build_academic_evidence(
     _mark_neighbor_target_overlap(segments)
     _mark_neighbor_initial_overlap(segments)
     candidates = mine_candidate_cases(segments, glossary, max_candidates=max_candidates)
+    decision_candidates = mine_translation_decision_cases(
+        segments, glossary, max_candidates=max_candidates)
     statistics = _project_statistics(state, segments)
     limitations = []
     if any(s["availability"]["initial_target"] == "not_recorded" for s in segments):
@@ -552,15 +643,18 @@ def build_academic_evidence(
             "minimum_core_case_count": 2,
             "revision_candidate_pool": len(candidates),
             "eligible_revision_cases": academically_eligible,
+            "translation_decision_candidate_pool": len(decision_candidates),
         },
         "project_evidence": {
             "segments": segments,
             "statistics": statistics,
             "document_profile": state.get("document_profile"),
             "glossary": glossary,
+            "workflow": _workflow_evidence(state, statistics),
         },
         "author_analysis": [],
         "candidate_cases": candidates,
+        "translation_decision_candidates": decision_candidates,
         "limitations": limitations,
     }
     artifact["content_hash"] = stable_hash({k: v for k, v in artifact.items()

@@ -48,15 +48,20 @@ def _template_contract(settings: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return settings.get("report_template_contract") or settings.get("template_contract")
 
 
-def _template_sections(contract: Mapping[str, Any]) -> list[Dict[str, Any]]:
+def _template_sections(
+    contract: Mapping[str, Any], project_name: str = "",
+) -> list[Dict[str, Any]]:
     structure = contract.get("document_structure") or {}
     sections = []
     for item in structure.get("chapters") or []:
         if not isinstance(item, Mapping):
             continue
+        title = str(item.get("title") or "").strip()
+        if project_name:
+            title = title.replace("XXX", project_name).replace("×××", project_name)
         sections.append({
             "section_id": str(item.get("section_id") or len(sections) + 1),
-            "title": str(item.get("title") or "").strip(),
+            "title": title,
             "role": str(item.get("role") or "generic_section"),
             "level": int(item.get("level") or 1),
             "purpose": str(item.get("purpose") or "").strip(),
@@ -68,6 +73,10 @@ def _template_sections(contract: Mapping[str, Any]) -> list[Dict[str, Any]]:
                     "markdown_prefix": str(x.get("markdown_prefix") or (
                         "#" * (int(x.get("level") or 2) + 1))),
                     "required": bool(x.get("required", True)),
+                    "allows_dynamic_children": bool(
+                        x.get("allows_dynamic_children", False)),
+                    "mapping_group": x.get("mapping_group"),
+                    "mapping_side": x.get("mapping_side"),
                 }
                 for x in item.get("required_subsections") or []
                 if isinstance(x, Mapping) and str(x.get("title") or "").strip()
@@ -83,7 +92,8 @@ def build_constraints(settings: Mapping[str, Any] | None = None) -> Dict[str, An
     explicit_override = settings.get("report_structure_override") \
         or settings.get("report_sections_override") \
         or settings.get("outline_sections_override")
-    template_sections = _template_sections(contract) if contract else []
+    template_sections = _template_sections(
+        contract, str(settings.get("project_name") or "").strip()) if contract else []
     if explicit_override:
         sections = _sections(settings, explicit_override)
         structure_source = "explicit_user_override"

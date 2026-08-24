@@ -115,6 +115,15 @@ def _parse_json(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _is_transient_llm_error(exc: Exception) -> bool:
+    module = type(exc).__module__ or ""
+    message = str(exc).casefold()
+    return module.startswith(("openai", "httpx", "httpcore")) or any(
+        token in message for token in (
+            "timeout", "connection", "rate limit", "502", "503", "504",
+            "bad gateway", "temporarily unavailable"))
+
+
 def detect_generic_patterns(text: str) -> List[str]:
     found = []
     for name, pattern in _GENERIC_PATTERNS:
@@ -441,13 +450,21 @@ def deterministic_diagnostics(
     for case in selected_cases.get("cases", []):
         case_id = str(case.get("case_id") or "")
         synthetic = case.get("case_type") == "synthetic_contrast"
+        decision = case.get("case_type") == "translation_decision"
+        segment = segs.get(str(case.get("source_segment_id") or case_id)) or {}
         if synthetic:
             validation = case.get("validation") or {}
             cls = "strong_case" if validation.get("academic_case_eligible") else "weak_case"
             reasons = [validation.get("reason") or "; ".join(
                 validation.get("rejected_reasons") or []) or "synthetic validation missing"]
+        elif decision:
+            decision_evidence = case.get("decision_evidence") or {}
+            cls = "strong_case" if segment.get("source") and segment.get(
+                "final_target") and decision_evidence else "weak_case"
+            reasons = list(decision_evidence.get("reasons") or []) or [
+                "翻译决策案例保留原文、终译和可分析的项目证据。"]
         else:
-            cls, reasons = classify_case(case, segs.get(case_id), findings_all, selected_ids)
+            cls, reasons = classify_case(case, segment, findings_all, selected_ids)
         case_rows.append({
             "case_id": case_id,
             "case_type": case.get("case_type", "authentic_revision"),
@@ -455,9 +472,9 @@ def deterministic_diagnostics(
             "reasons": reasons,
             "supports_claims": sorted(set(case.get("supports_claims") or [])),
             "evidence_richness": None if synthetic else case_quality_signals(
-                segs.get(case_id) or {}, findings_all)["evidence_richness"],
-            "case_role": "synthetic_contrast_case" if synthetic else case_role(
-                segs.get(case_id) or {}),
+                segment, findings_all)["evidence_richness"],
+            "case_role": "synthetic_contrast_case" if synthetic else (
+                "translation_decision_case" if decision else case_role(segment)),
             "synthetic_dimensions": {
                 "difficulty_validity": "confirmed" if case.get("difficulty", {}).get(
                     "trigger") and case.get("difficulty", {}).get("reason") else "not_confirmed",
@@ -598,6 +615,19 @@ def _deterministic_findings(diagnostics: Dict[str, Any]) -> List[Dict[str, Any]]
         section_id=x.get("section_id"), case_id=x.get("case_id"),
         claim_id=x.get("claim_id"), evidence=x.get("evidence", ""))
         for x in diagnostics["cross_section_checks"])
+    for item in diagnostics.get("deterministic_validation_issues") or []:
+        issue_type = str(item.get("type") or "deterministic_surface_failure")
+        issues.append(_issue(
+            issue_type,
+            dimension="surface_integrity" if issue_type.startswith("template_")
+            else "claim_discipline",
+            severity="high", priority="P1",
+            reason=str(item.get("reason") or "确定性验证发现用户可见质量问题。"),
+            recommended_action=str(item.get("suggested_action") or
+                                   "定点修复受影响章节并重新验证。"),
+            section_id=item.get("section_id"),
+            evidence=str(item.get("evidence_id") or ""),
+            repair_action="rewrite"))
     return issues
 
 
@@ -626,9 +656,12 @@ def _scoped_inputs(
                 "provenance": case.get("provenance"),
             })
             continue
-        segment = segs.get(str(case.get("case_id") or "")) or {}
+        segment = segs.get(str(case.get("source_segment_id") or
+                               case.get("case_id") or "")) or {}
         case_pool.append({
             "case_id": case.get("case_id"), "coverage_zone": case.get("coverage_zone"),
+            "case_type": case.get("case_type", "authentic_revision"),
+            "source_segment_id": case.get("source_segment_id"),
             "supports_claims": case.get("supports_claims"),
             "source": (segment.get("source") or "")[:200],
             "final_target": (segment.get("final_target") or "")[:200],
@@ -641,7 +674,15 @@ def _scoped_inputs(
                 "process_evidence", {}).get("injected_glossary_entry_ids") or []),
         })
     return {
-        "research_model": {k: v for k, v in research_model.items() if k != "content_hash"},
+        "research_model": {
+            key: research_model.get(key) for key in (
+                "research_topic", "research_questions", "theoretical_framework",
+                "method", "analysis_dimensions", "expected_contribution",
+                "project_metadata", "body_language", "writing_style")
+        },
+        "chapter_roles": {
+            str(item.get("section_id")): item.get("role")
+            for item in outline.get("sections") or []},
         "argument_plan": argument_plan,
         "selected_cases": case_pool,
         "case_count_policy": {
@@ -676,6 +717,14 @@ def evaluate_quality(
     has_literature = bool(literature_claims.get("items"))
     diagnostics = deterministic_diagnostics(
         research_model, argument_plan, selected_cases, outline, sections, evidence)
+    diagnostics["deterministic_validation_issues"] = [
+        dict(item) for item in deterministic_validation.get("issues") or []
+        if item.get("type") in {
+            "template_duplicate_rendering", "template_duplicate_heading",
+            "template_internal_id_visible", "template_unresolved_marker",
+            "unsupported_claim_strength",
+        }
+    ]
     findings = _deterministic_findings(diagnostics)
     for section in sections:
         section_id = section.get("section_id")
@@ -683,7 +732,7 @@ def evaluate_quality(
         revision_claims = case_analysis.detect_revision_claims(content)
         if revision_claims:
             for case in selected_cases.get("cases", []):
-                if case.get("case_type") == "synthetic_contrast":
+                if case.get("case_type") != "authentic_revision":
                     continue
                 case_id = str(case.get("case_id") or "")
                 segment = segment_index(evidence).get(case_id) or {}
@@ -783,14 +832,27 @@ def evaluate_quality(
     raw = None
     for attempt in range(2):
         suffix = "" if attempt == 0 else "\n上次输出无效；仅输出合法 JSON 对象。"
-        response = call_llm(provider, api_key, model, system + suffix,
-                            json.dumps(payload, ensure_ascii=False), temperature=0.1)
+        try:
+            response = call_llm(provider, api_key, model, system + suffix,
+                                json.dumps(payload, ensure_ascii=False), temperature=0.1)
+        except Exception as exc:
+            if not _is_transient_llm_error(exc):
+                raise
+            response = ""
         raw = _parse_json(response)
         if raw is not None:
             break
     valid_sections = {str(x.get("section_id")) for x in outline.get("sections", [])}
     valid_claims = {str(x.get("claim_id")) for x in argument_plan.get("claims", [])}
     valid_cases = {str(x.get("case_id")) for x in selected_cases.get("cases", [])}
+    if raw is None:
+        dimensions["research_alignment"] = "review_required"
+        findings.append(_issue(
+            "quality_review_unavailable", dimension="research_alignment",
+            severity="medium", priority="P1",
+            reason="学术质量模型未返回可解析结果；确定性门禁仍已执行。",
+            recommended_action="恢复模型连接后只重跑学术质量评估。",
+            repair_action="rewrite"))
     if raw:
         for name, status in (raw.get("dimensions") or {}).items():
             if name in dimensions and status in STATUSES:

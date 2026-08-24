@@ -7,6 +7,7 @@ import base64
 import inspect
 import json
 import re
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 
@@ -1237,6 +1238,33 @@ _WORKSPACE_CSS = """
 .tp-overview-hero { padding:22px 24px; border:1px solid #d8e5fa; border-radius:14px; background:linear-gradient(135deg,#f8fbff,#fff); }
 .tp-overview-hero strong { display:block; color:var(--tp-ink); font-size:19px; }
 .tp-overview-hero p { margin:8px 0 16px; color:var(--tp-sub); font-size:13px; }
+.tp-runtime-panel { margin:0 0 18px; padding:20px 22px; border:1px solid #c9dcfb; border-radius:14px; background:linear-gradient(135deg,#f8fbff,#fff); }
+.tp-runtime-kicker { color:var(--tp-primary); font-size:12px; font-weight:750; letter-spacing:.04em; }
+.tp-runtime-head { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; margin-top:7px; }
+.tp-runtime-head h3 { margin:0; color:var(--tp-ink); font-size:19px !important; }
+.tp-runtime-head p { margin:5px 0 0; color:var(--tp-sub); font-size:13px; line-height:1.5; }
+.tp-runtime-phase { display:flex; align-items:center; gap:8px; margin-top:17px; color:var(--tp-ink); font-size:14px; font-weight:700; }
+.tp-runtime-phase .dot { width:9px; height:9px; border-radius:50%; background:var(--tp-primary); box-shadow:0 0 0 4px #e3efff; }
+.tp-runtime-phase.is-warning .dot { background:#c47b00; box-shadow:0 0 0 4px #fff1cf; }
+.tp-runtime-phase.is-danger .dot { background:var(--tp-danger); box-shadow:0 0 0 4px #ffe3e3; }
+.tp-runtime-meta { display:flex; flex-wrap:wrap; gap:6px 18px; margin-top:8px; color:var(--tp-sub); font-size:12px; font-variant-numeric:tabular-nums; }
+.tp-runtime-progress-head { display:flex; justify-content:space-between; gap:12px; margin-top:18px; color:var(--tp-sub); font-size:12px; }
+.tp-runtime-progress-head strong { color:var(--tp-ink); font-variant-numeric:tabular-nums; }
+.tp-runtime-bar { height:8px; margin-top:7px; overflow:hidden; border-radius:999px; background:#e7eef9; }
+.tp-runtime-bar i { display:block; height:100%; border-radius:inherit; background:var(--tp-primary); transition:width .2s ease; }
+.tp-runtime-step-title { margin-top:18px; color:var(--tp-ink); font-size:13px; font-weight:750; }
+.tp-runtime-steps { margin-top:7px; padding-left:0; list-style:none; }
+.tp-runtime-steps li { position:relative; padding:5px 0 5px 24px; color:var(--tp-sub); font-size:12px; }
+.tp-runtime-steps li::before { content:"○"; position:absolute; left:0; color:#9aa7b8; font-size:16px; line-height:1; }
+.tp-runtime-steps li.is-current { color:var(--tp-ink); font-weight:650; }
+.tp-runtime-steps li.is-current::before { content:"●"; color:var(--tp-primary); }
+.tp-runtime-steps li.is-done { color:var(--tp-sub); }
+.tp-runtime-steps li.is-done::before { content:"✓"; color:var(--tp-success); font-weight:750; }
+.tp-runtime-alert { margin-top:13px; padding:9px 11px; border-radius:8px; background:#fff5e6; color:#8a5a00; font-size:12px; line-height:1.5; }
+.tp-runtime-alert.is-danger { background:#fff0f0; color:#a12222; }
+.tp-runtime-event { display:flex; gap:12px; padding:6px 0; color:var(--tp-sub); font-size:12px; line-height:1.45; }
+.tp-runtime-event time { flex:0 0 62px; color:var(--tp-faint); font-variant-numeric:tabular-nums; }
+.tp-runtime-event span { color:var(--tp-ink); }
 .tp-status-badge { display:inline-flex; align-items:center; gap:6px; padding:5px 10px; border-radius:999px; background:#fff7e6; color:#9a6700; font-size:12px; font-weight:700; }
 .tp-status-badge.is-success { background:#eaf8f1; color:#147a4a; }
 .tp-status-badge.is-danger { background:#fff0f0; color:#b42318; }
@@ -1607,14 +1635,7 @@ _PRESET_CONFIGS = {
 }
 
 def _default_output_config():
-    return {
-        "enable_annotate": False, "enable_report": False,
-        "deliver_plain_docx": True, "deliver_bilingual_docx": True,
-        "deliver_pdf": False, "deliver_terms_xlsx": True,
-        "deliver_tbx": False, "deliver_tmx": False, "deliver_jsonl": False,
-        "deliver_evidence": True, "deliver_cases": False,
-        "deliver_academic_workspace": False, "deliver_review_report": False,
-    }
+    return core.default_delivery_config()
 
 
 _PRESET_OUTPUTS = {
@@ -2391,11 +2412,11 @@ def _render_recovery_panel(job_id, state):
         if summary["recovered_tm_entries"]:
             st.info(f"已从上次中断中恢复 {summary['recovered_tm_entries']} 条翻译记忆同步记录。")
         if summary["can_resume"] and st.button(
-                "从断点继续", type="primary", key=f"resume_workspace_{job_id}",
+                "继续处理", type="primary", key=f"resume_workspace_{job_id}",
                 width="stretch"):
             st.session_state.update(
-                active_job_id=job_id, app_view="workspace", workspace_mode=True,
-                pending_continue_job=job_id)
+                active_job_id=job_id, app_view="workspace", workspace_mode=True)
+            _resume_job(job_id, state)
             st.rerun()
 
 
@@ -2875,6 +2896,15 @@ def _workspace_review_contexts(state):
 
 
 def _workspace_status(state, job_id=""):
+    runtime_view = core.build_job_runtime_view(job_id, state) if job_id else {}
+    runtime_status = runtime_view.get("runtime_status")
+    if runtime_status in {"resume_requested", "queued", "starting", "running",
+                          "waiting_external", "cancelling",
+                          "stalled", "interrupted", "failed", "cancelled",
+                          "idle_incomplete", "waiting_manual"}:
+        tone = "danger" if runtime_status in {"failed", "interrupted"} else \
+            "warning" if runtime_status in {"stalled", "cancelling", "waiting_manual"} else "neutral"
+        return runtime_view.get("headline_status") or "未完成", tone
     snapshot = core.delivery_snapshot_status(job_id, state) if job_id else {"current": False}
     if state.get("delivery_status") == "final" and snapshot.get("current"):
         return "已冻结", "success"
@@ -2918,6 +2948,140 @@ def _workspace_activity(job_id, state):
     return rows[:4]
 
 
+def _runtime_age(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _runtime_clock(value):
+    if not value:
+        return "—"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone().strftime("%H:%M:%S")
+    except (TypeError, ValueError):
+        return str(value)[:19]
+
+
+def _runtime_duration(seconds):
+    seconds = max(0, int(seconds or 0))
+    minutes, remainder = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}小时{minutes:02d}分"
+    if minutes:
+        return f"{minutes}分{remainder:02d}秒"
+    return f"{remainder}秒"
+
+
+def _render_runtime_panel(job_id, state):
+    view = core.build_job_runtime_view(job_id, state)
+    runtime = view["runtime"]
+    status = view["status"]
+    if status == "idle":
+        return
+    label = view["status_label"]
+    tone = "danger" if status in {"failed", "interrupted"} else \
+        "warning" if status in {"stalled", "cancelling", "waiting_manual"} else "neutral"
+    headline, detail = view["headline"], view["detail"]
+    heartbeat_age = _runtime_age(runtime.get("last_heartbeat_at"))
+    tone_class = "is-warning" if tone == "warning" else "is-danger" if tone == "danger" else ""
+    completed, total = view["progress_completed"], view["progress_total"]
+    progress_html = ""
+    if total:
+        progress_pct = round(min(1.0, completed / total) * 100)
+        progress_html = (
+            f'<div class="tp-runtime-progress-head"><span>报告工作流</span>'
+            f'<strong>{completed} / {total}</strong></div>'
+            f'<div class="tp-runtime-bar" aria-label="报告工作流 {completed} / {total}">'
+            f'<i style="width:{progress_pct}%"></i></div>')
+    timing_html = ""
+    if status in {"running", "waiting_external", "cancelling"}:
+        timing_html = (
+            f'<div class="tp-runtime-meta"><span>本步骤已运行 '
+            f'{_runtime_duration(_runtime_age(runtime.get("operation_started_at")) or 0)}</span>'
+            f'<span>最后运行信号 {_runtime_duration(heartbeat_age or 0)}前</span></div>')
+    st.markdown(
+        '<div class="tp-runtime-panel">'
+        f'<div class="tp-runtime-kicker">{escape(view["surface_label"])}</div>'
+        f'<div class="tp-runtime-phase {tone_class}"><span class="dot"></span>'
+        f'<span>{escape(label)}</span></div>'
+        f'<div class="tp-runtime-head"><div><h3>{escape(headline)}</h3>'
+        f'<p>{escape(detail)}</p></div></div>'
+        f'{timing_html}{progress_html}'
+        '</div>', unsafe_allow_html=True)
+    recent_events = view["user_events"]
+    if recent_events:
+        st.caption("最近活动")
+        for event in reversed(recent_events):
+            st.markdown(
+                f'<div class="tp-runtime-event"><time>{escape(_runtime_clock(event.get("timestamp") or event.get("at")))}</time>'
+                f'<span>{escape(event.get("message") or "")}</span></div>',
+                unsafe_allow_html=True)
+    action_col, detail_col = st.columns([1, 1.2], gap="small")
+    with action_col:
+        if status in {"resume_requested", "queued", "starting"}:
+            st.button("正在恢复…", key=f"runtime_resuming_{job_id}",
+                      disabled=True, width="stretch")
+        elif status in {"running", "waiting_external", "cancelling"} and st.button(
+                "取消任务", key=f"runtime_cancel_{job_id}", width="stretch"):
+            core.request_job_cancel(job_id)
+            st.rerun()
+        elif status in {"interrupted", "idle_incomplete", "cancelled"}:
+            if st.button("继续处理", type="primary", key=f"runtime_resume_{job_id}",
+                         width="stretch"):
+                _resume_job(job_id, state)
+                st.rerun()
+        elif status == "stalled" and core.is_job_worker_alive(job_id):
+            if st.button("放弃当前运行", type="primary", key=f"runtime_abandon_{job_id}",
+                         width="stretch"):
+                core.request_job_cancel(job_id)
+                st.rerun()
+        elif status in {"failed", "stalled"}:
+            if st.button("重试当前步骤", type="primary", key=f"runtime_retry_{job_id}",
+                         width="stretch"):
+                core.retry_job_step(job_id)
+                _resume_job(job_id, core.load_job_state(job_id) or state)
+                st.rerun()
+    with detail_col:
+        with st.expander("运行详情", expanded=False):
+            st.caption(f"worker：{'运行中' if core.is_job_worker_alive(job_id) else '未连接'}")
+            worker = runtime.get("worker") or {}
+            st.caption(f"worker id：{worker.get('worker_id') or '—'} · "
+                       f"PID：{worker.get('owner_pid') or '—'}")
+            st.caption(f"lease：{worker.get('lease_expires_at') or '—'}")
+            st.caption(f"runtime status：{status} · phase：{runtime.get('phase') or '—'}")
+            st.caption(f"stage：{runtime.get('stage_id') or runtime.get('stage') or '—'} · "
+                       f"operation：{runtime.get('operation_id') or runtime.get('operation') or '—'}")
+            st.caption(f"checkpoint：{view['progress_completed']} / "
+                       f"{view['progress_total'] or '—'}")
+            st.caption(f"最后进展：{_runtime_clock(runtime.get('last_progress_at'))}")
+            st.caption(f"最后心跳：{_runtime_clock(runtime.get('last_heartbeat_at'))}")
+            if isinstance(runtime.get("error"), dict):
+                error = runtime["error"]
+                st.caption(f"失败类型：{error.get('type') or '—'} · "
+                           f"技术日志：{error.get('technical_log') or '—'}")
+            if runtime.get("last_event"):
+                st.caption(f"最后事件：{runtime['last_event']}")
+            st.caption("技术日志")
+            for event in reversed(core.read_runtime_events(
+                    job_id, 12, visibility="technical")):
+                st.markdown(
+                    f'<div class="tp-runtime-event"><time>{escape(_runtime_clock(event.get("timestamp") or event.get("at")))}</time>'
+                    f'<span>{escape(event.get("event") or "")} · '
+                    f'{escape(event.get("message") or "")}</span></div>',
+                    unsafe_allow_html=True)
+
+
 def _workspace_saved_label(job_id, state):
     if not job_id:
         return "最近"
@@ -2950,6 +3114,12 @@ def _workspace_project_title(filename):
 def _workspace_report_stage(job_id, state):
     if not state.get("p3_done"):
         return "处理中"
+    report_status = state.get("report_status") or \
+        (state.get("academic_state") or {}).get("report_status")
+    if report_status == "failed_template_validation":
+        return "模板校验失败"
+    if report_status in {"incomplete", "review_required"}:
+        return "报告不完整"
     quality = (state.get("academic_state") or {}).get("quality_status") \
         or (state.get("academic_state") or {}).get("status")
     if quality in ("fail", "failed", "review_required"):
@@ -3423,6 +3593,7 @@ def _render_workspace_overview(job_id, state):
     st.markdown('<h2>概览</h2>'
                 '<div class="tp-section-lead">当前任务与项目进度</div>',
                 unsafe_allow_html=True)
+    _render_runtime_panel(job_id, state)
     action_text = (f"{blockers} 个必须处理问题阻止最终交付。" if blockers
                    else "当前没有交付阻塞，可以准备最终版本。")
     st.markdown('<div class="tp-overview-hero">'
@@ -3476,19 +3647,20 @@ def _render_workspace_overview(job_id, state):
     st.markdown('<div class="tp-section-label">项目进度</div>'
                 '<div class="tp-overview-progress">' + "".join(progress_rows) + '</div>',
                 unsafe_allow_html=True)
-    st.markdown('<div class="tp-section-label">最近活动</div><div class="tp-activity">',
-                unsafe_allow_html=True)
-    activities = _workspace_activity(job_id, state)
-    if activities:
-        st.markdown(f'<div class="tp-activity-date">{escape(activities[0][0])}</div>',
+    if not core.build_job_runtime_view(job_id, state).get("user_events"):
+        st.markdown('<div class="tp-section-label">最近活动</div><div class="tp-activity">',
                     unsafe_allow_html=True)
-        for _, text_value in activities[:3]:
-            st.markdown(f'<div class="tp-activity-row">{escape(text_value)}</div>',
+        activities = _workspace_activity(job_id, state)
+        if activities:
+            st.markdown(f'<div class="tp-activity-date">{escape(activities[0][0])}</div>',
                         unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="tp-activity-row">暂无活动记录</div>',
-                    unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+            for _, text_value in activities[:3]:
+                st.markdown(f'<div class="tp-activity-row">{escape(text_value)}</div>',
+                            unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="tp-activity-row">暂无活动记录</div>',
+                        unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
     _render_workspace_project_details(state)
 
 
@@ -3821,6 +3993,8 @@ _REPORT_CASE_ISSUES = {
     "invalid_selected_case", "non_revision_case_used_as_revision_analysis",
     "synthetic_pipeline_unavailable", "synthetic_only_without_eligible_cases",
     "ineligible_synthetic_case_selected", "synthetic_case_provenance_mismatch",
+    "duplicate_selected_case_presentation",
+    "case_presentation_count_mismatch",
 }
 _REPORT_SECTION_ISSUES = {
     "missing_required_section", "section_too_short", "missing_planned_claim",
@@ -3840,6 +4014,10 @@ _REPORT_TEMPLATE_ISSUES = {
     "template_subsection_order_mismatch", "template_extra_subsection",
     "template_extra_chapter", "template_hash_mismatch", "template_matter_mismatch",
     "template_case_role_missing", "template_case_role_mismatch",
+    "template_case_mapping_mismatch", "template_case_minimum_not_met",
+    "template_front_matter_content_missing", "template_internal_id_visible",
+    "template_unresolved_marker", "template_duplicate_rendering",
+    "template_duplicate_heading",
 }
 
 
@@ -3942,7 +4120,8 @@ def _clean_report_for_display(report_md):
     text = str(report_md or "")
     text = re.sub(r"\\?<!--.*?-->\\?", "", text, flags=re.DOTALL)
     text = re.sub(r"\\?\{\{TERM:[^}]+\}\}\\?", "", text)
-    text = re.sub(r"\b(?:seg|claim|rq|lit-claim|lit-evidence|human-ev)-[A-Za-z0-9_.:-]+\b",
+    text = re.sub(r"\b(?:(?:seg|claim|rq|lit-claim|lit-evidence|human-ev)-"
+                  r"[A-Za-z0-9_.:-]+|(?:AQ|AV|AR|LR)-\d+)\b",
                   "对应证据", text)
     lines = text.splitlines()
     cleaned = []
@@ -3962,7 +4141,7 @@ def _clean_report_for_display(report_md):
         cleaned.append(line.rstrip())
     text = "\n".join(cleaned)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return _report_template.anonymize_sensitive_institutions(text.strip())
 
 
 def _report_issue_category(issue):
@@ -4097,6 +4276,131 @@ def _render_report_issue_summary(job_id, groups):
     st.markdown('</div>', unsafe_allow_html=True)
 
 
+def _report_issues_for_category(category, artifacts):
+    issues = []
+    for artifact_name, field in (("validation", "issues"), ("review", "issues"),
+                                 ("literature_support_review", "issues"),
+                                 ("academic_quality", "findings")):
+        for issue in (artifacts.get(artifact_name) or {}).get(field) or []:
+            if _report_issue_category(issue) == category:
+                issues.append(issue)
+    return issues
+
+
+def _queue_report_repair(job_id, state, category, sections):
+    if category == "模板合规":
+        scope = "writer"
+    elif category == "案例不足":
+        scope = "planning"
+    elif category == "文献证据缺失":
+        scope = "all"
+    elif category in {"引用需要确认", "统计验证失败"}:
+        scope = "validation"
+    elif category == "章节需要重新生成" and sections:
+        for section_id in sections:
+            core.invalidate_academic_report(job_id, "section", section_id)
+        scope = None
+    else:
+        scope = "case_analysis" if category == "需要人工补充" else "writer"
+    if scope:
+        core.invalidate_academic_report(job_id, scope)
+    _resume_job(job_id, core.load_job_state(job_id) or state)
+
+
+def _render_report_issue_detail(job_id, state, groups, artifacts):
+    category = st.session_state.get(f"report_review_focus_{job_id}")
+    group = next((item for item in groups if item["category"] == category), None)
+    if not group:
+        return
+
+    with st.container(border=True):
+        st.markdown(f"### {group['action']}")
+        if category == "案例不足":
+            selected = artifacts.get("selected_cases") or {}
+            cases = selected.get("cases") or []
+            st.caption(
+                f"选择状态：{selected.get('authentic_selection_status') or '未记录'} · "
+                f"当前案例 {len(cases)} 个")
+            if cases:
+                st.dataframe(pd.DataFrame([{
+                    "案例": item.get("case_id") or "—",
+                    "类型": "合成对比" if item.get("case_type") == "synthetic_contrast"
+                    else "真实修订",
+                    "来源段": item.get("segment_id") or item.get("source_segment_id") or "—",
+                } for item in cases]), hide_index=True, width="stretch")
+            else:
+                st.info("当前没有符合报告要求的案例。重新规划会再次扫描现有翻译修订记录。")
+        elif category == "文献证据缺失":
+            sources = (artifacts.get("literature_sources") or {}).get("sources") or []
+            evidence = (artifacts.get("literature_evidence") or {}).get("items") or []
+            claims = (artifacts.get("literature_claims") or {}).get("items") or []
+            st.caption(f"已登记来源 {len(sources)} · 可核验证据 {len(evidence)} · 文献主张 {len(claims)}")
+            for source in sources:
+                st.markdown(f"- {escape(str(source.get('title') or source.get('source_id') or '未命名来源'))}")
+            if not sources:
+                st.info("当前没有已登记的参考资料；请先在新建任务的报告设置中添加文献，再重新生成。")
+        elif category == "需要人工补充":
+            questions = [
+                question for question in
+                (artifacts.get("human_evidence_questions") or {}).get("questions") or []
+                if question.get("status") == "open"
+            ]
+            if not questions:
+                st.success("当前没有尚未回答的人类证据问题，可以继续生成受影响章节。")
+            for question in questions:
+                question_id = question.get("question_id")
+                context = question.get("context") or {}
+                st.markdown(f"**{escape(str(question.get('question') or '请补充项目过程信息'))}**")
+                if context.get("source"):
+                    st.caption(f"原文：{str(context['source'])[:180]}")
+                answer_key = f"report_human_answer_{job_id}_{question_id}"
+                answer = st.text_area(
+                    "你的回答", key=answer_key, height=90,
+                    placeholder="如无法回忆，可填写“不记得/没有相关记录”。")
+                if st.button("提交回答", key=f"report_human_submit_{job_id}_{question_id}"):
+                    if not answer.strip():
+                        st.warning("请填写回答；无法回忆时可直接填写“不记得”。")
+                    else:
+                        core.record_human_evidence(job_id, question_id, answer)
+                        st.session_state.pop(answer_key, None)
+                        st.rerun()
+        elif category == "章节需要重新生成":
+            sections = group.get("sections") or []
+            st.info("将只重新生成问题章节：" + "、".join(f"第 {value} 节" for value in sections))
+        else:
+            issues = _report_issues_for_category(category, artifacts)
+            if not issues:
+                st.info("已定位该复核项；重新执行对应检查后会刷新这里的结果。")
+            for issue in issues:
+                reason = issue.get("reason") or issue.get("message") or \
+                    _report_issue_detail(category, issue)
+                st.markdown(f"- {escape(str(reason))}")
+
+        sections = sorted(group.get("sections") or [], key=str)
+        action_labels = {
+            "模板合规": "按模板重新生成",
+            "案例不足": "重新选择案例并继续生成",
+            "文献证据缺失": "重建文献证据并继续生成",
+            "引用需要确认": "重新验证引用并继续生成",
+            "统计验证失败": "重新验证统计并继续生成",
+            "章节需要重新生成": "重新生成问题章节",
+            "需要人工补充": "用已提交回答继续生成",
+        }
+        open_questions = category == "需要人工补充" and any(
+            question.get("status") == "open" for question in
+            (artifacts.get("human_evidence_questions") or {}).get("questions") or [])
+        disabled = not api_key or open_questions
+        if st.button(action_labels[category], type="primary",
+                     key=f"report_issue_repair_{job_id}_{category}",
+                     disabled=disabled, width="stretch"):
+            _queue_report_repair(job_id, state, category, sections)
+            st.rerun()
+        if not api_key:
+            st.caption("继续生成需要先在“设置”中配置当前模型的 API Key。")
+        elif open_questions:
+            st.caption("请先提交上方所有待回答问题；无法回忆时可以如实说明。")
+
+
 def _render_workspace_report(job_id, state):
     academic = state.get("academic_state") or {}
     quality = academic.get("quality_status") or academic.get("status") or "not_started"
@@ -4124,6 +4428,9 @@ def _render_workspace_report(job_id, state):
     st.markdown('<div class="tp-section-kicker">下游成果</div><h2>报告</h2>'
                 '<div class="tp-section-lead">以报告阅读为中心；复核与技术诊断按需展开。</div>',
                 unsafe_allow_html=True)
+    if not state.get("p3_done") or core.get_job_runtime_status(job_id, state).get(
+            "status") not in {"completed", "idle_incomplete"}:
+        _render_runtime_panel(job_id, state)
     st.markdown('<div class="tp-report-header"><div class="tp-report-toolbar">'
                 '<div class="tp-report-toolbar-copy"><div class="tp-report-toolbar-kicker">'
                 '报告工作区</div><h3>翻译实践报告</h3>'
@@ -4159,11 +4466,14 @@ def _render_workspace_report(job_id, state):
             else:
                 draft_label = "导出通用 DOCX"
             with action_a:
-                st.download_button(
-                    draft_label, docx_data,
-                    file_name=f"{filename}_翻译实践报告_草稿.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key=f"report_docx_{job_id}", width="stretch")
+                if docx_data is None:
+                    st.error("报告生成未通过模板或质量校验，DOCX 导出已阻止。")
+                else:
+                    st.download_button(
+                        draft_label, docx_data,
+                        file_name=f"{filename}_翻译实践报告_草稿.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"report_docx_{job_id}", width="stretch")
             with action_b:
                 st.download_button(
                     "导出 Markdown", state.get("p3_md", "").encode("utf-8"),
@@ -4181,6 +4491,7 @@ def _render_workspace_report(job_id, state):
                     '这不代表最终交付审批。</div>', unsafe_allow_html=True)
         if groups and st.session_state.get(f"report_review_open_{job_id}"):
             _render_report_issue_summary(job_id, groups)
+            _render_report_issue_detail(job_id, state, groups, artifacts)
         if headings:
             outline_links = []
             for item in headings:
@@ -4225,7 +4536,7 @@ def _render_workspace_delivery(job_id, state):
     snapshot = core.delivery_snapshot_status(job_id, state)
     latest = snapshot.get("latest")
     frozen = bool(state.get("glossary_frozen") or state.get("quality_bypass") or not state.get("quality_mode"))
-    report_ready = bool(state.get("p3_done") or not state.get("report_enabled", True))
+    report_ready = _delivery.report_ready(state)
     st.markdown('<div class="tp-section-kicker">工作流最后一步</div><h2>最终交付</h2>'
                 '<div class="tp-section-lead">确认后生成不可变版本；当前工作版本仍可继续修改。</div>',
                 unsafe_allow_html=True)
@@ -4240,7 +4551,8 @@ def _render_workspace_delivery(job_id, state):
         st.warning(f"{len(blockers)} 个必须处理问题仍会阻止最终版本。处理问题，或明确接受剩余风险。")
         accept = st.checkbox("我已检查这些问题，并确认接受剩余风险", key=f"workspace_delivery_accept_{job_id}")
         note = st.text_input("接受风险说明", key=f"workspace_delivery_note_{job_id}", placeholder="说明为什么可以接受…")
-        if st.button("接受风险并冻结最终版本", type="primary", disabled=not accept,
+        if st.button("接受风险并冻结最终版本", type="primary",
+                     disabled=not accept or not report_ready,
                      key=f"workspace_delivery_accept_go_{job_id}", width="stretch"):
             _, ok, errors = core.approve_delivery(job_id, note or "人工确认并接受剩余风险",
                                                    accept_blocking=True, target_lang=target_lang,
@@ -4251,7 +4563,9 @@ def _render_workspace_delivery(job_id, state):
                 st.error(error)
     elif not snapshot.get("current"):
         note = st.text_input("交付说明（可选）", key=f"workspace_delivery_final_note_{job_id}", placeholder="例如：已完成人工审校…")
-        if st.button("确认并冻结最终版本", type="primary", key=f"workspace_delivery_final_{job_id}", width="stretch"):
+        if st.button("确认并冻结最终版本", type="primary",
+                     disabled=not report_ready,
+                     key=f"workspace_delivery_final_{job_id}", width="stretch"):
             _, ok, errors = core.approve_delivery(job_id, note or "人工确认最终交付",
                                                    target_lang=target_lang, provider=ai_provider,
                                                    model=ai_model)
@@ -4285,27 +4599,36 @@ def _render_workspace_delivery(job_id, state):
     if not state.get("p2_done"):
         st.markdown('<div class="tp-empty">翻译完成后，交付文件会显示在这里。</div>', unsafe_allow_html=True)
         return
-    exported = _assets.export_all(state, job_id, target_lang, ai_provider, ai_model,
-                                  source_filename=state.get("filename", ""))
     frozen_assets = core.delivery_snapshot_assets(job_id, latest.get("snapshot_version")) \
         if snapshot.get("current") and latest else {}
-    def asset_bytes(name):
-        return frozen_assets.get(name) or exported.get(name)
-    term_count = len(state.get("glossary") or state.get("auto_terms") or [])
-    assets = [
-        ("双语文本", "bilingual.jsonl", f"translation.jsonl · {len(state.get('pairs') or []):,} segments", "application/x-jsonlines"),
-        ("术语库", "terms.tbx", f"terminology.tbx · {term_count:,} terms", "application/xml"),
-        ("翻译记忆", "memory.tmx", f"translation-memory.tmx · {len(state.get('pairs') or []):,} units", "application/xml"),
-        ("Delivery Manifest", "delivery_manifest.json", "manifest.json · 任务版本与资产清单", "application/json"),
-    ]
-    if state.get("findings"):
-        assets.append(("案例证据包", "segment_evidence.jsonl", "审校证据与段落 provenance", "application/x-jsonlines"))
-    if state.get("p3_md"):
-        report_docx = _report_docx_bytes(state, frozen_assets)
-        assets.append(("实践报告", "stage3_report.docx", "翻译实践报告 · DOCX", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
+    assets = frozen_assets or core.build_delivery_assets(job_id, state)
+    labels = {
+        "translation.docx": "纯译文", "bilingual.docx": "双语对照",
+        "translation.pdf": "PDF 译文", "annotated_bilingual.docx": "重点标注版",
+        "terms.xlsx": "术语表", "terms.tbx": "TBX 术语库",
+        "memory.tmx": "TMX 翻译记忆", "bilingual.jsonl": "JSONL 双语段落",
+        "segment_evidence.jsonl": "翻译过程证据",
+        "selected_cases.json": "案例候选",
+        "academic_workspace.zip": "学术写作工作区",
+        "review_report.md": "审校报告", "report.docx": "实践报告 DOCX",
+        "report.md": "实践报告 Markdown",
+        "delivery_manifest.json": "Delivery Manifest",
+        "stage1_cleaned.docx": "清洗后原文", "auto_terms.xlsx": "自动术语表",
+        "stage2_bilingual.docx": "双语对照", "stage3_report.docx": "实践报告",
+    }
+    mime_by_suffix = {
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".pdf": "application/pdf", ".tbx": "application/xml",
+        ".tmx": "application/xml", ".json": "application/json",
+        ".jsonl": "application/x-jsonlines", ".md": "text/markdown",
+        ".zip": "application/zip",
+    }
     st.markdown('<div class="tp-section-label" style="margin-top:24px">交付文件</div><div class="tp-asset-list">', unsafe_allow_html=True)
-    for index, (label, key, description, mime) in enumerate(assets):
-        data = report_docx if key == "stage3_report.docx" else asset_bytes(key)
+    for index, (key, data) in enumerate(assets.items()):
+        label = labels.get(key, key)
+        mime = mime_by_suffix.get(Path(key).suffix.lower(), "application/octet-stream")
+        description = f"{key} · {_format_size(len(data))}"
         asset_col, action_col = st.columns([3, 1])
         with asset_col:
             st.markdown(f'<div class="tp-asset-row"><div class="tp-asset-copy"><strong>{escape(label)}</strong><span>{escape(description)}</span></div></div>', unsafe_allow_html=True)
@@ -4364,6 +4687,12 @@ def _render_workspace_shell(job_id, state):
     with context_col:
         with st.container(key="workspace_context_col"):
             _render_workspace_context(job_id, state, section)
+
+
+@st.fragment(run_every="3s")
+def _render_live_workspace(job_id):
+    """Poll the durable state without blocking the Streamlit render thread."""
+    _render_workspace_shell(job_id, core.load_job_state(job_id) if job_id else None)
 
 # ================= Product shell / state =================
 providers = sorted(core.PROVIDERS, key=str.casefold)
@@ -4494,6 +4823,52 @@ if template_input:
     research_settings["report_template_contract"] = template_input.get("contract")
 elif st.session_state.get("report_template_removed"):
     research_settings.pop("report_template_contract", None)
+
+
+def _pipeline_kwargs(state=None):
+    """Build the current UI configuration for a new or resumed worker."""
+    state = state if isinstance(state, dict) else {}
+    saved = state.get("pipeline_config") or {}
+    academic_state = state.get("academic_state") or {}
+    persisted = bool(saved or state.get("p1_done") or state.get("p2_done")
+                     or academic_state.get("artifacts"))
+    resume_report = saved.get("enable_report") if saved else \
+        state.get("report_enabled", enable_report) if persisted else enable_report
+    if state and (academic_state.get("artifacts") or academic_state.get(
+            "current_stage") not in {None, "", "not_started"}):
+        resume_report = True
+    resume_annotate = saved.get("enable_annotate") if "enable_annotate" in saved \
+        else state.get("enable_annotate", enable_annotate) if persisted else enable_annotate
+    delivery = state.get("delivery_config") or output_config
+    delivery = core.normalize_delivery_config(
+        delivery, enable_report=resume_report, enable_annotate=resume_annotate)
+    return {
+        "provider": ai_provider,
+        "api_key": api_key,
+        "model": ai_model,
+        "target_lang": saved.get("target_lang") or state.get("target_lang") or target_lang,
+        "auto_term": saved.get("auto_term", auto_term),
+        "enable_report": bool(resume_report),
+        "translation_theory": saved.get("translation_theory") or
+        state.get("theory") or translation_theory,
+        "user_glossary": state.get("glossary") or user_glossary,
+        "style_rules": saved.get("style_rules", style_rules),
+        "enable_review": saved.get("enable_review", enable_review),
+        "enable_annotate": bool(resume_annotate),
+        "use_tm": saved.get("use_tm", use_tm),
+        "strict_terminology_governance": saved.get(
+            "strict_terminology_governance", state.get(
+                "quality_mode", strict_terminology_governance)),
+        "research_settings": state.get("research_settings") or research_settings,
+        "literature_sources": state.get("literature_sources") or literature_sources,
+        "delivery_config": delivery,
+    }
+
+
+def _resume_job(job_id, state):
+    return core.resume_job(
+        job_id, state.get("filename") or "当前任务",
+        _pipeline_kwargs(state), base_url=api_base)
 
 # ================= Main views =================
 setup_placeholder = st.empty()
@@ -5002,17 +5377,29 @@ if app_view == "history":
             with st.container(key=f"history_item_{job['job_id']}"):
                 hc1, hc2 = st.columns([4, 1])
                 filename = escape(str(job["state"].get("filename", "?")))
-                status = escape(core.task_status_label(job["state"]))
+                runtime_view = core.build_job_runtime_view(job["job_id"], job["state"])
+                status = escape(runtime_view["headline_status"])
+                business_status = escape(core.task_status_label(job["state"]))
                 recovery = core.recovery_summary(job["job_id"], job["state"])
                 hc1.markdown(f'<div class="tp-history-copy"><strong>{filename}</strong>'
-                             f'<span>{status}</span></div>', unsafe_allow_html=True)
-                if hc2.button("打开", key=f"open_history_{job['job_id']}", width="stretch"):
+                             f'<span>{status} · 业务阶段：{business_status}</span></div>',
+                             unsafe_allow_html=True)
+                action = "继续处理" if "resume" in runtime_view.get("available_actions", []) \
+                    else "打开"
+                if hc2.button(action, key=f"open_history_{job['job_id']}", width="stretch"):
                     st.session_state.update(active_job_id=job["job_id"], app_view="workspace",
                                             workspace_mode=True)
+                    if action == "继续处理":
+                        _resume_job(job["job_id"], job["state"])
                     st.rerun()
                 st.caption(
                     f"自动保存已开启 · 最近保存进度 {_format_saved_at(recovery['last_saved_at'])} · "
                     f"已完成 {recovery['completed_batch_count']}/{recovery['total_batches']} 个处理批次")
+                if runtime_view.get("current_operation"):
+                    st.caption(f"当前步骤：{runtime_view['current_operation']}")
+                if runtime_view.get("progress"):
+                    completed, total = runtime_view["progress"]
+                    st.caption(f"报告工作流：已完成 {completed} / {total} 个检查点")
                 if recovery.get("current_batch"):
                     current = recovery["current_batch"]
                     st.warning(
@@ -5022,18 +5409,11 @@ if app_view == "history":
                 if recovery.get("recovered_tm_entries"):
                     st.caption(f"已恢复 {recovery['recovered_tm_entries']} 条翻译记忆同步记录。")
                 _render_snapshot_versions(job["job_id"], job["state"], "history")
-                if recovery.get("can_resume") and st.button(
-                        "从断点继续", type="primary", key=f"resume_history_{job['job_id']}",
-                        width="stretch"):
-                    st.session_state.update(
-                        active_job_id=job["job_id"], app_view="workspace",
-                        workspace_mode=True, pending_continue_job=job["job_id"])
-                    st.rerun()
     st.stop()
 if app_view == "new" and not workspace_mode and not run_clicked:
     st.stop()
 
-# ================= 核心处理流（断点续传状态机，实时落盘）=================
+# ================= 核心处理流（后台 worker，UI 轮询 runtime 状态）=================
 pending_job = st.session_state.pop("pending_continue_job", None)
 
 tasks = []
@@ -5045,19 +5425,6 @@ if run_clicked:
         st.error("请先上传待翻译文档，或在「上传与开始」卡片中选择要继续的本地任务。")
     else:
         st.session_state.update(workspace_mode=True, app_view="workspace")
-        setup_placeholder.empty()
-        _page_title("任务工作区", "任务正在运行，进度会自动保存")
-        wp_left, wp_right = st.columns([1, 2.5])
-        with wp_left:
-            st.markdown('<div class="tp-pipeline" style="padding:16px 18px">'
-                        '<div class="tp-section-sub" style="margin-bottom:8px">处理流程</div>'
-                        '<div class="tp-flow" style="display:block;line-height:2.15">'
-                        '<span>文档解析</span><br/><span>段落重建</span><br/>'
-                        '<span>术语抽取</span><br/><span>批次翻译</span><br/>'
-                        '<span>独立审校</span><br/><span>Evidence</span><br/>'
-                        '<span>实践报告</span></div></div>', unsafe_allow_html=True)
-        wp_status = wp_right.empty()
-        wp_status.info("准备工作流…")
         for f in task_inputs:
             file_bytes = f["bytes"]
             job_id = core.file_job_id(file_bytes)
@@ -5082,8 +5449,8 @@ elif pending_job:
         st.session_state.active_job_id = job["job_id"]
 
 if tasks:
-    overall_bar = st.progress(0)
-    for task_idx, task in enumerate(tasks):
+    started_jobs = []
+    for task in tasks:
         job_id, filename, file_bytes = task["job_id"], task["filename"], task["file_bytes"]
         if st.session_state.get("report_template_removed"):
             core.clear_report_template(job_id)
@@ -5101,7 +5468,7 @@ if tasks:
         # when academic writing is explicitly disabled.
         if state["p1_done"] and state["p2_done"] and not enable_report \
                 and (not enable_annotate or state.get("annotations_done")):
-            overall_bar.progress((task_idx + 1) / len(tasks))
+            started_jobs.append(job_id)
             continue
 
         try:
@@ -5119,72 +5486,22 @@ if tasks:
                         core.save_job_state(job_id, job_state)
             if task["file_bytes"] is not None:
                 st.session_state.source_parse_state = "parsing"
-            with st.status(f"正在处理：{filename}", expanded=True) as status:
-                state = core.run_job_pipeline(
-                    job_id, filename, file_bytes,
-                    provider=ai_provider, api_key=api_key, model=ai_model,
-                    target_lang=target_lang, auto_term=auto_term,
-                    enable_report=enable_report, translation_theory=translation_theory,
-                    user_glossary=user_glossary,
-                    style_rules=style_rules, enable_review=enable_review,
-                    enable_annotate=enable_annotate, use_tm=use_tm,
-                    strict_terminology_governance=strict_terminology_governance,
-                    research_settings=research_settings,
-                    literature_sources=literature_sources,
-                    on_status=lambda label: (
-                        status.update(label=label, state="running"),
-                        wp_status.info(label) if run_clicked else None),
-                    on_caption=lambda text: st.caption(text),
-                )
-                st.session_state.doc_states[job_id] = state
-                st.session_state.active_job_id = job_id
-                if state.get("p1_done"):
-                    st.session_state.source_parse_state = "parsed"
-                for warn in state.get("warnings", []):
-                    st.warning(warn)
-                if state["p1_done"] and state["p2_done"] \
-                        and (not enable_report or state["p3_done"]):
-                    academic_quality = (state.get("academic_state") or {}).get(
-                        "quality_status") if enable_report else None
-                    if academic_quality in ("fail", "failed"):
-                        status.update(
-                            label=f"{filename} 翻译完成，但学术报告验证失败（可单独重验/重生成）",
-                            state="error")
-                    elif academic_quality == "review_required":
-                        status.update(
-                            label=f"{filename} 翻译完成，学术报告需要人工复核",
-                            state="complete")
-                    elif academic_quality == "pass_with_warnings":
-                        status.update(
-                            label=f"{filename} 报告已生成并通过验证，但存在证据警告",
-                            state="complete")
-                    elif state.get("has_blocking"):
-                        status.update(
-                            label=f"{filename} 流程完成，但有必须处理问题待确认（见资产面板审查报告）",
-                            state="complete")
-                    else:
-                        status.update(
-                            label=f"{filename} 流程完成（交付状态：draft，"
-                                  f"可在资产面板确认最终交付）",
-                            state="complete")
-                else:
-                    status.update(
-                        label=f"{filename} 进度已保存（当前阶段：{state.get('stage', '?')}），"
-                              f"可在下方继续操作",
-                        state="complete")
-        except Exception as e:
-            if task["file_bytes"] is not None and not state.get("p1_done"):
-                st.session_state.source_parse_state = "error"
-            if "学术写作阶段失败" in str(e):
-                st.error(f"{filename} 翻译已保存，但学术写作失败：{e}。"
-                         "可在下方学术写作工作区重新生成，不需要重跑翻译。")
+            if file_bytes is None:
+                started = core.resume_job(
+                    job_id, filename, _pipeline_kwargs(state), base_url=api_base)
             else:
-                st.error(f"{filename} 翻译流程中断: {e}。进度已保存到本地 outputs/ 目录，"
-                         f"刷新页面后可在「上传与开始」卡片中选择本地任务继续！")
-            st.session_state.doc_states[job_id] = \
-                core.load_job_state(job_id) or st.session_state.doc_states[job_id]
-
-        overall_bar.progress((task_idx + 1) / len(tasks))
+                started = core.start_job_worker(
+                    job_id, filename, file_bytes, _pipeline_kwargs(state), base_url=api_base)
+            if started or core.is_job_worker_alive(job_id):
+                started_jobs.append(job_id)
+                st.session_state.active_job_id = job_id
+        except Exception as exc:  # setup failures remain visible in the UI
+            st.error(f"无法启动 {filename}：{exc}")
+    if started_jobs:
+        st.session_state.update(
+            active_job_id=started_jobs[0], app_view="workspace", workspace_mode=True,
+            workspace_section="overview")
+        st.rerun()
 
 # ================= 术语准备与审核面板（刷新/重启后自动恢复）=================
 saved_jobs_after = core.list_jobs()
@@ -5323,7 +5640,12 @@ if active and not (app_view == "workspace" and st.session_state.get("active_job_
 # academic/context surfaces, but route the product workspace through the
 # compact shell above.
 if app_view == "workspace":
-    _render_workspace_shell(active, core.load_job_state(active) if active else None)
+    live_status = core.get_job_runtime_status(active).get("status") if active else None
+    if live_status in {"resume_requested", "queued", "starting", "running",
+                       "waiting_external", "cancelling"}:
+        _render_live_workspace(active)
+    else:
+        _render_workspace_shell(active, core.load_job_state(active) if active else None)
     st.stop()
 
 # ================= 动态渲染过程资产面板（基于磁盘任务，刷新后仍可用）=================

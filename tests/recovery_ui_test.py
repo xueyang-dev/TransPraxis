@@ -66,7 +66,9 @@ def test_recovery_ui():
         assert not at.exception, f"历史任务渲染异常：{at.exception}"
         assert any("处理中断" in m.value for m in at.markdown)
         assert any("自动保存已开启" in c.value for c in at.caption)
-        assert any(b.label == "从断点继续" for b in at.button)
+        resume_buttons = [b for b in at.button if b.label == "继续处理"]
+        assert len(resume_buttons) == 1
+        assert not any(b.label == "从断点继续" for b in at.button)
         assert any("0/2 段" in w.value for w in at.warning)
 
         def fake_pipeline(job_id, filename, file_bytes, **kwargs):
@@ -77,14 +79,15 @@ def test_recovery_ui():
             return resumed
 
         core.run_job_pipeline = fake_pipeline
-        next(b for b in at.button if b.label == "从断点继续").click()
+        resume_buttons[0].click()
         at.run()
         assert not at.exception, f"从断点继续后异常：{at.exception}"
         assert at.session_state["active_job_id"] == job_id
         at.run()
         assert not at.exception, f"恢复后的当前任务面板异常：{at.exception}"
         assert any("<h2>概览</h2>" in s.value for s in at.markdown)
-        assert any("最近活动" in s.value for s in at.markdown)
+        assert any("最近活动" in s.value for s in at.markdown) or \
+            any("最近活动" in s.value for s in at.caption)
         print("  ✓ Recovery UI：History 状态、断点继续与 workspace 恢复可见")
     finally:
         core.run_job_pipeline = original_pipeline

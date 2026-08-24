@@ -57,6 +57,8 @@ def _default_new_fields() -> Dict[str, Any]:
         "delivery_snapshots": [],
         "latest_delivery_snapshot_version": None,
         "exported_assets": [],
+        "pipeline_config": {},
+        "delivery_config": {},
         "quality_mode": False,
         "quality_bypass": False,
         "delivery_notes": "",

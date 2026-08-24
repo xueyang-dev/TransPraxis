@@ -186,6 +186,151 @@ def test_blocking_requires_explicit_risk_acceptance_and_snapshot_records_it():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_incomplete_requested_report_blocks_backend_and_workspace_delivery():
+    from streamlit.testing.v1 import AppTest
+
+    tmp = Path(tempfile.mkdtemp(prefix="delivery-report-gate-"))
+    old_dir = core.OUTPUT_DIR
+    core.OUTPUT_DIR = tmp
+    try:
+        job_id = "snapshotreportgate"
+        state = _job(job_id)
+        state.update(report_enabled=True, p3_done=True, p3_md="# 未完成报告",
+                     report_status="incomplete")
+        core.save_job_state(job_id, state)
+        _, ok, errors = core.approve_delivery(job_id, note="不应成功")
+        assert not ok and any("实践报告" in error for error in errors)
+        assert core.list_delivery_snapshots(job_id) == []
+
+        at = AppTest.from_file(
+            str(Path(__file__).resolve().parent.parent / "app.py"),
+            default_timeout=30)
+        at.run()
+        at.session_state["active_job_id"] = job_id
+        at.session_state["app_view"] = "workspace"
+        at.session_state["workspace_mode"] = True
+        at.session_state["workspace_section"] = "delivery"
+        at.run()
+        button = next(item for item in at.button
+                      if item.label == "确认并冻结最终版本")
+        assert button.disabled
+        assert core.load_job_state(job_id)["delivery_status"] != "final"
+    finally:
+        core.OUTPUT_DIR = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_configured_delivery_builds_every_selected_format_and_nothing_else():
+    tmp = Path(tempfile.mkdtemp(prefix="delivery-configured-assets-"))
+    old_dir = core.OUTPUT_DIR
+    core.OUTPUT_DIR = tmp
+    try:
+        job_id = "snapshotconfigured"
+        state = _job(job_id)
+        state["glossary"] = [{
+            "source": "Source", "target": "来源", "preferred": "来源",
+            "status": "locked", "scope": "document",
+        }]
+        config = {key: True for key in core.DELIVERY_CONFIG_DEFAULTS}
+        state.update(
+            report_enabled=True, p3_done=True, report_status="generated",
+            p3_md="# 翻译实践报告\n\n报告正文。",
+            enable_annotate=True,
+            annotations={0: [{"type": "domain", "src_span": [0, 6],
+                              "tgt_span": [0, 2], "note": "术语"}]},
+            annotations_done=True,
+            delivery_config=core.normalize_delivery_config(
+                config, enable_report=True, enable_annotate=True),
+        )
+        artifacts = {
+            "research-model.json": {"schema_version": "test"},
+            "argument-plan.json": {"schema_version": "test"},
+            "selected-cases.json": {"cases": [{"case_id": "case-1"}]},
+            "academic-outline.json": {"sections": []},
+            "case-analysis-plans.json": {"plans": []},
+            "human-evidence-questions.json": {"questions": []},
+        }
+        for filename, payload in artifacts.items():
+            (core.job_dir(job_id) / filename).write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        core.save_job_state(job_id, state)
+
+        approved, ok, errors = core.approve_delivery(job_id, note="全格式")
+        assert ok, errors
+        assets = core.delivery_snapshot_assets(job_id, 1)
+        expected = {
+            "translation.docx", "bilingual.docx", "translation.pdf",
+            "annotated_bilingual.docx", "terms.xlsx", "terms.tbx",
+            "memory.tmx", "bilingual.jsonl", "segment_evidence.jsonl",
+            "selected_cases.json", "academic_workspace.zip",
+            "review_report.md", "report.docx", "report.md",
+            "delivery_manifest.json",
+        }
+        assert set(assets) == expected
+        assert approved["delivery_status"] == "final"
+        assert assets["translation.pdf"].startswith(b"%PDF")
+        with core.fitz.open(stream=assets["translation.pdf"], filetype="pdf") as pdf:
+            assert pdf.page_count >= 1
+            assert "译文" in "".join(page.get_text() for page in pdf)
+        with ZipFile(BytesIO(assets["translation.docx"])) as docx:
+            assert "word/document.xml" in docx.namelist()
+        with ZipFile(BytesIO(assets["terms.xlsx"])) as workbook:
+            assert "xl/workbook.xml" in workbook.namelist()
+        with ZipFile(BytesIO(assets["academic_workspace.zip"])) as workspace:
+            assert set(workspace.namelist()) == set(artifacts)
+        manifest = json.loads(assets["delivery_manifest.json"])
+        assert set(manifest["generated_assets"]) == expected
+
+        minimal = core.load_job_state(job_id)
+        minimal["delivery_status"] = "draft"
+        minimal["delivery_approved_by_human"] = False
+        minimal["delivery_approval"] = None
+        minimal["delivery_config"] = {
+            key: key == "deliver_jsonl" for key in core.DELIVERY_CONFIG_DEFAULTS
+        }
+        minimal["report_enabled"] = False
+        minimal["enable_annotate"] = False
+        core.save_job_state(job_id, minimal)
+        working = core.build_delivery_assets(job_id, minimal)
+        assert set(working) == {"bilingual.jsonl", "delivery_manifest.json"}
+    finally:
+        core.OUTPUT_DIR = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_workspace_delivery_lists_exact_configured_assets():
+    from streamlit.testing.v1 import AppTest
+
+    tmp = Path(tempfile.mkdtemp(prefix="delivery-configured-ui-"))
+    old_dir = core.OUTPUT_DIR
+    core.OUTPUT_DIR = tmp
+    try:
+        job_id = "snapshotconfiguredui"
+        state = _job(job_id)
+        state["delivery_config"] = {
+            key: key == "deliver_jsonl" for key in core.DELIVERY_CONFIG_DEFAULTS
+        }
+        core.save_job_state(job_id, state)
+        at = AppTest.from_file(
+            str(Path(__file__).resolve().parent.parent / "app.py"),
+            default_timeout=30)
+        at.run()
+        at.session_state["active_job_id"] = job_id
+        at.session_state["app_view"] = "workspace"
+        at.session_state["workspace_mode"] = True
+        at.session_state["workspace_section"] = "delivery"
+        at.run()
+        assert not at.exception, at.exception
+        assert [button.label for button in at.download_button] == [
+            "下载", "下载 manifest"]
+        assert any("JSONL 双语段落" in item.value for item in at.markdown)
+        assert any("delivery_manifest.json" in item.value for item in at.markdown)
+        assert not any("TBX 术语库" in item.value for item in at.markdown)
+    finally:
+        core.OUTPUT_DIR = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_snapshot_storage_is_local_output_data_not_package_input():
     root = Path(__file__).resolve().parent.parent
     assert "outputs/" in (root / ".gitignore").read_text(encoding="utf-8")

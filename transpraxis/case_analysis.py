@@ -240,6 +240,40 @@ def synthetic_evidence_adequacy(case: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def translation_decision_evidence_adequacy(
+    case: Dict[str, Any], segment: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Capabilities of an unchanged, evidence-rich translation decision."""
+    base = evidence_adequacy(segment)
+    has_evidence = bool(
+        segment.get("source") and segment.get("final_target")
+        and ((segment.get("process_evidence") or {}).get("findings")
+             or (segment.get("process_evidence") or {}).get(
+                 "injected_glossary_entry_ids")
+             or (case.get("features") or {}).get("clause_markers", 0) >= 2)
+    )
+    return {
+        **base,
+        "case_id": case.get("case_id"),
+        "case_type": "translation_decision",
+        "case_role": "translation_decision_case",
+        "evidence_level": "translation_decision_evidence" if has_evidence
+        else "source_final_only",
+        "can_support": [
+            "textual_analysis", "translation_decision", "terminology_analysis",
+            "syntax_or_rhetoric_analysis", "bounded_quality_confirmation",
+        ] if has_evidence else ["textual_analysis"],
+        "cannot_support": sorted(set(base.get("cannot_support") or []) | {
+            "historical_revision_reasoning", "initial_failure_reasoning",
+            "author_initial_translation_claim",
+        }),
+        "capabilities": {
+            **base.get("capabilities", {}),
+            "has_translation_decision_evidence": has_evidence,
+        },
+    }
+
+
 def detect_revision_claims(text: str) -> List[Dict[str, Any]]:
     """Return deterministic revision-prose claims and any quoted X→Y pair."""
     claims = []
@@ -301,10 +335,13 @@ def _scoped_planner_input(
     cases = []
     for case in selected_cases.get("cases", []):
         case_id = str(case.get("case_id") or "")
-        synthetic = case.get("case_type") == "synthetic_contrast"
-        segment = segs.get(case_id) or {}
-        adequacy = synthetic_evidence_adequacy(case) if synthetic \
-            else evidence_adequacy(segment)
+        case_type = case.get("case_type") or "authentic_revision"
+        synthetic = case_type == "synthetic_contrast"
+        source_segment_id = str(case.get("source_segment_id") or case_id)
+        segment = segs.get(source_segment_id) or {}
+        adequacy = synthetic_evidence_adequacy(case) if synthetic else (
+            translation_decision_evidence_adequacy(case, segment)
+            if case_type == "translation_decision" else evidence_adequacy(segment))
         if synthetic:
             cases.append({
                 "case_id": case_id,
@@ -333,7 +370,8 @@ def _scoped_planner_input(
             continue
         cases.append({
             "case_id": case_id,
-            "case_type": "authentic_revision",
+            "case_type": case_type,
+            "source_segment_id": source_segment_id,
             "coverage_zone": case.get("coverage_zone"),
             "supports_claims": case.get("supports_claims", []),
             "claim_statements": [
@@ -377,6 +415,9 @@ def build_case_analysis_plans(
         str(x.get("case_id")): (
             synthetic_evidence_adequacy(x)
             if x.get("case_type") == "synthetic_contrast"
+            else translation_decision_evidence_adequacy(
+                x, segs.get(str(x.get("source_segment_id") or "")) or {})
+            if x.get("case_type") == "translation_decision"
             else evidence_adequacy(segs.get(str(x.get("case_id"))) or {}))
         for x in selected_cases.get("cases", [])}
     selected_by_id = {str(x.get("case_id")): x
@@ -392,7 +433,9 @@ def build_case_analysis_plans(
     system = (
         "你是保守的 MTI 案例分析规划器。为每个案例制定分析计划；只使用输入中的"
         "项目证据与文献主张，不编造译者意图、草稿、过程历史或理论。区分："
-        "authentic_revision 是真实历史初译→修订→终译；synthetic_contrast 是"
+        "authentic_revision 是真实历史初译→修订→终译；translation_decision 是"
+        "初译与终译一致但具有真实术语、句法、修辞或 QA 证据的决策案例，不得写成"
+        "错误修订；synthetic_contrast 是"
         "为分析生成且已验证的模拟初译→错误诊断→AI 优化，绝非作者历史。"
         "evidence_level 决定案例能支持什么。对每个案例给出 problem（必须是具体"
         "翻译问题；证据不足时 grounded=false 并说明需要什么人工证据）、"
@@ -464,11 +507,15 @@ def build_case_analysis_plans(
         if grounded and not (
                 adequacy.get("capabilities", {}).get("has_meaningful_revision")
                 or adequacy.get("capabilities", {}).get(
+                    "has_translation_decision_evidence")
+                or adequacy.get("capabilities", {}).get(
                     "has_validated_synthetic_contrast")):
             grounded = False
         initial_failure = item.get("initial_failure")
         if case_type == "synthetic_contrast" and isinstance(initial_failure, dict):
             initial_failure = {**initial_failure, "simulated": True}
+        elif case_type == "translation_decision":
+            initial_failure = None
         elif isinstance(initial_failure, dict) and cannot & {
                 "historical_revision_reasoning", "initial_failure_reasoning"}:
             initial_failure = None
@@ -480,7 +527,7 @@ def build_case_analysis_plans(
             if label not in ALTERNATIVE_LABELS:
                 label = "counterfactual_rendering"
             if label == "historical_alternative" and (
-                    case_type == "synthetic_contrast" or cannot & {
+                    case_type in {"synthetic_contrast", "translation_decision"} or cannot & {
                         "historical_revision_reasoning"}):
                 label = "analytical_comparison"
             alternatives.append({"label": label,
@@ -632,6 +679,24 @@ def render_analysis_contract(plan: Dict[str, Any]) -> str:
                 f"→ 目标需求「{mapping.get('target_requirement')}」→ 关系「{mapping.get('relation')}」")
         for item in plan.get("recommended_human_evidence") or []:
             lines.append(f"- 可选人工判断：{item}")
+        return "\n".join(lines)
+    if plan.get("case_type") == "translation_decision":
+        lines = [
+            f"案例 {plan.get('case_id')}（translation_decision；初译与终译一致）",
+            "- 推理链：真实翻译难点 → 已保存译文决策 → 术语/句法/修辞或 QA 证据 → "
+            "决策理由 → 具体效果 → 有界结论",
+            "- 标签：使用 SOURCE / TARGET；不得声称发生过初译错误或历史修订。",
+            f"- 问题：{plan.get('problem', {}).get('statement') or '（未计划，需如实说明）'}",
+        ]
+        if plan.get("decision_rationale"):
+            lines.append(f"- 决策理由：{plan['decision_rationale']}")
+        effect = plan.get("translation_effect")
+        if effect:
+            lines.append(
+                f"- 效果维度：{effect.get('dimension')}（依据：{effect.get('demonstrated_by')}）")
+        if plan.get("bounded_conclusion"):
+            lines.append(f"- 有界结论：{plan['bounded_conclusion']}")
+        lines.append("- 证据边界：译文未发生变化，只能分析可观察的翻译决策，不能重构历史改译过程。")
         return "\n".join(lines)
     lines = [
         f"案例 {plan.get('case_id')}（{plan.get('case_role')}；"

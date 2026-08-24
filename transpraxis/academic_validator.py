@@ -12,12 +12,13 @@ from .academic_evidence import (
 )
 from . import case_analysis, literature_evidence, report_template, synthetic_cases, thesis_constraints
 
-SCHEMA_VERSION = "academic-validation-v2"
-VALIDATOR_VERSION = "validator-v9"
+SCHEMA_VERSION = "academic-validation-v4"
+VALIDATOR_VERSION = "validator-v11"
 
 _SEGMENT_REF = re.compile(r"\[(seg-[A-Za-z0-9_-]+-\d{4,})\]")
 _QUOTE = re.compile(
-    r"^\s*>\s*\[(SOURCE|INITIAL|TARGET)\s+(seg-[A-Za-z0-9_-]+-\d{4,})\]:\s*(.*)$",
+    r"^\s*>\s*\[(SOURCE|INITIAL|TARGET)\s+"
+    r"((?:seg-[A-Za-z0-9_-]+-\d{4,})|(?:TD-\d{4,}))\]:\s*(.*)$",
     re.MULTILINE,
 )
 _SYNTHETIC_QUOTE = re.compile(
@@ -51,6 +52,13 @@ _HUMAN_EV = re.compile(r"<!--human-ev:([A-Za-z0-9_.:-]+)-->")
 _CASE_COUNT_POLICY = re.compile(
     r"<!--case-count-policy:(sufficient_revision_cases|two_case_fallback|"
     r"insufficient_revision_cases)-->")
+_CASE_MARKER = re.compile(r"<!--case:([A-Za-z0-9_.:-]+)-->")
+_VISIBLE_CASE_EXAMPLE = re.compile(
+    r"^[ \t]*(?:[-*][ \t]*)?\*{1,2}例\[\d+\][^\n]*?\*{0,2}[ \t]*$",
+    re.MULTILINE)
+_DECISION_AS_REVISION = re.compile(
+    r"(?:笔者|译者|作者)?(?:的)?初译|修改后|修订后|改译为|"
+    r"(?:经|经过)(?:审校|修改|修订).{0,24}(?:改为|修改为|修订为)")
 _THREE_CORE_CASES = re.compile(
     r"(?<!第)(?:三个|3\s*个|三则|three)\s*"
     r"(?:真实|核心|修订|translation\s+revision\s+)*案例",
@@ -130,6 +138,9 @@ _CASE_VALIDATION_ISSUE_TYPES = frozenset({
     "unknown_synthetic_case", "wrong_synthetic_case_quote",
     "synthetic_case_presented_as_historical", "ineligible_synthetic_case_selected",
     "synthetic_case_provenance_mismatch", "described_revision_not_in_stored_delta",
+    "duplicate_selected_case_presentation", "case_presentation_count_mismatch",
+    "unbound_visible_case_example", "orphan_case_marker",
+    "translation_decision_presented_as_revision",
 })
 
 
@@ -258,7 +269,36 @@ def expand_evidence_tokens(
 
     text = re.sub(r"\{\{STAT:([A-Za-z0-9_.-]+)\}\}", stat_repl, text)
     text = re.sub(r"\{\{TERM:([A-Za-z0-9_.:-]+)\}\}", term_repl, text)
-    return re.sub(r"\[@([A-Za-z0-9_.:-]+)\]", cite_repl, text)
+    text = re.sub(r"\[@([A-Za-z0-9_.:-]+)\]", cite_repl, text)
+
+    def collapse(marker_type: str, key: str, value: Any) -> None:
+        nonlocal text
+        visible = _value_text(value)
+        if not visible:
+            return
+        escaped = re.escape(visible)
+        marker = f"<!--{marker_type}:{key}-->"
+        marker_re = re.escape(marker)
+        previous = None
+        while previous != text:
+            previous = text
+            text = re.sub(
+                rf"(?:{escaped}){{2,}}{marker_re}", f"{visible}{marker}", text)
+            text = re.sub(
+                rf"{escaped}\s*[（(]\s*{escaped}{marker_re}\s*[）)]",
+                f"{visible}{marker}", text)
+            text = re.sub(
+                rf"([‘’“”\"']{escaped}[‘’“”\"'])\s*[（(]\s*"
+                rf"{escaped}{marker_re}\s*[）)]", rf"\1{marker}", text)
+
+    for key, value in stats.items():
+        if value is not None:
+            collapse("stat", str(key), value)
+    for key, entry in glossary.items():
+        value = entry.get("preferred") or entry.get("target") or entry.get("source")
+        if value:
+            collapse("term", str(key), value)
+    return text
 
 
 def case_statistic_overrides(
@@ -305,7 +345,13 @@ def _section_map(report_md: str, outline: Dict[str, Any]) -> Dict[str, str]:
 
 def _visible_prose(text: str) -> str:
     """Remove evidence quotations and hidden markers before language checks."""
-    lines = [line for line in text.splitlines() if not line.lstrip().startswith(">")]
+    quote_label = re.compile(
+        r"^(?:[-*]\s+)?(?:\*{1,2})?(?:SOURCE|INITIAL|TARGET|原文|"
+        r"源语(?:（SOURCE）|\s*\(SOURCE\))?|初译|改译|译文)"
+        r"(?:\*{1,2})?\s*[：:]", re.IGNORECASE)
+    lines = [line for line in text.splitlines()
+             if not line.lstrip().startswith(">")
+             and not quote_label.match(line.strip())]
     return re.sub(r"<!--.*?-->", "", "\n".join(lines), flags=re.DOTALL)
 
 
@@ -349,6 +395,17 @@ def _template_heading_key(value: Any) -> str:
     return re.sub(r"[\s:：.。、()（）\[\]【】_\-]+", "", value)
 
 
+def _template_title_matches(actual: Any, expected: Any) -> bool:
+    actual_key = _template_heading_key(actual)
+    expected_key = _template_heading_key(expected)
+    if actual_key == expected_key:
+        return True
+    if "xxx" not in expected_key and "×××" not in expected_key:
+        return False
+    pattern = re.escape(expected_key).replace("xxx", ".+").replace("×××", ".+")
+    return bool(re.fullmatch(pattern, actual_key))
+
+
 def _template_structure_records(contract: Mapping[str, Any]) -> tuple[list, list]:
     structure = contract.get("document_structure") or {}
     chapters = list(structure.get("chapters") or [])
@@ -360,6 +417,8 @@ def _template_structure_records(contract: Mapping[str, Any]) -> tuple[list, list
             "title": str(chapter.get("title") or ""),
             "role": str(chapter.get("role") or "generic_section"),
             "level": 2,
+            "allows_dynamic_subsections": bool(
+                chapter.get("allows_dynamic_subsections", False)),
             "required_subsections": [
                 dict(item) for item in chapter.get("required_subsections") or []
                 if isinstance(item, Mapping)
@@ -408,8 +467,7 @@ def validate_template_compliance(
                     f"模板章节顺序错误：第 {index + 1} 个应为 {item['section_id']}。",
                     section_id=item["section_id"],
                     suggested_action="按 Template Contract 恢复章节顺序。"))
-            if _template_heading_key(actual.get("title")) != \
-                    _template_heading_key(item["title"]):
+            if not _template_title_matches(actual.get("title"), item["title"]):
                 issues.append(_issue(
                     "template_chapter_title_mismatch",
                     f"章节 {item['section_id']} 标题应为“{item['title']}”。",
@@ -419,9 +477,8 @@ def validate_template_compliance(
         if index >= len(chapters):
             continue
         actual = chapters[index]
-        if str(actual.get("heading_id")) == item["section_id"] and \
-                _template_heading_key(actual.get("title")) != \
-                _template_heading_key(item["title"]):
+        if str(actual.get("heading_id")) == item["section_id"] and not \
+                _template_title_matches(actual.get("title"), item["title"]):
             issues.append(_issue(
                 "template_chapter_title_mismatch",
                 f"章节 {item['section_id']} 标题应为“{item['title']}”。",
@@ -468,16 +525,39 @@ def validate_template_compliance(
                 section_id=item["section_id"],
                 suggested_action="按模板规定的小节顺序组织正文。"))
         for record in body_records:
+            dynamic_prefixes = [str(x.get("heading_id") or "") + "."
+                                for x in item.get("required_subsections") or []
+                                if x.get("allows_dynamic_children")]
+            chapter_dynamic = item.get("allows_dynamic_subsections") and str(
+                record.get("heading_id") or "").startswith(
+                    str(item.get("section_id") or "") + ".")
             if record.get("level") > 2 and not any(
                     str(x.get("heading_id")) == str(record.get("heading_id")) and
                     _template_heading_key(x.get("title")) ==
                     _template_heading_key(record.get("title"))
-                    for x in item.get("required_subsections") or []):
+                    for x in item.get("required_subsections") or []) and not any(
+                        str(record.get("heading_id") or "").startswith(prefix)
+                        for prefix in dynamic_prefixes) and not chapter_dynamic:
                 issues.append(_issue(
                     "template_extra_subsection",
                     f"章节 {item['section_id']} 出现未在模板中定义的小节“{record.get('payload')}”。",
                     severity="warning", section_id=item["section_id"],
                     suggested_action="确认该小节确实属于模板；否则删除模型新增的小节。"))
+        problem_ids = {
+            str(record.get("heading_id"))[len("3.2."):]
+            for record in body_records
+            if str(record.get("heading_id") or "").startswith("3.2.")}
+        solution_ids = {
+            str(record.get("heading_id"))[len("3.3."):]
+            for record in body_records
+            if str(record.get("heading_id") or "").startswith("3.3.")}
+        if item.get("role") == "case_analysis" and (problem_ids or solution_ids) \
+                and problem_ids != solution_ids:
+            issues.append(_issue(
+                "template_case_mapping_mismatch",
+                "翻译难点与翻译策略的三级标题没有形成一一对应关系。",
+                section_id=item["section_id"],
+                suggested_action="使 3.2.x 与 3.3.x 使用相同的 x 编号并逐项映射。"))
     if len(chapters) > len(expected):
         for actual in chapters[len(expected):]:
             issues.append(_issue(
@@ -508,6 +588,68 @@ def validate_template_compliance(
                     "template_matter_mismatch",
                     f"模板{('前置' if matter_key == 'front_matter' else '后置')}部分未完整保留。",
                     suggested_action="由模板渲染器保留固定前后置内容，不要由模型重建。"))
+        front_items = {str(x.get("role")): x for x in
+                       (report_artifact or {}).get("front_matter") or []}
+        for role in ("abstract_zh", "abstract_en"):
+            if role in {str(x.get("role")) for x in structure.get("front_matter") or []} \
+                    and not str((front_items.get(role) or {}).get("content") or "").strip():
+                issues.append(_issue(
+                    "template_front_matter_content_missing",
+                    f"模板要求的 {role} 尚未生成正文。",
+                    suggested_action="只重新生成缺失的摘要前置页。"))
+        for role in ("keywords_zh", "keywords_en"):
+            if role in {str(x.get("role")) for x in structure.get("front_matter") or []} \
+                    and not (front_items.get(role) or {}).get("keywords"):
+                issues.append(_issue(
+                    "template_front_matter_content_missing",
+                    f"模板要求的 {role} 尚未生成。",
+                    suggested_action="从已生成摘要与项目主题补齐关键词。"))
+        actual_back = list((report_artifact or {}).get("back_matter") or [])
+        for required in structure.get("back_matter") or []:
+            match = next((item for item in actual_back
+                          if str(item.get("role")) == str(required.get("role"))
+                          and _template_heading_key(item.get("title")) ==
+                          _template_heading_key(required.get("title"))), None)
+            if match is not None and not str(match.get("content") or "").strip():
+                issues.append(_issue(
+                    "template_back_matter_content_missing",
+                    f"模板后置部分“{required.get('title')}”没有内容或占位说明。",
+                    suggested_action="仅补齐该后置部分；信息缺失时保留需要用户补充。"))
+
+    minimum_cases = int((structure.get("case_requirement") or {}).get(
+        "minimum_cases") or 0)
+    actual_case_count = len((selected_cases or {}).get("cases") or [])
+    if minimum_cases and actual_case_count < minimum_cases:
+        issues.append(_issue(
+            "template_case_minimum_not_met",
+            f"模板至少要求 {minimum_cases} 个例证，当前只有 {actual_case_count} 个。",
+            suggested_action="仅重建案例选择与第三章；证据仍不足时保持报告 incomplete。"))
+
+    public_md = report_template.public_report_markdown(
+        report_md, (report_artifact or {}).get("case_labels") or {})
+    if re.search(r"\b(?:seg-[A-Za-z0-9_.:-]+|finding-[A-Za-z0-9_.:-]+|"
+                 r"term-[A-Za-z0-9_.:-]+|claim-[A-Za-z0-9_.:-]+)\b", public_md,
+                 re.IGNORECASE):
+        issues.append(_issue(
+            "template_internal_id_visible", "用户可见报告仍包含内部 evidence ID。",
+            suggested_action="保留 hidden provenance marker，并在 preview/DOCX 映射为例[n]。"))
+    if re.search(r"\{\{(?:STAT|TERM):[^}]+\}\}", public_md):
+        issues.append(_issue(
+            "template_unresolved_marker", "用户可见报告仍包含未解析 token。",
+            suggested_action="只重建包含未解析 token 的章节。"))
+    if re.search(r"基于\s*基于|行星性\s*行星性|全球主义\s*全球主义|"
+                 r"\b(84|42|0)[（(]?\s*\1", public_md):
+        issues.append(_issue(
+            "template_duplicate_rendering", "用户可见报告包含重复词或重复统计值。",
+            suggested_action="修复 marker expansion 后只重建受影响章节。"))
+    public_records = _template_heading_records(public_md)
+    for previous, current in zip(public_records, public_records[1:]):
+        if previous["level"] == current["level"] and _template_heading_key(
+                previous["title"]) == _template_heading_key(current["title"]):
+            issues.append(_issue(
+                "template_duplicate_heading", f"标题“{current['payload']}”重复出现。",
+                suggested_action="由 assembler 保留唯一 canonical heading。"))
+            break
 
     case_sections = [x for x in (outline.get("sections") or [])
                      if x.get("cases")]
@@ -579,6 +721,23 @@ def validate_academic_report(
     stats = _statistics(evidence)
     sections = _section_map(report_md, outline)
     canonical_synthetic = synthetic_cases.case_index(synthetic_artifact or {})
+
+    tm_found, tm_reuse = resolve_statistic(stats, "tm_reuse_count")
+    if tm_found and tm_reuse == 0:
+        strong_tm_inference = re.compile(
+            r"(?:机器翻译|大语言模型|\bLLM\b|\bMT\b).{0,50}"
+            r"(?:未使用|没有使用|未启用|未发挥|完全依赖人工|全程人工)|"
+            r"(?:完全依赖人工|全程人工).{0,50}(?:翻译|机器|模型)",
+            re.IGNORECASE)
+        for section_id, body in sections.items():
+            if strong_tm_inference.search(_visible_prose(body)):
+                issues.append(_issue(
+                    "unsupported_claim_strength",
+                    "TM 复用记录为 0 只能说明当前项目未观察到 TM 复用记录，"
+                    "不能证明机器翻译或 LLM 未使用，也不能证明全程依赖人工。",
+                    section_id=section_id,
+                    suggested_action="区分 Translation Memory、Machine Translation 与 LLM，"
+                                     "将结论降为‘未观察到 TM 复用记录’。"))
 
     if not report_md.strip():
         issues.append(_issue("empty_report", "报告内容为空。"))
@@ -831,7 +990,11 @@ def validate_academic_report(
                 evidence_id=seg_id,
                 suggested_action="删除该引用，或先在案例选择与提纲中纳入该案例。"))
 
-    for kind, seg_id, quote in _QUOTE.findall(report_md):
+    selected_by_id = {str(x.get("case_id")): x
+                      for x in selected_cases.get("cases", [])}
+    for kind, case_id, quote in _QUOTE.findall(report_md):
+        selected_case = selected_by_id.get(case_id) or {}
+        seg_id = str(selected_case.get("source_segment_id") or case_id)
         if seg_id not in segs:
             continue
         expected_key = {"SOURCE": "source", "INITIAL": "initial_target",
@@ -842,13 +1005,16 @@ def validate_academic_report(
                 "wrong_initial_translation" if kind == "INITIAL"
                 else "wrong_final_translation" if kind == "TARGET"
                 else "wrong_segment_quote",
-                f"{kind} 引文与 {seg_id} 的保存文本不一致。",
-                evidence_id=seg_id,
+                f"{kind} 引文与所选案例的保存文本不一致。",
+                evidence_id=case_id,
                 suggested_action="逐字使用学术证据库中的原文或终译。"))
 
     selected_synthetic = {
         str(x.get("case_id")): x for x in selected_cases.get("cases", [])
         if x.get("case_type") == "synthetic_contrast"}
+    selected_decisions = {
+        str(x.get("case_id")): x for x in selected_cases.get("cases", [])
+        if x.get("case_type") == "translation_decision"}
     synthetic_quotes = _SYNTHETIC_QUOTE.findall(report_md)
     for kind, case_id, quote in synthetic_quotes:
         case = canonical_synthetic.get(case_id) or selected_synthetic.get(case_id)
@@ -1072,7 +1238,8 @@ def validate_academic_report(
                     section_id=section_id, claim_id=claim_id,
                     suggested_action="围绕该 claim 与其证据补写或调整提纲。"))
         for case_id in plan_section.get("cases") or []:
-            if case_id not in segs and case_id not in selected_synthetic:
+            if case_id not in segs and case_id not in selected_synthetic \
+                    and case_id not in selected_decisions:
                 issues.append(_issue(
                     "outline_unknown_case", f"章节 {section_id} 引用未知案例 {case_id}。",
                     section_id=section_id, evidence_id=case_id))
@@ -1156,8 +1323,96 @@ def validate_academic_report(
 
     selected_ids = {str(x.get("case_id")) for x in selected_cases.get("cases", [])}
     authentic_ids = {str(x.get("case_id")) for x in selected_cases.get("cases", [])
-                      if x.get("case_type") != "synthetic_contrast"}
-    synthetic_ids = selected_ids - authentic_ids
+                     if x.get("case_type") in {None, "", "authentic_revision"}}
+    decision_ids = {str(x.get("case_id")) for x in selected_cases.get("cases", [])
+                    if x.get("case_type") == "translation_decision"}
+    synthetic_ids = {str(x.get("case_id")) for x in selected_cases.get("cases", [])
+                     if x.get("case_type") == "synthetic_contrast"}
+    case_section_id = next((str(item.get("section_id"))
+                            for item in outline.get("sections") or []
+                            if item.get("role") == "case_analysis"), None)
+    case_markers = _CASE_MARKER.findall(report_md)
+    structured_nodes = list((report_artifact or {}).get("case_nodes") or [])
+    has_structured_case_graph = report_artifact is not None \
+        and "case_nodes" in (report_artifact or {})
+    if has_structured_case_graph:
+        structured_ids = [str(node.get("case_id") or "") for node in structured_nodes
+                          if node.get("type") == "case_example"]
+        case_presentations = [
+            str(node.get("case_id")) for node in structured_nodes
+            if node.get("type") == "case_example" and node.get("visible")
+            and node.get("provenance_bound") and str(node.get("case_id")) in case_markers
+            and f"<!--case:{node.get('case_id')}-->" in str(node.get("content") or "")]
+        visible_count = len(_VISIBLE_CASE_EXAMPLE.findall(report_md))
+        if visible_count > len([
+                node for node in structured_nodes if node.get("visible")]):
+            issues.append(_issue(
+                "unbound_visible_case_example",
+                f"报告有 {visible_count} 个可见例证，但只有 "
+                f"{len([node for node in structured_nodes if node.get('visible')])} 个"
+                "形成 structured case node。",
+                section_id=case_section_id,
+                suggested_action="只定点修复未绑定例证，禁止用重复案例补数。"))
+        for case_id in sorted(set(case_markers) - set(case_presentations)):
+            issues.append(_issue(
+                "orphan_case_marker", f"案例 marker {case_id} 没有对应的可见结构化例证。",
+                section_id=case_section_id, evidence_id=case_id,
+                suggested_action="将 marker、可见例证和 structured node 由同一 assembly 节点生成。"))
+    else:
+        structured_ids = []
+        marked_ids = set(case_markers)
+        source_quote_ids = [
+            case_id for kind, case_id, _quote in _QUOTE.findall(report_md)
+            if kind == "SOURCE" and case_id not in marked_ids]
+        source_quote_ids.extend(
+            case_id for kind, case_id, _quote in _SYNTHETIC_QUOTE.findall(report_md)
+            if kind == "SYNTHETIC_SOURCE" and case_id not in marked_ids)
+        case_presentations = [*case_markers, *source_quote_ids]
+        structured_ids = list(case_presentations)
+    bound_ids = set(case_presentations) & selected_ids
+    missing_case_ids = sorted(selected_ids - bound_ids)
+    if selected_ids and (
+            len(structured_ids) != len(selected_ids) or len(bound_ids) != len(selected_ids)):
+        issue = _issue(
+            "case_presentation_count_mismatch",
+            f"报告 selected={len(selected_ids)}、structured={len(structured_ids)}、"
+            f"provenance-safe visible={len(bound_ids)}。",
+            section_id=case_section_id,
+            suggested_action="只重建缺失案例所属的 case_analysis subsection。")
+        issue.update({
+            "selected_case_count": len(selected_ids),
+            "structured_case_node_count": len(structured_ids),
+            "unique_provenance_bound_visible_case_count": len(bound_ids),
+            "missing_case_ids": missing_case_ids,
+        })
+        issues.append(issue)
+    for case_id, count in Counter(structured_ids).items():
+        if case_id in selected_ids and count > 1:
+            issues.append(_issue(
+                "duplicate_selected_case_presentation",
+                f"同一案例 {case_id} 被包装成 {count} 个用户可见例证。",
+                section_id=case_section_id, evidence_id=case_id,
+                suggested_action="同一案例只保留一个例[n]；不同分析维度合并到该例分析中。"))
+    for node in structured_nodes:
+        case_id = str(node.get("case_id") or "")
+        if case_id in decision_ids and _DECISION_AS_REVISION.search(
+                str(node.get("content") or node.get("analysis") or "")):
+            issues.append(_issue(
+                "translation_decision_presented_as_revision",
+                f"translation_decision {case_id} 被表述成历史初译或改译过程。",
+                section_id=case_section_id, evidence_id=case_id,
+                suggested_action="改用‘原文—译文—翻译难点—译法分析’，不得虚构修订历史。"))
+    case_heading_ids = re.findall(
+        r"^\s*(?:[-*]\s*)?(?:\*{1,2})?案例[^\n：:]*?"
+        r"\b((?:seg-[A-Za-z0-9_-]+-\d{4,}|TD-\d{4,}|SC-\d{4,}))\b",
+        report_md, re.MULTILINE | re.IGNORECASE)
+    for case_id, count in Counter(case_heading_ids).items():
+        if case_id in selected_ids and count > 1:
+            issues.append(_issue(
+                "duplicate_selected_case_presentation",
+                f"同一案例 {case_id} 被包装成 {count} 个用户可见例证。",
+                section_id=case_section_id, evidence_id=case_id,
+                suggested_action="同一案例只保留一个例[n]；不同分析维度合并到该例分析中。"))
     selected_count = len(authentic_ids)
     if selected_cases.get("selection_policy") in {"mixed", "synthetic_only"} \
             and selected_cases.get("synthetic_pipeline_status") == "failed":
@@ -1190,9 +1445,11 @@ def validate_academic_report(
                 suggested_action="重新运行案例选择，不要手工覆盖案例数量状态。"))
         if expected_status == "insufficient_revision_cases":
             issues.append(_issue(
-                "insufficient_core_revision_cases",
+                "revision_evidence_scarcity",
                 f"只有 {selected_count} 个合格修订案例，少于最低要求 {minimum} 个。",
-                suggested_action="恢复可追溯历史版本或改用其他项目；不得用弱案例补位。"))
+                severity="warning",
+                suggested_action="保留真实修订案例，并用明确标注的 translation_decision "
+                                 "或 synthetic_contrast 补充分析；不得伪造改译历史。"))
         elif expected_status == "two_case_fallback":
             markers = set(_CASE_COUNT_POLICY.findall(report_md))
             if "two_case_fallback" not in markers:
@@ -1372,7 +1629,21 @@ def validate_academic_report(
             "literature_quote_markers": len(_LIT_QUOTE.findall(report_md)),
             "claim_markers": len(_CLAIM.findall(report_md)),
             "research_question_markers": len(_RQ.findall(report_md)),
+            "selected_case_count": len(selected_ids),
+            "structured_case_node_count": len(structured_ids),
+            "unique_provenance_bound_visible_case_count": len(bound_ids),
         },
+    }
+    case_issue_types = _CASE_VALIDATION_ISSUE_TYPES | {"missing_selected_case"}
+    case_issues = [item for item in issues if item.get("type") in case_issue_types]
+    result["case_validation"] = {
+        "status": "fail" if any(item.get("severity") == "error"
+                                  for item in case_issues) else
+        "pass_with_warnings" if case_issues else "pass",
+        "selected_case_count": len(selected_ids),
+        "structured_case_node_count": len(structured_ids),
+        "unique_provenance_bound_visible_case_count": len(bound_ids),
+        "missing_case_ids": sorted(selected_ids - bound_ids),
     }
     result["template_compliance"] = template_compliance
     result["content_hash"] = stable_hash({k: v for k, v in result.items()

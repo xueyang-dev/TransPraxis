@@ -10,7 +10,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import academic_evidence
 from . import academic_quality
@@ -22,26 +22,26 @@ from . import report_template
 from . import synthetic_cases
 from . import thesis_constraints
 
-PIPELINE_VERSION = "academic-pipeline-v7"
+PIPELINE_VERSION = "academic-pipeline-v9"
 VERSIONS = {
     "evidence_version": academic_evidence.SCHEMA_VERSION,
     "report_constraints_version": thesis_constraints.SCHEMA_VERSION,
     "template_contract_version": report_template.SCHEMA_VERSION,
-    "research_model_version": "research-model-v2",
+    "research_model_version": "research-model-v3",
     "literature_sources_version": literature_evidence.SOURCES_VERSION,
     "literature_evidence_version": literature_evidence.EVIDENCE_VERSION,
     "literature_claims_version": literature_evidence.CLAIMS_VERSION,
-    "argument_plan_version": "argument-planner-v2",
+    "argument_plan_version": "argument-planner-v4",
     "synthetic_opportunity_version": synthetic_cases.OPPORTUNITY_VERSION,
     "synthetic_baseline_version": synthetic_cases.BASELINE_VERSION,
     "synthetic_error_manifest_version": synthetic_cases.ERROR_MANIFEST_VERSION,
     "synthetic_optimizer_version": synthetic_cases.OPTIMIZER_VERSION,
     "synthetic_validation_version": synthetic_cases.VALIDATION_VERSION,
-    "case_selection_version": "case-selector-v4",
-    "outline_version": "academic-outline-v5",
-    "writer_version": "academic-writer-v9",
+    "case_selection_version": "case-selector-v5",
+    "outline_version": "academic-outline-v6",
+    "writer_version": "academic-writer-v11",
     "validator_version": academic_validator.VALIDATOR_VERSION,
-    "report_artifact_version": "academic-report-artifact-v1",
+    "report_artifact_version": "academic-report-artifact-v3",
     "reviewer_version": "academic-reviewer-v1",
     "literature_reviewer_version": "literature-support-reviewer-v1",
     "academic_quality_version": academic_quality.QUALITY_VERSION,
@@ -420,6 +420,14 @@ def prepare_academic_inputs(
     settings = dict(state.get("research_settings") or {})
     if research_settings:
         settings.update(research_settings)
+    filename = str(state.get("filename") or "")
+    settings.setdefault("source_filename", filename)
+    source_stem = Path(filename or "翻译项目").stem
+    project_name = re.split(r"提取自", source_stem, maxsplit=1)[-1].strip()
+    project_name = re.sub(r"^\d+\s*", "", project_name)
+    project_name = re.sub(r"\s*\([^)]*\)\s*$", "", project_name).strip()
+    if not settings.get("project_name") or settings.get("project_name") == source_stem:
+        settings["project_name"] = project_name or source_stem
     settings["theoretical_framework"] = settings.get("theoretical_framework") or [theory]
     template_contract = settings.get("report_template_contract") or \
         settings.get("template_contract")
@@ -548,6 +556,15 @@ def _as_list(value: Any) -> List[str]:
     return [str(x).strip() for x in (value or []) if str(x).strip()]
 
 
+def _norm_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _norm_without_english_parentheticals(value: Any) -> str:
+    text = re.sub(r"[（(]\s*[A-Za-z][^()（）]{0,100}[）)]", "", str(value or ""))
+    return _norm_text(text)
+
+
 def build_research_model(
     evidence: Dict[str, Any], theory: str,
     settings: Optional[Dict[str, Any]] = None,
@@ -556,13 +573,17 @@ def build_research_model(
     report_constraints = thesis_constraints.build_constraints(settings)
     framework = _as_list(settings.get("theoretical_framework")) or [theory]
     provided_rqs = _as_list(settings.get("research_questions"))
+    profile = evidence.get("project_evidence", {}).get("document_profile") or {}
+    domain = profile.get("domain") or profile.get("genre") or "当前源文本"
+    glossary = evidence.get("project_evidence", {}).get("glossary") or []
+    term_examples = "、".join(str(x.get("source") or "") for x in glossary[:2]
+                             if x.get("source")) or "核心学术术语"
     default_rqs = [
-        "源文本的主要语言特征与可证实的翻译难点是什么？",
-        f"代表性翻译决策从{framework[0]}视角可作何种有限解释？",
-        "术语治理、机器翻译、审校与译后编辑在本项目中呈现了哪些可追溯效果与局限？",
+        f"在{domain}文本的英汉翻译中，如何识别并处理长句论证链与信息结构难点？",
+        f"如何依据上下文一致处理 {term_examples} 等概念术语，并避免概念关系弱化？",
+        "如何在无人机视觉与行星共同体相关论述中再现隐喻、评价色彩及其论证功能？",
     ]
     rqs = provided_rqs or default_rqs
-    profile = evidence.get("project_evidence", {}).get("document_profile") or {}
     template_contract = settings.get("report_template_contract") or \
         settings.get("template_contract")
     template_identity = (template_contract or {}).get("template_identity") or {}
@@ -586,6 +607,14 @@ def build_research_model(
         "report_constraints": report_constraints,
         "template_contract": template_contract,
         "template_hash": template_identity.get("sha256"),
+        "template_identity": template_identity or None,
+        "project_metadata": {
+            "project_name": settings.get("project_name"),
+            "source_filename": settings.get("source_filename"),
+            "domain": profile.get("domain"),
+            "genre": profile.get("genre"),
+            "audience": profile.get("audience"),
+        },
         "body_language": report_constraints["body_language"]["language"],
         "writing_style": settings.get("writing_style") or report_constraints[
             "style_rules"]["academic_register"],
@@ -705,6 +734,11 @@ def build_argument_plan(
         for x in (human_evidence_entries or [])}
     valid_metrics = {f"metric:{x}" for x in
                      evidence.get("project_evidence", {}).get("statistics", {})}
+    constraints = research_model.get("report_constraints") or {}
+    chapters = list(constraints.get("chapters") or [])
+    template_configured = bool((constraints.get("template") or {}).get("configured"))
+    case_chapters = [str(x.get("section_id")) for x in chapters
+                     if x.get("role") == "case_analysis"]
     source_index = literature_evidence.source_index(literature_sources_artifact or {})
     literature_claims = {
         claim_id: claim for claim_id, claim in literature_evidence.claim_index(
@@ -767,14 +801,39 @@ def build_argument_plan(
             "support_category": support_category,
             "analysis_type": analysis_type,
             "confidence": str(item.get("confidence") or "low"),
-            "planned_sections": _as_list(item.get("planned_sections")) or ["3"],
+            "planned_sections": case_chapters if template_configured else (
+                _as_list(item.get("planned_sections")) or ["3"]),
             "reasoning": str(item.get("reasoning") or "").strip(),
             "counterargument": str(item.get("counterargument") or "").strip(),
         })
     if not claims:
         claims = _fallback_argument_plan(research_model, evidence)["claims"]
+    segment_rows = academic_evidence.segment_index(evidence)
+    for claim in claims:
+        bound_segments = [segment_rows.get(str(evidence_id)) or {}
+                          for evidence_id in claim.get("project_evidence") or []]
+        parenthetical_only = any(
+            segment.get("initial_target") and segment.get("final_target") and
+            _norm_without_english_parentheticals(segment.get("initial_target")) ==
+            _norm_without_english_parentheticals(segment.get("final_target")) and
+            _norm_without_english_parentheticals(segment.get("initial_target")) !=
+            _norm_text(segment.get("initial_target"))
+            for segment in bound_segments)
+        if parenthetical_only and re.search(
+                r"修订记录.{0,40}(?:逻辑|衔接|句法|信息结构)",
+                str(claim.get("claim") or "")):
+            claim["claim"] = re.sub(
+                r"[，,；;]?\s*(?:但)?修订记录表明.*?(?:。|$)", "。",
+                str(claim.get("claim") or "")).strip()
+            claim["reasoning"] = (
+                str(claim.get("reasoning") or "").strip() +
+                " 证据边界：该真实修订仅删除术语英文括号释义，不能证明句法、"
+                "逻辑衔接或信息结构发生修订。").strip()
+            claim["confidence"] = "low"
     artifact = {
         "schema_version": VERSIONS["argument_plan_version"],
+        "template_hash": research_model.get("template_hash"),
+        "chapter_roles": {str(x.get("section_id")): x.get("role") for x in chapters},
         "claims": claims,
         "planner_fallback": bool(raw.get("planner_fallback")),
         "rejected_source_only_support": rejected_source_only,
@@ -822,6 +881,20 @@ def select_academic_cases(
                 **item, "supports_claims": [], "research_questions": []})
     cases = list(selected.values())[:limit]
     authentic_count = len(cases)
+    decision_count = 0
+    if policy != "synthetic_only" and len(cases) < limit:
+        for item in evidence.get("translation_decision_candidates") or []:
+            if len(cases) >= limit:
+                break
+            cases.append({
+                **item,
+                "supports_claims": [],
+                "research_questions": [],
+                "selection_rationale": (
+                    "unchanged translation with recorded terminology, syntax, rhetoric, "
+                    "finding, or QA evidence; not presented as a revision"),
+            })
+            decision_count += 1
     if policy != "authentic_only" and len(cases) < limit:
         segs = academic_evidence.segment_index(evidence)
         for item in synthetic_cases.select_diverse_cases(
@@ -872,9 +945,11 @@ def select_academic_cases(
         scarcity_disclosure = (
             f"现有项目证据仅支持 {authentic_count} 个通过修订资格门禁的真实修订案例，"
             f"少于最低要求 {minimum} 个。")
-    synthetic_count = len(cases) - authentic_count
+    synthetic_count = len(cases) - authentic_count - decision_count
     selection_status = (
-        "mixed_case_selection" if authentic_count and synthetic_count else
+        "mixed_case_selection" if sum(bool(x) for x in (
+            authentic_count, decision_count, synthetic_count)) > 1 else
+        "translation_decision_selection" if decision_count else
         "synthetic_only_selection" if synthetic_count else
         "no_eligible_synthetic_cases" if policy == "synthetic_only" else
         authentic_status)
@@ -882,8 +957,8 @@ def select_academic_cases(
         "schema_version": VERSIONS["case_selection_version"],
         "selection_policy": policy,
         "preference_order": (
-            "verified authentic revision > eligible synthetic contrast > "
-            "weak authentic evidence > unsupported reconstructed history"),
+            "verified authentic revision > evidence-rich translation decision > "
+            "eligible synthetic contrast > unsupported reconstructed history"),
         "eligibility_rule": "case_type_specific_gate",
         "requested_case_count": limit,
         "preferred_core_case_count": preferred_authentic_count,
@@ -898,6 +973,7 @@ def select_academic_cases(
             "pipeline_status", "not_run"),
         "selected_case_count": len(cases),
         "authentic_revision_cases": authentic_count,
+        "translation_decision_cases": decision_count,
         "synthetic_contrast_cases": synthetic_count,
         "authentic_selection_status": authentic_status,
         "selection_status": selection_status,
@@ -957,6 +1033,9 @@ def _fallback_outline(
             "claims": claims,
             "cases": cases,
             "case_groups": {"authentic_revision": authentic_cases,
+                            "translation_decision": [
+                                x for x in cases if x not in authentic_cases
+                                and x not in synthetic_case_ids],
                             "synthetic_contrast": synthetic_case_ids},
             "literature_claims": [], "literature_evidence": [], "literature_sources": [],
             "required_statistics": [],
@@ -1074,13 +1153,19 @@ def build_academic_outline(
             lit_evidence[x]["source_id"] for x in section_lit_evidence
             if lit_evidence[x].get("source_id") in lit_sources
         })
+        role = chapter.get("role") or str(item.get("role") or "generic_section")
+        default_statistics = []
+        if role == "project_overview":
+            default_statistics = [x for x in (
+                "total_segments", "translated_segments", "reviewed_segments",
+                "meaningfully_revised_segments", "tm_reuse_count") if x in valid_stats]
         return {
             "section_id": section_id,
             # Template title/order/level/role are authoritative.  The model
             # only fills the evidence assignment fields below.
             "title": chapter.get("title") or str(
                 item.get("title") or f"章节 {section_id}").strip(),
-            "role": chapter.get("role") or str(item.get("role") or "generic_section"),
+            "role": role,
             "level": chapter.get("level", 1),
             "purpose": chapter.get("purpose") or str(item.get("purpose") or "").strip(),
             "required_subsections": chapter.get("required_subsections", []),
@@ -1091,8 +1176,11 @@ def build_academic_outline(
             "literature_claims": section_lit_claims if section_lit_evidence else [],
             "literature_evidence": section_lit_evidence,
             "literature_sources": section_sources,
-            "required_statistics": [str(x) for x in item.get("required_statistics") or []
-                                    if str(x) in valid_stats],
+            "required_statistics": list(dict.fromkeys([
+                *default_statistics,
+                *[str(x) for x in item.get("required_statistics") or []
+                  if str(x) in valid_stats],
+            ])),
             "target_words": max(200, int(item.get("target_words") or 700)),
             "minimum_chars": max(100, int(item.get("minimum_chars") or 200)),
             "allowed_conclusions": _as_list(item.get("allowed_conclusions")),
@@ -1127,6 +1215,7 @@ def build_academic_outline(
     case_sections = [x for x in sections if x.get("role") == "case_analysis"]
     conclusion_sections = [x for x in sections if x.get("role") == "conclusion_reflection"]
     intro_sections = [x for x in sections if x.get("role") == "introduction"]
+    template_configured = bool((constraints.get("template") or {}).get("configured"))
     planning_warnings = list(raw.get("planning_warnings") or [])
     if (research_model.get("template_hash") or
             (constraints.get("template") or {}).get("configured")) and not case_sections:
@@ -1137,6 +1226,8 @@ def build_academic_outline(
         section["research_questions"] = list(dict.fromkeys(section["research_questions"]))
     if intro_sections and valid_rqs:
         intro_sections[0]["research_questions"] = sorted(valid_rqs)
+    for section in [*case_sections, *conclusion_sections]:
+        section["research_questions"] = sorted(valid_rqs)
 
     # Bind claims to model-planned sections first; otherwise choose an
     # explicit role, never the last section by accident.
@@ -1147,7 +1238,8 @@ def build_academic_outline(
         if any(claim_id in x["claims"] for x in sections):
             continue
         claim = claims_by_id.get(claim_id) or {}
-        planned = [section_by_id.get(str(x)) for x in claim.get("planned_sections") or []]
+        planned = [] if template_configured else [
+            section_by_id.get(str(x)) for x in claim.get("planned_sections") or []]
         target = next((x for x in planned if x), None)
         target = target or (case_sections[0] if case_sections else
                             (conclusion_sections[0] if conclusion_sections else sections[0]))
@@ -1162,7 +1254,6 @@ def build_academic_outline(
     selected_ids = {str(x.get("case_id")) for x in selected_cases.get("cases", [])}
     selected_by_id = {str(x.get("case_id")): x
                       for x in selected_cases.get("cases", [])}
-    template_configured = bool((constraints.get("template") or {}).get("configured"))
     for section in sections:
         section["cases"] = section["cases"][:max(4, len(selected_ids))]
     assigned = {case_id for section in sections for case_id in section["cases"]}
@@ -1199,10 +1290,15 @@ def build_academic_outline(
             "authentic_revision": [case_id for case_id in section["cases"]
                                      if selected_by_id.get(case_id, {}).get(
                                          "case_type") == "authentic_revision"],
+            "translation_decision": [case_id for case_id in section["cases"]
+                                      if selected_by_id.get(case_id, {}).get(
+                                          "case_type") == "translation_decision"],
             "synthetic_contrast": [case_id for case_id in section["cases"]
                                     if selected_by_id.get(case_id, {}).get(
                                         "case_type") == "synthetic_contrast"],
         }
+    for section in conclusion_sections:
+        section["claims"] = sorted(valid_claims)
     artifact = {
         "schema_version": VERSIONS["outline_version"],
         "report_constraints": constraints,
@@ -1222,6 +1318,8 @@ def build_academic_outline(
         "case_groups": {
             "authentic_revision": [case_id for case_id, item in selected_by_id.items()
                                      if item.get("case_type") == "authentic_revision"],
+            "translation_decision": [case_id for case_id, item in selected_by_id.items()
+                                     if item.get("case_type") == "translation_decision"],
             "synthetic_contrast": [case_id for case_id, item in selected_by_id.items()
                                     if item.get("case_type") == "synthetic_contrast"],
         },
@@ -1229,6 +1327,31 @@ def build_academic_outline(
     artifact["content_hash"] = academic_evidence.stable_hash(
         {k: v for k, v in artifact.items() if k != "content_hash"})
     return artifact
+
+
+def _case_assignment_for_plan(case_id: str, plan: Mapping[str, Any]) -> Dict[str, Any]:
+    problem_type = str((plan.get("problem") or {}).get("type") or "other")
+    if problem_type in {
+            "terminology", "reference_resolution", "lexical_polysemy",
+            "cultural_reference"}:
+        group, title = "1", "术语、专名与文化指称"
+    elif problem_type in {
+            "syntactic_ambiguity", "logical_relation", "information_structure"}:
+        group, title = "2", "句法与信息结构"
+    elif problem_type in {
+            "metaphor", "pragmatic_implication", "register", "voice", "rhythm",
+            "narrative_perspective"}:
+        group, title = "3", "修辞、语用与语域"
+    else:
+        group, title = "4", "连贯性与质量控制"
+    return {
+        "case_id": case_id,
+        "difficulty_group": f"3.2.{group}",
+        "strategy_group": f"3.3.{group}",
+        "target_subsection": f"3.3.{group}",
+        "group_title": title,
+        "required": True,
+    }
 
 
 def _section_packet(
@@ -1248,6 +1371,11 @@ def _section_packet(
     lit_evidence = literature_evidence.evidence_index(literature_evidence_artifact or {})
     lit_claims = literature_evidence.claim_index(literature_claims_artifact or {})
     plans = case_analysis.plan_index(case_analysis_plans or {})
+    required_case_ids = [str(x) for x in section.get("cases", []) if str(x) in cases]
+
+    case_assignments = [
+        _case_assignment_for_plan(case_id, plans.get(case_id) or {})
+        for case_id in required_case_ids]
     case_term_ids = set()
     for case_id in section.get("cases", []):
         selected = cases.get(case_id) or {}
@@ -1292,9 +1420,12 @@ def _section_packet(
         "available_evidence": available_evidence,
         "cases": [{
             **cases[x],
-            "evidence": segments.get(x) if cases[x].get(
-                "case_type") == "authentic_revision" else cases[x],
+            "evidence": cases[x] if cases[x].get("case_type") == "synthetic_contrast"
+            else segments.get(str(cases[x].get("source_segment_id") or x)),
         } for x in section.get("cases", []) if x in cases],
+        "required_case_ids": required_case_ids,
+        "must_render_all_cases": bool(required_case_ids),
+        "case_assignments": case_assignments,
         "case_analyses": [{
             **plans[x],
             "analysis_contract_text": case_analysis.render_analysis_contract(plans[x]),
@@ -1309,6 +1440,8 @@ def _section_packet(
         "literature_evidence": [lit_evidence[x] for x in section.get(
             "literature_evidence", []) if x in lit_evidence],
         "statistics": statistics,
+        "workflow_evidence": evidence.get("project_evidence", {}).get("workflow", {})
+        if section.get("role") == "project_overview" else {},
         "terminology_decisions": terminology,
         "prior_section_summaries": prior_summaries,
         "writing_constraints": {
@@ -1332,6 +1465,9 @@ def _section_packet(
             "literature_claim_marker": "<!--lit-claim:LC-001-->",
             "literature_evidence_marker": "<!--lit-evidence:LE-...-->",
             "analysis_contract": "按 case_analyses 中的 analysis_contract_text 逐项落实",
+            "required_case_ids": required_case_ids,
+            "must_render_all_cases": bool(required_case_ids),
+            "case_assignments": case_assignments,
             "evidence_level_policy": (
                 "authentic_revision 必须有真实初译→终译；synthetic_contrast 必须通过"
                 "独立合成资格门禁；两者不得互相转换"),
@@ -1363,7 +1499,10 @@ def _section_packet(
 
 
 def _writer_heading_key(value: Any) -> str:
-    value = re.sub(r"^\d+(?:\.\d+)*[.)、．]?\s+", "", str(value or "")).strip()
+    value = str(value or "").strip()
+    value = re.sub(r"^第\s*[一二三四五六七八九十百千万]+\s*章\s*", "", value)
+    value = re.sub(r"^[一二三四五六七八九十]+[、.．]\s*", "", value)
+    value = re.sub(r"^\d+(?:\.\d+)*[.)、．]?\s+", "", value).strip()
     return re.sub(r"[\s:：.。、()（）\[\]【】_-]+", "", value.casefold())
 
 
@@ -1374,10 +1513,18 @@ def _ensure_section_contract(text: str, section: Mapping[str, Any]) -> str:
     normalized = []
     seen = set()
     section_key = _writer_heading_key(section.get("title"))
+    substantive_started = False
     for line in lines:
-        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line.strip())
+        stripped = line.strip()
+        if not substantive_started and stripped and not stripped.startswith("<!--") \
+                and _writer_heading_key(stripped) == section_key:
+            # The assembler supplies the canonical chapter heading.
+            continue
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", stripped)
         if not match:
             normalized.append(line)
+            if stripped and not stripped.startswith("<!--"):
+                substantive_started = True
             continue
         title = match.group(2).strip()
         if _writer_heading_key(title) == section_key:
@@ -1393,7 +1540,22 @@ def _ensure_section_contract(text: str, section: Mapping[str, Any]) -> str:
             normalized.append(f"{prefix} {heading_id} {matched.get('title')}")
             seen.add(_writer_heading_key(matched.get("title")))
         else:
-            normalized.append(line)
+            numeric = re.match(r"^(\d+(?:\.\d+)*)(?:[.)、．])?\s+(.+)$", title)
+            heading_id = numeric.group(1) if numeric else ""
+            dynamic_allowed = any(
+                item.get("allows_dynamic_children") and heading_id.startswith(
+                    str(item.get("heading_id") or "") + ".")
+                for item in required)
+            chapter_child = heading_id.startswith(
+                str(section.get("section_id") or "") + ".")
+            if numeric and chapter_child and (dynamic_allowed or not required):
+                depth = heading_id.count(".") + 2
+                normalized.append(f"{'#' * min(6, depth)} {heading_id} {numeric.group(2)}")
+            else:
+                # Preserve useful prose labels without allowing an LLM to add
+                # structural headings outside the template contract.
+                normalized.append(f"**{title}**")
+        substantive_started = True
     missing = [item for item in required
                if _writer_heading_key(item.get("title")) not in seen]
     if missing:
@@ -1405,7 +1567,21 @@ def _ensure_section_contract(text: str, section: Mapping[str, Any]) -> str:
                 "#" * (int(item.get("level") or 2) + 1)))
             normalized.extend(["", f"{prefix} {heading_id} {item.get('title')}",
                                "当前项目证据不足以对此作进一步实证分析，需人工补充。"])
-    return "\n".join(normalized).strip()
+    text = "\n".join(normalized).strip()
+    if str(section.get("role") or "") == "case_analysis":
+        problem_ids = set(re.findall(r"^#{4,6}\s+3\.2\.(\d+)\b", text, re.MULTILINE))
+        solution_ids = set(re.findall(r"^#{4,6}\s+3\.3\.(\d+)\b", text, re.MULTILINE))
+        for side, suffixes in (("2", problem_ids - solution_ids),
+                               ("3", solution_ids - problem_ids)):
+            for suffix in suffixes:
+                text = re.sub(
+                    rf"^#{{4,6}}\s+(3\.{side}\.{suffix}\s+.+)$",
+                    r"**\1**", text, flags=re.MULTILINE)
+    missing_rqs = [str(rq) for rq in section.get("research_questions") or []
+                   if f"<!--rq:{rq}-->" not in text]
+    if missing_rqs:
+        text += "\n" + "".join(f"<!--rq:{rq}-->" for rq in missing_rqs)
+    return text.strip()
 
 
 def _write_section(
@@ -1417,6 +1593,8 @@ def _write_section(
     system = (
         "你是证据约束型学术写作者。根据论点计划写当前 section，不得新增主要论点、"
         "项目事实或文献。authentic_revision 必须逐字使用 SOURCE/INITIAL/TARGET；"
+        "translation_decision 只使用 SOURCE/TARGET，并明确初译与终译一致、用于分析"
+        "可观察的翻译决策，绝不能写成错误后改译；"
         "synthetic_contrast 必须逐字使用 SYNTHETIC_SOURCE/SIMULATED/OPTIMIZED，"
         "并明确称为‘模拟初译’和‘优化译文’。项目数字只能用 packet.statistics 中已提供的 "
         "{{STAT:key}}；缺失指标不得猜测，也不要输出对应 token。正式文献只能用 [@source_id]；"
@@ -1424,7 +1602,9 @@ def _write_section(
         "同时保留 lit-claim 与 lit-evidence marker，并引用对应 source_id；"
         "项目术语决策用 {{TERM:entry_id}}。每个落实的 claim 和 RQ 分别保留 HTML marker。"
         "理论解释必须写成作者分析，例如‘从结果看可解释为’，不得冒充译者真实意图。"
-        "无文献证据时，不得从模型记忆补作者、年份、书名或理论命题。只输出章节正文。"
+        "无文献证据时，不得从模型记忆补作者、年份、书名或理论命题。内部 ID 只能存在于"
+        "规定的 quote/HTML marker，普通论文句子不得出现 segment id、artifact、finding id、"
+        "evidence registry 等系统语言。只输出章节正文。"
     )
     constraints = (packet.get("writing_constraints") or {}).get(
         "report_constraints") or {}
@@ -1441,6 +1621,41 @@ def _write_section(
             " 当前章必须按 required_subsections 的顺序使用可见标题，并逐项采用其中的"
             "markdown_prefix，格式为‘markdown_prefix 编号 标题’，不得省略、改名或压平层级。"
         )
+    role = str((packet.get("current_section") or {}).get("role") or "")
+    if role == "introduction":
+        system += (
+            " 本章必须在 1.1 只写真实项目背景与意义；1.2 原样提出 packet 中 2—3 个研究问题；"
+            "1.3 必须准确说明当前四章结构。不得虚构行业数据。")
+    elif role == "project_overview":
+        system += (
+            " 本章只使用 workflow_evidence、statistics 与 project_metadata。2.1 说明原文件、"
+            "方向、范围、片段数、文本类型和交付记录；2.2.1/2.2.2/2.2.3 分别写真实译前、"
+            "译中、译后流程。不得虚构客户、团队、CATTI、Trados 或客户反馈。"
+            "TM reuse=0 只能写‘未观察到 TM 复用记录’，不能推出机器翻译或 LLM 未使用。")
+    elif role == "case_analysis":
+        system += (
+            " 本章必须保持 3.1 源语类型与特征、3.2 翻译难点、3.3 翻译策略与解决方案。"
+            "3.2.x 与 3.3.x 必须同号一一对应；每个策略项使用真实案例，按原文、初译/译文、"
+            "改译（仅真实修订）、分析组织。案例正文不要显示内部 ID。selected cases 中每个"
+            "case_id 只能作为一个编号例证出现一次，不得把同一段落按不同维度包装成两个案例，"
+            "也不得新增第七个案例。translation_decision 只能称为翻译决策案例。finding 数量只"
+            "表示检测记录，不等于发生同等数量的实际改译；TM reuse=0 时不得写 TM 污染、"
+            "机器翻译未使用或全程人工。真实修订若仅删除英文括号释义，只能支持术语格式与"
+            "阅读连续性分析，不能证明句法、逻辑衔接或信息结构发生修订。")
+        required_case_ids = packet.get("required_case_ids") or []
+        if required_case_ids:
+            system += (
+                " packet.required_case_ids 中的案例全部是 required，不是可选上下文；必须按"
+                "packet.case_assignments 将每个案例各写成一个独立可见例证，恰好一次，并在"
+                "例证标题下一行保留 <!--case:CASE_ID-->。例证编号可暂用例[1]，最终 assembly"
+                "会统一编号。authentic_revision 使用原文、初译、改译、分析；"
+                "translation_decision 只使用原文、译文、翻译难点、译法分析，不得使用"
+                "‘初译’‘修改后’‘改译为’等历史修订措辞。"
+            )
+    elif role == "conclusion_reflection":
+        system += (
+            " 本章必须逐项回应研究问题，总结已建立的策略、实践经验、真实局限和改进方向；"
+            "不得首次引入任何案例或新证据。")
     count_policy = (packet.get("writing_constraints") or {}).get(
         "case_count_policy") or {}
     if count_policy.get("status") == "two_case_fallback":
@@ -1521,6 +1736,77 @@ def _write_section(
     return academic_validator.expand_evidence_tokens(text, packet_to_evidence(packet))
 
 
+def _write_missing_case_example(
+    packet: Dict[str, Any], case_id: str, call_llm: Callable,
+    provider: str, api_key: str, model: str,
+) -> str:
+    """Write one required case block without rewriting its surrounding chapter."""
+    case = next((item for item in packet.get("cases") or []
+                 if str(item.get("case_id")) == case_id), None)
+    plan = next((item for item in packet.get("case_analyses") or []
+                 if str(item.get("case_id")) == case_id), None)
+    assignment = next((item for item in packet.get("case_assignments") or []
+                       if str(item.get("case_id")) == case_id), None)
+    if not case or not plan or not assignment:
+        raise ValueError(f"missing required case contract: {case_id}")
+    case_type = str(case.get("case_type") or "authentic_revision")
+    format_rule = (
+        "原文、初译、改译、分析" if case_type == "authentic_revision"
+        else "原文、译文、翻译难点、译法分析")
+    system = (
+        "你是 MTI 案例定点修复器。只输出一个独立案例块，不输出章节标题或修订说明。"
+        f"案例必须使用{format_rule}；逐字使用输入 evidence 与 analysis_contract_text，"
+        "不得补造译者意图、修订历史或新证据。标题暂用 **例[1]：简短标题**，下一行逐字"
+        f"保留 <!--case:{case_id}-->。原文与译文使用带 case_id 的 SOURCE/INITIAL/TARGET "
+        "blockquote；普通论文文字不得显示内部 ID。translation_decision 禁止出现‘初译’"
+        "‘修改后’‘改译为’。"
+    )
+    payload = {"case": case, "case_analysis": plan, "assignment": assignment}
+    raw = call_llm(provider, api_key, model, system,
+                   json.dumps(payload, ensure_ascii=False), temperature=0.1)
+    block = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", str(raw or "").strip(),
+                   flags=re.DOTALL)
+    if not block:
+        raise RuntimeError(f"missing case repair returned empty content: {case_id}")
+    if f"<!--case:{case_id}-->" not in block:
+        first_newline = block.find("\n")
+        block = (block + f"\n<!--case:{case_id}-->") if first_newline < 0 else (
+            block[:first_newline + 1] + f"<!--case:{case_id}-->\n" +
+            block[first_newline + 1:])
+    return block.strip()
+
+
+def _insert_case_example(section_text: str, subsection_id: str, block: str) -> str:
+    heading = re.search(
+        rf"^#{{3,6}}\s+{re.escape(subsection_id)}\b.*$",
+        section_text, re.MULTILINE)
+    if not heading:
+        heading = re.search(r"^###\s+3\.3\b.*$", section_text, re.MULTILINE)
+    if not heading:
+        raise ValueError(f"missing case target subsection: {subsection_id}")
+    following = re.search(r"^#{3,4}\s+", section_text[heading.end():], re.MULTILINE)
+    insert_at = heading.end() + following.start() if following else len(section_text)
+    return (section_text[:insert_at].rstrip() + "\n\n" + block.strip() + "\n\n" +
+            section_text[insert_at:].lstrip()).strip()
+
+
+def _repair_missing_case_examples(
+    section_text: str, packet: Dict[str, Any], missing_case_ids: Iterable[str],
+    call_llm: Callable, provider: str, api_key: str, model: str,
+) -> str:
+    assignments = {str(item.get("case_id")): item
+                   for item in packet.get("case_assignments") or []}
+    repaired = section_text
+    for case_id in missing_case_ids:
+        case_id = str(case_id)
+        assignment = assignments.get(case_id) or {}
+        block = _write_missing_case_example(
+            packet, case_id, call_llm, provider, api_key, model)
+        repaired = _insert_case_example(
+            repaired, str(assignment.get("target_subsection") or "3.3"), block)
+    return repaired
+
+
 def _is_transient_llm_error(exc: Exception) -> bool:
     module = type(exc).__module__ or ""
     if module.startswith("openai"):
@@ -1569,19 +1855,131 @@ def _compose_report(sections: List[Dict[str, Any]]) -> str:
         for item in sections) + "\n"
 
 
+def build_report_matter(
+    research_model: Mapping[str, Any], evidence: Mapping[str, Any],
+    selected_cases: Mapping[str, Any], template_contract: Optional[Mapping[str, Any]],
+    literature_sources_artifact: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build front/back matter only from recorded project and source metadata."""
+    project = research_model.get("project_metadata") or {}
+    project_name = str(project.get("project_name") or "当前翻译项目")
+    profile = evidence.get("project_evidence", {}).get("document_profile") or {}
+    stats = evidence.get("project_evidence", {}).get("statistics") or {}
+    cases = selected_cases.get("cases") or []
+    rqs = [str(x.get("question") or "") for x in research_model.get(
+        "research_questions") or [] if x.get("question")]
+    glossary = evidence.get("project_evidence", {}).get("glossary") or []
+    genre = str(profile.get("genre") or "学术文本")
+    domain = str(profile.get("domain") or "翻译实践")
+    abstract_zh = (
+        f"本报告基于《{project_name}》英汉翻译项目。项目源文本属于{genre}，"
+        f"涉及{domain}，共记录 {stats.get('total_segments', 0)} 个翻译片段。"
+        f"报告围绕{('；'.join(rqs)) if rqs else '项目中可观察的翻译难点'}展开，"
+        f"并在模板规定的案例分析章中使用 {len(cases)} 个可追溯案例讨论长句信息结构、"
+        "概念术语与修辞表达的处理。分析只依据已保存的原文、译文、术语、审校与流程记录；"
+        "未记录的译者意图、客户反馈或工具使用情况不作推断。"
+    )
+    abstract_en = (
+        f"This report examines the English-Chinese translation project {project_name}. "
+        f"The source is a {genre} text in the field of {domain}, and the recorded scope "
+        f"contains {stats.get('total_segments', 0)} segments. The report discusses "
+        f"{len(cases)} traceable cases concerning information structure in complex "
+        "sentences, conceptual terminology, and rhetorical expression. Its conclusions "
+        "are limited to the saved source, translation, terminology, review, and workflow "
+        "records; unrecorded intentions, client feedback, and tool use are not inferred."
+    )
+    keywords_zh = [x for x in (genre, domain, "英汉翻译", "案例分析") if x][:4]
+    keywords_en = ["English-Chinese translation", "translation practice",
+                   "case analysis", "academic translation"]
+    structure = (template_contract or {}).get("document_structure") or {}
+    front_by_role = {
+        "abstract_zh": {"content": abstract_zh},
+        "keywords_zh": {"keywords": keywords_zh},
+        "abstract_en": {"content": abstract_en},
+        "keywords_en": {"keywords": keywords_en},
+    }
+    front = [{**item, **front_by_role.get(str(item.get("role")), {})}
+             for item in structure.get("front_matter") or []]
+
+    references = []
+    for source in (literature_sources_artifact or {}).get("sources") or []:
+        if not source.get("citation_allowed"):
+            continue
+        citation = source.get("citation_metadata") or {}
+        visible = citation.get("bibliography") or citation.get("full")
+        if visible:
+            references.append(str(visible))
+    source_filename = str(project.get("source_filename") or "").strip()
+    if source_filename:
+        references.insert(0, f"[1] {source_filename}（项目源文献；出版信息待用户补充）")
+    segments = evidence.get("project_evidence", {}).get("segments") or []
+    appendix_pairs = "\n\n".join(
+        f"原文：{item.get('source') or ''}\n\n译文：{item.get('final_target') or ''}"
+        for item in segments if item.get("source") and item.get("final_target"))
+    appendix_terms = "\n".join(
+        f"{item.get('source') or ''}：{item.get('preferred') or item.get('target') or ''}"
+        for item in glossary if item.get("source") and (
+            item.get("preferred") or item.get("target")))
+    back = []
+    for item in structure.get("back_matter") or []:
+        title = str(item.get("title") or "")
+        role = str(item.get("role") or "")
+        content = "需要用户补充。"
+        if role == "references":
+            content = "\n".join(references) if references else "需要用户补充可核验的参考文献。"
+        elif role == "acknowledgements":
+            content = "需要用户补充致谢正文。"
+        elif role == "appendix" and "原文与译文" in title:
+            content = appendix_pairs or "当前项目没有可用于附录的原译文对照记录。"
+        elif role == "appendix" and "术语" in title:
+            content = appendix_terms or "本项目未记录适用的主要术语表。"
+        back.append({**item, "content": content})
+    return {
+        "project_title": project_name,
+        "front_matter": front,
+        "back_matter": back,
+        "report": {
+            "abstract_zh": abstract_zh,
+            "keywords_zh": keywords_zh,
+            "abstract_en": abstract_en,
+            "keywords_en": keywords_en,
+            "references": references,
+            "acknowledgements": "需要用户补充致谢正文。",
+            "appendices": back,
+        },
+    }
+
+
 def build_report_artifact(
     report_md: str,
     written: Sequence[Mapping[str, Any]],
     outline: Mapping[str, Any],
     constraints: Mapping[str, Any],
+    matter: Optional[Mapping[str, Any]] = None,
+    selected_cases: Optional[Mapping[str, Any]] = None,
+    evidence: Optional[Mapping[str, Any]] = None,
+    case_analysis_plans: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create the structured report consumed by template-aware renderers."""
+    case_nodes: List[Dict[str, Any]] = []
+    if selected_cases is not None and evidence is not None:
+        report_md, case_nodes = _realize_visible_case_examples(
+            report_md, dict(evidence), dict(selected_cases),
+            dict(case_analysis_plans or {}))
+    report_content_by_id: Dict[str, str] = {}
+    chapter_matches = list(re.finditer(
+        r"^##\s+([^\s]+)(?:\s+.*?)?\s*$", report_md, re.MULTILINE))
+    for index, match in enumerate(chapter_matches):
+        end = chapter_matches[index + 1].start() \
+            if index + 1 < len(chapter_matches) else len(report_md)
+        report_content_by_id[match.group(1).rstrip(".．、")] = report_md[
+            match.end():end].strip()
     written_by_id = {str(x.get("section_id")): x for x in written}
     sections = []
     for plan in outline.get("sections") or []:
         section_id = str(plan.get("section_id"))
         item = written_by_id.get(section_id) or {}
-        content = str(item.get("content") or "")
+        content = report_content_by_id.get(section_id, str(item.get("content") or ""))
         heading_matches = list(re.finditer(
             r"^#{3,6}\s+([^\s]+)(?:\s+(.+?))?\s*$", content, re.MULTILINE))
         subsections = []
@@ -1607,9 +2005,20 @@ def build_report_artifact(
             "intro_content": intro_content,
             "subsections": subsections,
             "cases": list(plan.get("cases") or []),
+            "case_nodes": [node for node in case_nodes
+                           if str(node.get("chapter_id")) == section_id],
         })
     template_contract = constraints.get("template_contract")
     identity = (template_contract or {}).get("template_identity") or {}
+    matter = dict(matter or {})
+    case_order = [str(node.get("case_id")) for node in case_nodes]
+    if not case_order:
+        for plan in outline.get("sections") or []:
+            if plan.get("role") != "case_analysis":
+                continue
+            for case_id in plan.get("cases") or []:
+                if case_id not in case_order:
+                    case_order.append(case_id)
     artifact = {
         "schema_version": VERSIONS["report_artifact_version"],
         "template_hash": constraints.get("template_hash") or identity.get("sha256"),
@@ -1618,11 +2027,27 @@ def build_report_artifact(
         (template_contract or {}).get("schema_version"),
         "renderer_version": report_template.RENDERER_VERSION,
         "template_contract": template_contract,
-        "front_matter": list(constraints.get("front_matter") or []),
+        "project_title": matter.get("project_title"),
+        "front_matter": list(matter.get("front_matter") or
+                             constraints.get("front_matter") or []),
         "sections": sections,
-        "back_matter": list(constraints.get("back_matter") or []),
+        "back_matter": list(matter.get("back_matter") or
+                            constraints.get("back_matter") or []),
+        "report": dict(matter.get("report") or {}),
+        "case_labels": {case_id: f"例[{index}]"
+                        for index, case_id in enumerate(case_order, start=1)},
+        "report_status": "draft",
         "source_markdown_hash": academic_evidence.stable_hash(report_md),
     }
+    if selected_cases is not None and evidence is not None:
+        artifact["case_nodes"] = case_nodes
+        artifact["case_counts"] = {
+            "selected_case_count": len((selected_cases or {}).get("cases") or []),
+            "structured_case_node_count": len(case_nodes),
+            "unique_provenance_bound_visible_case_count": len({
+                str(node.get("case_id")) for node in case_nodes
+                if node.get("visible") and node.get("provenance_bound")}),
+        }
     artifact["content_hash"] = academic_evidence.stable_hash(
         {k: v for k, v in artifact.items() if k != "content_hash"})
     return artifact
@@ -1651,7 +2076,8 @@ def normalize_report_quotes(
     def repl(match: re.Match) -> str:
         kind, case_id, _ = match.groups()
         if kind in {"SOURCE", "INITIAL", "TARGET"}:
-            segment = segs.get(case_id)
+            selected_case = selected.get(case_id) or {}
+            segment = segs.get(str(selected_case.get("source_segment_id") or case_id))
             if not segment:
                 return match.group(0)
             exact = segment[{"SOURCE": "source", "INITIAL": "initial_target",
@@ -1751,6 +2177,170 @@ def _ensure_case_group_headings(
     return report_md[:section_match.end()] + body + report_md[body_end:]
 
 
+_VISIBLE_EXAMPLE = re.compile(
+    r"^(?P<label>[ \t]*(?:[-*][ \t]*)?\*{1,2}例\[\d+\][^\n]*?\*{0,2})[ \t]*$",
+    re.MULTILINE)
+_VISIBLE_CASE_QUOTE = re.compile(
+    r"^(?P<indent>\s*)[-*]\s+\*{1,2}(?P<label>SOURCE|INITIAL|TARGET|"
+    r"原文|源语(?:（SOURCE）|\s*\(SOURCE\))?|初译|终译|改译|译文(?:（TARGET）|"
+    r"\s*\(TARGET\))?)\*{1,2}\s*[：:]\s*(?P<value>.+?)\s*$",
+    re.MULTILINE | re.IGNORECASE)
+
+
+def _quote_fragments(value: Any) -> List[str]:
+    text = str(value or "").strip().strip('“”"')
+    fragments = []
+    for excerpt in re.split(r"(?:\.{3,}|…+)", text):
+        fragments.extend(re.split(
+            r"[\"”']\s*(?:以及|及|和)\s*[\"“']", excerpt))
+    return [fragment.strip().strip('“”"') for fragment in fragments
+            if len(fragment.strip().strip('“”"')) >= 8]
+
+
+def _source_match_score(quoted: str, source: str) -> int:
+    fragments = _quote_fragments(quoted)
+    if not fragments:
+        return 0
+    def match_norm(value: str) -> str:
+        value = str(value or "").casefold()
+        value = re.sub(r"(?<=[a-z])-\s*(?=[a-z])", "", value)
+        value = value.replace("’", "'").replace("‘", "'")
+        value = value.replace("“", '"').replace("”", '"')
+        return re.sub(r"[^a-z0-9\u3400-\u9fff]+", " ", value).strip()
+
+    source_norm = match_norm(source)
+    score = 0
+    for fragment in fragments:
+        fragment_norm = match_norm(fragment)
+        if fragment_norm not in source_norm:
+            return 0
+        score += len(fragment_norm)
+    return score
+
+
+def _realize_visible_case_examples(
+    report_md: str, evidence: Dict[str, Any], selected_cases: Dict[str, Any],
+    case_analysis_plans: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Bind, number and materialize visible examples as canonical case nodes."""
+    matches = list(_VISIBLE_EXAMPLE.finditer(report_md))
+    if not matches:
+        return report_md, []
+    segments = academic_evidence.segment_index(evidence)
+    selected_by_id = {str(x.get("case_id")): x
+                      for x in selected_cases.get("cases") or []}
+    plan_by_id = case_analysis.plan_index(case_analysis_plans or {})
+    candidates = []
+    for case_id, case in selected_by_id.items():
+        if case.get("case_type") == "synthetic_contrast":
+            continue
+        segment_id = str(case.get("source_segment_id") or case_id)
+        segment = segments.get(segment_id) or {}
+        if case_id and segment.get("source"):
+            candidates.append((case_id, segment))
+    chunks = []
+    nodes = []
+    cursor = 0
+    for index, match in enumerate(matches):
+        next_example = matches[index + 1].start() \
+            if index + 1 < len(matches) else len(report_md)
+        next_heading = re.search(r"^#{3,6}\s+", report_md[match.end():], re.MULTILINE)
+        heading_end = match.end() + next_heading.start() if next_heading else len(report_md)
+        end = min(next_example, heading_end)
+        block = report_md[match.start():end]
+        block = re.sub(r"例\[\d+\]", f"例[{index + 1}]", block, count=1)
+        explicit = [case_id for case_id in re.findall(
+            r"<!--case:([A-Za-z0-9_.:-]+)-->", block) if case_id in selected_by_id]
+        case_id = explicit[0] if len(set(explicit)) == 1 else ""
+        segment = None
+        if case_id:
+            selected_case = selected_by_id[case_id]
+            segment = segments.get(str(selected_case.get("source_segment_id") or case_id))
+        if not segment:
+            source_line = next((item for item in _VISIBLE_CASE_QUOTE.finditer(block)
+                                if str(item.group("label")).upper() in {
+                                    "SOURCE", "原文", "源语（SOURCE）", "源语(SOURCE)"}), None)
+            scored = sorted((
+                (_source_match_score(source_line.group("value"), item.get("source")),
+                 candidate_id, item)
+                for candidate_id, item in candidates), reverse=True) if source_line else []
+            if scored and scored[0][0] > 0 and not (
+                    len(scored) > 1 and scored[0][0] == scored[1][0]):
+                _score, case_id, segment = scored[0]
+        if not case_id or not segment:
+            chunks.append(report_md[cursor:match.start()])
+            chunks.append(block)
+            cursor = end
+            continue
+        selected_case = selected_by_id[case_id]
+        case_type = str(selected_case.get("case_type") or "authentic_revision")
+
+        def replace_quote(item: re.Match) -> str:
+            label = str(item.group("label") or "").upper()
+            if label in {"SOURCE", "原文", "源语（SOURCE）", "源语(SOURCE)"}:
+                kind, value = "SOURCE", segment.get("source")
+            elif label in {"INITIAL", "初译"}:
+                kind, value = "INITIAL", segment.get("initial_target")
+            else:
+                kind, value = "TARGET", segment.get("final_target")
+            return f"> [{kind} {case_id}]: {value}" if value else item.group(0)
+
+        block = _VISIBLE_CASE_QUOTE.sub(replace_quote, block)
+        if case_type == "translation_decision":
+            block = re.sub(r"TARGET（初译与终译一致）", "译文", block)
+            block = re.sub(r"该案例初译与终译一致", "该案例的已保存译文未发生变更", block)
+        block = re.sub(
+            r"例\[(\d+)\]\s*（(?:真实修订案例|翻译决策案例|合成对比案例)）\s*[：:]?",
+            r"例[\1]：", block, count=1)
+        block = re.sub(r"<!--case:[A-Za-z0-9_.:-]+-->\s*", "", block)
+        marker_at = block.find("\n")
+        block = (block + f"\n<!--case:{case_id}-->") if marker_at < 0 else (
+            block[:marker_at + 1] + f"<!--case:{case_id}-->\n" + block[marker_at + 1:])
+        heading_ids = re.findall(
+            r"^#{3,6}\s+(\d+(?:\.\d+)*)\b", report_md[:match.start()], re.MULTILINE)
+        actual_subsection = heading_ids[-1] if heading_ids else ""
+        assignment = _case_assignment_for_plan(case_id, plan_by_id.get(case_id) or {})
+        analysis = _VISIBLE_CASE_QUOTE.sub("", block)
+        analysis = re.sub(r"<!--case:[^>]+-->", "", analysis)
+        analysis = re.sub(r"^.*?例\[\d+\].*?$", "", analysis, count=1,
+                          flags=re.MULTILINE).strip()
+        nodes.append({
+            "type": "case_example",
+            "case_id": case_id,
+            "case_type": case_type,
+            "chapter_id": actual_subsection.split(".", 1)[0] if actual_subsection else "3",
+            "subsection_id": actual_subsection or assignment["target_subsection"],
+            "example_number": index + 1,
+            "source": segment.get("source"),
+            "initial_target": segment.get("initial_target")
+            if case_type == "authentic_revision" else None,
+            "target": segment.get("final_target"),
+            "analysis": analysis,
+            "content": block.strip(),
+            **assignment,
+            "visible": True,
+            "provenance_bound": True,
+            "provenance": {
+                "case_id": case_id,
+                "source_segment_id": str(
+                    selected_case.get("source_segment_id") or case_id),
+                **dict(selected_case.get("provenance") or {}),
+            },
+        })
+        chunks.append(report_md[cursor:match.start()])
+        chunks.append(block)
+        cursor = end
+    chunks.append(report_md[cursor:])
+    return "".join(chunks), nodes
+
+
+def _normalize_visible_case_examples(
+    report_md: str, evidence: Dict[str, Any], selected_cases: Dict[str, Any],
+) -> str:
+    """Backward-compatible string surface for case realization."""
+    return _realize_visible_case_examples(report_md, evidence, selected_cases)[0]
+
+
 def finalize_report_tokens(
     report_md: str, evidence: Dict[str, Any],
     selected_cases: Optional[Dict[str, Any]] = None,
@@ -1765,8 +2355,12 @@ def finalize_report_tokens(
     authority during drafting.
     """
     normalized = normalize_report_quotes(report_md, evidence, selected_cases)
+    normalized = _normalize_visible_case_examples(
+        normalized, evidence, selected_cases or {})
+    normalized = normalize_report_quotes(normalized, evidence, selected_cases)
     normalized = _ensure_case_group_headings(normalized, selected_cases, outline)
-    return _expand_report_stat_tokens(normalized, evidence, selected_cases, outline)
+    normalized = _expand_report_stat_tokens(normalized, evidence, selected_cases, outline)
+    return re.sub(r"基于\s*基于", "基于", normalized)
 
 
 def _semantic_review(
@@ -1800,8 +2394,13 @@ def _semantic_review(
             for x in selected_cases.get("cases", [])],
         "report": report_md,
     }
-    raw = _call_json(call_llm, provider, api_key, model, system,
-                     json.dumps(payload, ensure_ascii=False))
+    try:
+        raw = _call_json(call_llm, provider, api_key, model, system,
+                         json.dumps(payload, ensure_ascii=False))
+    except Exception as exc:
+        if not _is_transient_llm_error(exc):
+            raise
+        raw = None
     valid_sections = {str(x["section_id"]) for x in outline.get("sections", [])}
     valid_claims = {str(x["claim_id"]) for x in argument_plan.get("claims", [])}
     valid_evidence = {str(x["case_id"]) for x in selected_cases.get("cases", [])}
@@ -1926,8 +2525,13 @@ def _literature_support_review(
         "outline": outline,
         "report": report_md,
     }
-    raw = _call_json(call_llm, provider, api_key, model, system,
-                     json.dumps(payload, ensure_ascii=False))
+    try:
+        raw = _call_json(call_llm, provider, api_key, model, system,
+                         json.dumps(payload, ensure_ascii=False))
+    except Exception as exc:
+        if not _is_transient_llm_error(exc):
+            raise
+        raw = None
     issues = []
     if raw is None:
         issues.append({
@@ -2275,7 +2879,7 @@ def run_academic_pipeline(
         save_state(state)
 
     try:
-        stage("evidence", "【学术写作 1/10】构建全语料项目证据库...")
+        stage("evidence", "【学术写作 1/11】构建全语料项目证据库...")
         evidence_new = academic_evidence.build_academic_evidence(
             state, job_id)
         evidence_dep = academic_evidence.stable_hash({
@@ -2383,7 +2987,7 @@ def run_academic_pipeline(
                 state, artifact_dir, "synthetic_validation", synthetic_validation,
                 synthetic_validation_dep, VERSIONS["synthetic_validation_version"])
 
-        stage("literature_evidence", "【学术写作 2/10】固化文献来源与逐字证据...")
+        stage("literature_evidence", "【学术写作 2/11】固化文献来源与逐字证据...")
         literature_sources_new = literature_evidence.build_literature_sources(literature)
         literature_sources_dep = academic_evidence.stable_hash({
             "source_snapshot": literature_sources_new["content_hash"],
@@ -2411,7 +3015,7 @@ def run_academic_pipeline(
                 state, artifact_dir, "literature_evidence", literature_evidence_new,
                 literature_evidence_dep, VERSIONS["literature_evidence_version"])
 
-        stage("research_model", "【学术写作 3/10】建立研究问题与理论框架...")
+        stage("research_model", "【学术写作 3/11】建立研究问题与理论框架...")
         model_new = build_research_model(evidence, theory, settings)
         research_dep = academic_evidence.stable_hash({
             "settings": model_new["content_hash"], "evidence_profile":
@@ -2426,7 +3030,7 @@ def run_academic_pipeline(
                 state, artifact_dir, "research_model", model_new, research_dep,
                 VERSIONS["research_model_version"])
 
-        stage("literature_claims", "【学术写作 4/10】从文献证据抽取受限主张...")
+        stage("literature_claims", "【学术写作 4/11】从文献证据抽取受限主张...")
         literature_claims_dep = academic_evidence.stable_hash({
             "evidence": literature_evidence_artifact["content_hash"],
             "version": VERSIONS["literature_claims_version"],
@@ -2442,7 +3046,7 @@ def run_academic_pipeline(
                 state, artifact_dir, "literature_claims", literature_claims_new,
                 literature_claims_dep, VERSIONS["literature_claims_version"])
 
-        stage("argument_plan", "【学术写作 5/10】规划研究论点与证据关系...")
+        stage("argument_plan", "【学术写作 5/11】规划研究论点与证据关系...")
         argument_dep = academic_evidence.stable_hash({
             "evidence": evidence["content_hash"], "research": research_model["content_hash"],
             "literature_source_policy": literature_sources_artifact[
@@ -2464,11 +3068,17 @@ def run_academic_pipeline(
                 state, artifact_dir, "argument_plan", argument_plan, argument_dep,
                 VERSIONS["argument_plan_version"])
 
+        template_case_minimum = int((
+            ((research_model.get("template_contract") or {}).get(
+                "document_structure") or {}).get("case_requirement") or {}
+        ).get("minimum_cases") or 0)
+        effective_case_limit = max(
+            1, int(settings.get("case_limit") or 5), template_case_minimum)
         case_dep = academic_evidence.stable_hash({
             "argument": argument_plan["content_hash"], "evidence": evidence["content_hash"],
             "synthetic": synthetic_validation["content_hash"],
             "policy": synthetic_policy,
-            "limit": int(settings.get("case_limit") or 5),
+            "limit": effective_case_limit,
             "version": VERSIONS["case_selection_version"],
         })
         selected_cases = _load_valid_artifact(
@@ -2477,7 +3087,7 @@ def run_academic_pipeline(
         if selected_cases is None:
             selected_cases = select_academic_cases(
                 research_model, argument_plan, evidence,
-                limit=max(1, int(settings.get("case_limit") or 5)),
+                limit=effective_case_limit,
                 synthetic_artifact=synthetic_validation, policy=synthetic_policy,
                 preferred_authentic_count=max(1, int(settings.get(
                     "preferred_authentic_case_count") or 3)),
@@ -2487,7 +3097,7 @@ def run_academic_pipeline(
                 state, artifact_dir, "selected_cases", selected_cases, case_dep,
                 VERSIONS["case_selection_version"])
 
-        stage("case_analysis", "【学术写作 6/11】规划案例分析证据契约...")
+        stage("case_analysis", "【学术写作】规划案例分析证据契约（提纲子步骤）...")
         human_evidence_artifact = {
             "schema_version": VERSIONS["human_evidence_version"],
             "items": human_entries,
@@ -2518,7 +3128,7 @@ def run_academic_pipeline(
                 state, artifact_dir, "case_analysis_plans", case_plans,
                 case_analysis_dep, VERSIONS["case_analysis_version"])
 
-        stage("outline", "【学术写作 6/10】生成证据约束型学术提纲...")
+        stage("outline", "【学术写作 6/11】生成证据约束型学术提纲...")
         outline_dep = academic_evidence.stable_hash({
             "research": research_model["content_hash"],
             "report_constraints": academic_evidence.stable_hash(
@@ -2540,7 +3150,7 @@ def run_academic_pipeline(
             outline = _save_artifact(state, artifact_dir, "outline", outline, outline_dep,
                                      VERSIONS["outline_version"])
 
-        stage("writing", "【学术写作 7/10】按论点与分节证据撰写正文...")
+        stage("writing", "【学术写作 7/11】按论点与分节证据撰写正文...")
         sections_dep = academic_evidence.stable_hash({
             "outline": outline["content_hash"], "evidence": evidence["content_hash"],
             "literature_sources": literature_sources_artifact["sources_metadata_hash"],
@@ -2571,6 +3181,8 @@ def run_academic_pipeline(
                                          literature_sources_artifact,
                                          literature_evidence_artifact,
                                          literature_claims_artifact, case_plans)
+                if on_status:
+                    on_status(f"【学术写作 7/11】正在生成第 {sid} 节...")
                 content = _write_section(packet, call_llm, provider, api_key, model)
                 item = {
                     "section_id": sid, "title": plan["title"], "content": content,
@@ -2578,6 +3190,12 @@ def run_academic_pipeline(
                     "dependency_hash": section_key,
                     "provenance": _packet_provenance(packet),
                 }
+            normalized_content = _ensure_section_contract(
+                str(item.get("content") or ""), plan)
+            if normalized_content != item.get("content"):
+                item = {**item, "content": normalized_content,
+                        "summary": re.sub(
+                            r"<!--.*?-->", "", normalized_content)[:240]}
             written.append(item)
             prior_summaries.append({"section_id": sid, "summary": item["summary"]})
             partial = {"schema_version": VERSIONS["writer_version"], "sections": written}
@@ -2589,10 +3207,14 @@ def run_academic_pipeline(
         academic["forced_sections"] = []
         report_md = _compose_report(written)
         report_md = finalize_report_tokens(report_md, evidence, selected_cases, outline)
+        matter = build_report_matter(
+            research_model, evidence, selected_cases,
+            research_model.get("template_contract"), literature_sources_artifact)
         report_artifact = build_report_artifact(
-            report_md, written, outline, research_model.get("report_constraints") or {})
+            report_md, written, outline, research_model.get("report_constraints") or {},
+            matter, selected_cases, evidence, case_plans)
 
-        stage("validation", "【学术写作 8/10】执行确定性证据与结构验证...")
+        stage("validation", "【学术写作 8/11】执行确定性证据与结构验证...")
         validation = academic_validator.validate_academic_report(
             report_md, evidence, research_model, argument_plan, selected_cases, outline,
             literature_sources_artifact, literature_evidence_artifact,
@@ -2600,15 +3222,55 @@ def run_academic_pipeline(
             report_artifact.get("template_contract"), report_artifact)
         validation = _locate_validation_issues(validation, written)
         validation_runs.append(validation)
+        validation_dep = academic_evidence.stable_hash({
+            "report": academic_evidence.stable_hash(report_md),
+            "evidence": evidence["content_hash"],
+            "validator": VERSIONS["validator_version"],
+            "synthetic": synthetic_validation["content_hash"],
+            "literature_sources": literature_sources_artifact["content_hash"],
+            "literature_evidence": literature_evidence_artifact["content_hash"],
+            "literature_claims": literature_claims_artifact["content_hash"],
+        })
+        validation_checkpoint = {**validation, "runs": validation_runs[-2:]}
+        validation_checkpoint["content_hash"] = academic_evidence.stable_hash(
+            {k: v for k, v in validation_checkpoint.items() if k != "content_hash"})
+        _save_artifact(state, artifact_dir, "validation", validation_checkpoint,
+                       validation_dep, VERSIONS["validator_version"])
 
-        stage("review", "【学术写作 9/10】执行独立语义与文献支持审稿...")
-        review = _semantic_review(
-            report_md, research_model, argument_plan, outline, selected_cases,
-            call_llm, provider, api_key, model)
-        literature_support_review = _literature_support_review(
-            report_md, argument_plan, outline, literature_sources_artifact,
-            literature_evidence_artifact, literature_claims_artifact,
-            call_llm, provider, api_key, model)
+        stage("review", "【学术写作 9/11】执行独立语义与文献支持审稿...")
+        review_dep = academic_evidence.stable_hash({
+            "report": academic_evidence.stable_hash(report_md),
+            "argument": argument_plan["content_hash"],
+            "reviewer": VERSIONS["reviewer_version"],
+        })
+        review = _load_valid_artifact(
+            state, artifact_dir, "review", review_dep, VERSIONS["reviewer_version"])
+        if review is None:
+            review = _semantic_review(
+                report_md, research_model, argument_plan, outline, selected_cases,
+                call_llm, provider, api_key, model)
+            _save_artifact(state, artifact_dir, "review", review, review_dep,
+                           VERSIONS["reviewer_version"])
+        literature_review_dep = academic_evidence.stable_hash({
+            "report": academic_evidence.stable_hash(report_md),
+            "argument": argument_plan["content_hash"],
+            "literature_sources": literature_sources_artifact["content_hash"],
+            "literature_evidence": literature_evidence_artifact["content_hash"],
+            "literature_claims": literature_claims_artifact["content_hash"],
+            "reviewer": VERSIONS["literature_reviewer_version"],
+        })
+        literature_support_review = _load_valid_artifact(
+            state, artifact_dir, "literature_support_review", literature_review_dep,
+            VERSIONS["literature_reviewer_version"])
+        if literature_support_review is None:
+            literature_support_review = _literature_support_review(
+                report_md, argument_plan, outline, literature_sources_artifact,
+                literature_evidence_artifact, literature_claims_artifact,
+                call_llm, provider, api_key, model)
+            _save_artifact(
+                state, artifact_dir, "literature_support_review",
+                literature_support_review, literature_review_dep,
+                VERSIONS["literature_reviewer_version"])
 
         repair_history = {"schema_version": "academic-repair-v1", "rounds": []}
         if auto_repair_rounds > 0:
@@ -2620,10 +3282,12 @@ def run_academic_pipeline(
             affected = sorted({str(x.get("section_id")) for x in repair_issues
                                if x.get("section_id")})
             if affected:
-                stage("repair", "【学术写作 10/10】定点修订受影响章节并重新验证...")
+                stage("repair", "【学术写作 10/11】定点修订受影响章节并重新验证...")
                 by_id = {x["section_id"]: x for x in written}
                 plan_by_id = {x["section_id"]: x for x in outline.get("sections", [])}
                 for sid in affected:
+                    if on_status:
+                        on_status(f"【学术写作 10/11】正在修复第 {sid} 节...")
                     packet = _section_packet(plan_by_id[sid], research_model, argument_plan,
                                              selected_cases, evidence, outline,
                                              prior_summaries,
@@ -2632,9 +3296,42 @@ def run_academic_pipeline(
                                              literature_claims_artifact, case_plans)
                     issues = [x for x in repair_issues if str(x.get("section_id")) == sid]
                     old_content = by_id[sid]["content"]
-                    new_content = _write_section(
-                        packet, call_llm, provider, api_key, model,
-                        repair_issues=issues, existing=old_content)
+                    try:
+                        missing_case_ids = sorted({
+                            str(case_id) for issue in issues
+                            if issue.get("type") == "case_presentation_count_mismatch"
+                            for case_id in issue.get("missing_case_ids") or []})
+                        available_cases = {str(item.get("case_id"))
+                                           for item in packet.get("cases") or []}
+                        available_analyses = {str(item.get("case_id"))
+                                             for item in packet.get("case_analyses") or []}
+                        available_assignments = {str(item.get("case_id"))
+                                                 for item in packet.get(
+                                                     "case_assignments") or []}
+                        targeted_ready = set(missing_case_ids) <= (
+                            available_cases & available_analyses & available_assignments)
+                        case_only = missing_case_ids and all(
+                            issue.get("type") in {
+                                "case_presentation_count_mismatch", "missing_selected_case"}
+                            for issue in issues) and targeted_ready
+                        if case_only:
+                            new_content = _repair_missing_case_examples(
+                                old_content, packet, missing_case_ids,
+                                call_llm, provider, api_key, model)
+                        else:
+                            new_content = _write_section(
+                                packet, call_llm, provider, api_key, model,
+                                repair_issues=issues, existing=old_content)
+                    except Exception as exc:
+                        if not _is_transient_llm_error(exc):
+                            raise
+                        repair_history["rounds"].append({
+                            "round": 1, "section_id": sid,
+                            "issue_ids": [x.get("issue_id") for x in issues],
+                            "status": "deferred_external_error",
+                            "reason": str(exc)[:240], "repaired_at": _now(),
+                        })
+                        continue
                     by_id[sid]["content"] = new_content
                     by_id[sid]["summary"] = re.sub(r"<!--.*?-->", "", new_content)[:240]
                     by_id[sid]["provenance"] = _packet_provenance(packet)
@@ -2665,7 +3362,10 @@ def run_academic_pipeline(
                 report_md = finalize_report_tokens(report_md, evidence, selected_cases, outline)
                 report_artifact = build_report_artifact(
                     report_md, written, outline,
-                    research_model.get("report_constraints") or {})
+                    research_model.get("report_constraints") or {}, matter,
+                    selected_cases, evidence, case_plans)
+                if on_status:
+                    on_status("【学术写作 10/11】重新验证修订章节…")
                 validation = academic_validator.validate_academic_report(
                     report_md, evidence, research_model, argument_plan, selected_cases, outline,
                     literature_sources_artifact, literature_evidence_artifact,
@@ -2673,6 +3373,8 @@ def run_academic_pipeline(
                     report_artifact.get("template_contract"), report_artifact)
                 validation = _locate_validation_issues(validation, written)
                 validation_runs.append(validation)
+                if on_status:
+                    on_status("【学术写作 10/11】重新执行学术复核…")
                 review = _semantic_review(
                     report_md, research_model, argument_plan, outline, selected_cases,
                     call_llm, provider, api_key, model)
@@ -2767,7 +3469,8 @@ def run_academic_pipeline(
         # gate on the final report before recording completion.
         report_artifact = build_report_artifact(
             report_md, written, outline,
-            research_model.get("report_constraints") or {})
+            research_model.get("report_constraints") or {}, matter,
+            selected_cases, evidence, case_plans)
         validation = academic_validator.validate_academic_report(
             report_md, evidence, research_model, argument_plan, selected_cases, outline,
             literature_sources_artifact, literature_evidence_artifact,
@@ -2874,6 +3577,33 @@ def run_academic_pipeline(
             aq_status = "pass_with_warnings"
         if critical_open:
             aq_status = "review_required"
+        template_status = (validation.get("template_compliance") or {}).get(
+            "status", "not_configured")
+        if template_status == "fail":
+            report_status = "failed_template_validation"
+        elif validation.get("status") == "fail" or quality == "fail" \
+                or aq_status == "fail":
+            report_status = "incomplete"
+        elif quality == "review_required" or aq_status == "review_required" \
+                or template_status == "review_required" or critical_open:
+            report_status = "review_required"
+        else:
+            report_status = "generated"
+        report_artifact.update(
+            report_status=report_status,
+            template_compliance=template_status,
+            validation_status=validation.get("status", "fail"),
+            quality_status=quality,
+        )
+        report_artifact["content_hash"] = academic_evidence.stable_hash(
+            {k: v for k, v in report_artifact.items() if k != "content_hash"})
+        report_dep = academic_evidence.stable_hash({
+            "report": report_artifact["content_hash"],
+            "template": report_artifact.get("template_hash"),
+            "version": VERSIONS["report_artifact_version"],
+        })
+        _save_artifact(state, artifact_dir, "report", report_artifact,
+                       report_dep, VERSIONS["report_artifact_version"])
         warning_md = academic_validator.render_warnings_markdown(
             validation, review, literature_support_review, evidence, quality_dimensions)
         (artifact_dir / "academic-evidence-warnings.md").write_text(
@@ -2881,6 +3611,7 @@ def run_academic_pipeline(
         state["p3_md"] = report_md
         state["p3_sections"] = [[x["title"], x["content"]] for x in written]
         state["p3_done"] = True
+        state["report_status"] = report_status
         state["theory"] = theory
         completion_stage = {
             "fail": "validation_failed",
@@ -2890,6 +3621,7 @@ def run_academic_pipeline(
             status=quality, quality_status=quality, current_stage=completion_stage,
             quality_dimensions=quality_dimensions,
             academic_quality_status=aq_status,
+            report_status=report_status,
             last_error="", updated_at=_now(),
             warnings_file="academic-evidence-warnings.md",
             quality_report_file="academic-quality-report.md",

@@ -5,11 +5,16 @@
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import threading
 import time
-from datetime import datetime, timezone
+import traceback
+import uuid
+import zipfile
+from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -32,6 +37,37 @@ from transpraxis import snapshots as _snapshots
 # ================= 常量 =================
 # 任务进度与过程文件的本地存储目录（已加入 .gitignore）
 OUTPUT_DIR = Path("outputs")
+
+DELIVERY_CONFIG_DEFAULTS = {
+    "enable_annotate": False,
+    "enable_report": False,
+    "deliver_plain_docx": True,
+    "deliver_bilingual_docx": True,
+    "deliver_pdf": False,
+    "deliver_terms_xlsx": True,
+    "deliver_tbx": False,
+    "deliver_tmx": False,
+    "deliver_jsonl": False,
+    "deliver_evidence": True,
+    "deliver_cases": False,
+    "deliver_academic_workspace": False,
+    "deliver_review_report": False,
+}
+
+
+def default_delivery_config():
+    return dict(DELIVERY_CONFIG_DEFAULTS)
+
+
+def normalize_delivery_config(config, *, enable_report=None, enable_annotate=None):
+    normalized = default_delivery_config()
+    if isinstance(config, dict):
+        normalized.update({key: bool(config[key]) for key in normalized if key in config})
+    if enable_report is not None:
+        normalized["enable_report"] = bool(enable_report)
+    if enable_annotate is not None:
+        normalized["enable_annotate"] = bool(enable_annotate)
+    return normalized
 
 # 提供商注册表：kind=openai_compat 走 OpenAI SDK 兼容接口（官方与中转站通用）。
 # base_url 为 None 表示使用官方 SDK 默认路由；custom_base_url 表示地址由用户在
@@ -112,6 +148,14 @@ MODELS = {name: cfg["models"] for name, cfg in PROVIDERS.items()}
 # 每个 Streamlit 会话线程独立，多设备同时使用不会互相串扰。
 _LLM_CTX = threading.local()
 
+# Runtime status is deliberately file-backed: the UI can poll it while the
+# worker is inside a blocking provider request, and a browser refresh does not
+# erase the last known activity.
+_RUNTIME_CTX = threading.local()
+_RUNTIME_LOCK = threading.RLock()
+_RUNTIME_WORKERS = {}
+_RUNTIME_WORKERS_LOCK = threading.RLock()
+
 
 def normalize_openai_base_url(base_url):
     """接受基址或误填的 OpenAI 兼容具体端点，并统一回基址。"""
@@ -125,6 +169,14 @@ def normalize_openai_base_url(base_url):
 def set_llm_base_url(base_url):
     """为当前线程设置 OpenAI 兼容中转站地址（空值清除）。"""
     _LLM_CTX.base_url = normalize_openai_base_url(base_url) or None
+
+
+def _runtime_job_id():
+    return getattr(_RUNTIME_CTX, "job_id", None)
+
+
+def _runtime_cancel_requested(job_id):
+    return bool((load_runtime_state(job_id) or {}).get("cancel_requested"))
 
 
 # ================= 基础工具函数 =================
@@ -419,6 +471,14 @@ def call_llm(provider, api_key, model, system_prompt, user_prompt,
     cfg = PROVIDERS.get(provider)
     if not cfg:
         return ""
+    runtime_job_id = _runtime_job_id()
+    if runtime_job_id:
+        if _runtime_cancel_requested(runtime_job_id):
+            raise RuntimeError("任务已请求取消")
+        update_runtime_state(
+            runtime_job_id, status="waiting_external", phase="waiting_llm",
+            phase_label="等待模型响应", event="已向模型发送请求",
+            event_name="llm_request_started")
     if cfg["kind"] == "gemini":
         try:
             client = genai.Client(api_key=api_key,
@@ -431,7 +491,14 @@ def call_llm(provider, api_key, model, system_prompt, user_prompt,
             system_instruction=system_prompt,
             config=genai.types.GenerateContentConfig(temperature=temperature),
         )
-        return (res.text or "").strip()
+        result = (res.text or "").strip()
+        if runtime_job_id:
+            update_runtime_state(runtime_job_id, status="running", phase="running",
+                                 phase_label="处理模型结果", event="已收到模型响应",
+                                 event_name="llm_response_received")
+            if _runtime_cancel_requested(runtime_job_id):
+                raise RuntimeError("任务已请求取消")
+        return result
 
     # OpenAI 官方与所有 OpenAI 兼容接口共用 SDK 路由
     kwargs = {"api_key": api_key, "timeout": (15.0, 180.0), "max_retries": 1}
@@ -453,7 +520,14 @@ def call_llm(provider, api_key, model, system_prompt, user_prompt,
                       {"role": "user", "content": user_prompt}],
             temperature=temperature,
         )
-        return (res.choices[0].message.content or "").strip()
+        result = (res.choices[0].message.content or "").strip()
+        if runtime_job_id:
+            update_runtime_state(runtime_job_id, status="running", phase="running",
+                                 phase_label="处理模型结果", event="已收到模型响应",
+                                 event_name="llm_response_received")
+            if _runtime_cancel_requested(runtime_job_id):
+                raise RuntimeError("任务已请求取消")
+        return result
     finally:
         if http_client:
             http_client.close()
@@ -2011,6 +2085,71 @@ def paragraphs_to_word(paragraphs):
     return out
 
 
+def translations_to_word(pairs):
+    doc = Document()
+    _apply_doc_fonts(doc)
+    doc.add_heading("译文", 0)
+    for pair in pairs or []:
+        doc.add_paragraph(str(pair.get("target") or ""))
+    out = io.BytesIO()
+    doc.save(out)
+    out.seek(0)
+    return out
+
+
+def translations_to_pdf(pairs):
+    """Render a paginated, Unicode-aware translation PDF with PyMuPDF Story."""
+    paragraphs = "".join(
+        '<table class="entry"><tr><td dir="auto">'
+        f'{html_escape(str(pair.get("target") or ""))}</td></tr></table>'
+        for pair in pairs or [])
+    html = f'<article><h1>译文</h1>{paragraphs}</article>'
+    css = (
+        "@page { size: A4; } "
+        "body { font-family: sans-serif; font-size: 11pt; line-height: 1.65; "
+        "color: #1f2937; } h1 { font-size: 20pt; margin: 0 0 20pt; "
+        "color: #111827; } table.entry { width: 100%; border-collapse: collapse; "
+        "margin: 0 0 10pt; break-inside: avoid; page-break-inside: avoid; } "
+        "td { padding: 0; text-align: start; unicode-bidi: plaintext; }"
+    )
+    story = fitz.Story(html=html, user_css=css, em=11)
+    page_rect = fitz.paper_rect("a4")
+    content_rect = fitz.Rect(54, 54, page_rect.width - 54, page_rect.height - 54)
+
+    def rectfn(_rect_num, _filled):
+        return page_rect, content_rect, None
+
+    pdf = story.write_with_links(rectfn)
+    for number, page in enumerate(pdf, start=1):
+        page.insert_text(
+            (page_rect.width / 2 - 4, page_rect.height - 25), str(number),
+            fontsize=9, fontname="helv", color=(0.45, 0.48, 0.52))
+    data = pdf.tobytes(garbage=4, deflate=True)
+    pdf.close()
+    return data
+
+
+def glossary_to_excel(entries, fallback=None):
+    normalized = normalize_glossary(entries or [])
+    if normalized:
+        rows = [{
+            "Source": entry.get("source") or "",
+            "Target": entry.get("preferred") or entry.get("target") or "",
+            "Status": entry.get("status") or "",
+            "Domain": entry.get("domain") or "",
+            "Note": entry.get("note") or "",
+        } for entry in normalized]
+        frame = pd.DataFrame(rows)
+    else:
+        frame = pd.DataFrame(list((fallback or {}).items()),
+                             columns=["Source", "Target"])
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False)
+    output.seek(0)
+    return output
+
+
 def _find_span(text, needle):
     """宽容定位子串：统一引号/破折号/省略号、折叠空白后查找，返回 (start, end) 或 None。"""
     if not needle or not text:
@@ -2297,6 +2436,850 @@ def job_state_path(job_id):
     return job_dir(job_id) / "state.json"
 
 
+RUNTIME_SCHEMA_VERSION = "2"
+RUNTIME_STATE_FILE = "runtime_state.json"
+RUNTIME_EVENTS_FILE = "runtime_events.jsonl"
+RUNTIME_TECHNICAL_LOG = "runtime_technical.log"
+RUNTIME_HEARTBEAT_SECONDS = 5
+RUNTIME_LEASE_SECONDS = 60
+RUNTIME_STALL_SECONDS = 45
+RUNTIME_ACTIVE_STATUSES = {
+    "resume_requested", "queued", "starting", "running",
+    "waiting_external", "cancelling",
+}
+
+_RUNTIME_EVENT_META = {
+    "resume_requested": ("user", "lifecycle"),
+    "pipeline_resumed": ("user", "progress"),
+    "llm_request_started": ("user", "external_wait"),
+    "llm_response_received": ("user", "progress"),
+    "job_completed": ("user", "lifecycle"),
+    "job_failed": ("user", "error"),
+    "job_cancelled": ("user", "lifecycle"),
+    "cancel_requested": ("user", "lifecycle"),
+    "interrupted": ("user", "error"),
+    "stalled": ("user", "error"),
+    "retry_requested": ("user", "lifecycle"),
+    "job_queued": ("technical", "orchestration"),
+    "worker_started": ("technical", "orchestration"),
+    "worker_released": ("technical", "orchestration"),
+    "job_checkpointed": ("technical", "checkpoint"),
+    "checkpoint_saved": ("technical", "checkpoint"),
+    "state_flushed": ("technical", "checkpoint"),
+    "lease_acquired": ("technical", "orchestration"),
+    "lease_renewed": ("technical", "orchestration"),
+    "evidence": ("user", "progress"),
+    "literature_evidence": ("user", "progress"),
+    "research_model": ("user", "progress"),
+    "literature_claims": ("user", "progress"),
+    "argument_plan": ("user", "progress"),
+    "selected_cases": ("user", "progress"),
+    "outline": ("user", "progress"),
+    "sections": ("user", "progress"),
+    "validation": ("user", "progress"),
+    "review": ("user", "progress"),
+    "quality_repair": ("user", "progress"),
+    "academic_quality": ("user", "progress"),
+}
+
+
+def runtime_state_path(job_id):
+    return job_dir(job_id) / RUNTIME_STATE_FILE
+
+
+def runtime_events_path(job_id):
+    return job_dir(job_id) / RUNTIME_EVENTS_FILE
+
+
+def runtime_technical_log_path(job_id):
+    return job_dir(job_id) / RUNTIME_TECHNICAL_LOG
+
+
+def _utc_now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _runtime_defaults():
+    return {
+        "schema_version": RUNTIME_SCHEMA_VERSION,
+        "status": "idle",
+        "pipeline": "document_pipeline",
+        "stage": "",
+        "stage_id": "",
+        "stage_index": None,
+        "stage_total": None,
+        "operation": "",
+        "operation_id": "",
+        "operation_label": "",
+        "section_id": None,
+        "phase": "",
+        "phase_label": "",
+        "started_at": None,
+        "operation_started_at": None,
+        "last_heartbeat_at": None,
+        "last_progress_at": None,
+        "completed_units": 0,
+        "total_units": 0,
+        "overall_progress": None,
+        "last_event": "",
+        "events": [],
+        "last_technical_event": "",
+        "cancel_requested": False,
+        "attempt": 0,
+        "resume_request_id": None,
+        "error": None,
+        "worker": {
+            "owner_pid": None,
+            "worker_id": None,
+            "lease_expires_at": None,
+        },
+    }
+
+
+def load_runtime_state(job_id):
+    """Read the durable worker status without changing the workflow state."""
+    if not job_id:
+        return _runtime_defaults()
+    try:
+        raw = json.loads(runtime_state_path(job_id).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return _runtime_defaults()
+    if not isinstance(raw, dict):
+        return _runtime_defaults()
+    result = _runtime_defaults()
+    result.update(raw)
+    result["schema_version"] = RUNTIME_SCHEMA_VERSION
+    if result.get("status") == "cancel_requested":
+        result["status"] = "cancelling"
+    worker = result.get("worker")
+    result["worker"] = {**_runtime_defaults()["worker"], **worker} \
+        if isinstance(worker, dict) else dict(_runtime_defaults()["worker"])
+    result["events"] = [item for item in result.get("events") or []
+                         if isinstance(item, dict)
+                         and item.get("visibility") == "user"][-24:]
+    return result
+
+
+def _runtime_event_code(message):
+    value = re.sub(r"[^a-z0-9]+", "_", str(message or "").lower()).strip("_")
+    return value[:80] or "runtime_event"
+
+
+def _runtime_event_meta(event_name, visibility=None, category=None):
+    default_visibility, default_category = _RUNTIME_EVENT_META.get(
+        str(event_name or ""), ("technical", "debug"))
+    return visibility or default_visibility, category or default_category
+
+
+def _append_runtime_event(job_id, event, *, stage=None, operation=None, metadata=None,
+                          visibility=None, category=None):
+    event_name = event.get("event") if isinstance(event, dict) else _runtime_event_code(event)
+    visibility, category = _runtime_event_meta(event_name, visibility, category)
+    record = {
+        "timestamp": _utc_now_iso(),
+        "job_id": job_id,
+        "pipeline": event.get("pipeline") if isinstance(event, dict) else None,
+        "stage": stage or "",
+        "operation": operation or "",
+        "event": event_name,
+        "message": event.get("message") if isinstance(event, dict) else str(event),
+        "visibility": visibility,
+        "category": category,
+    }
+    if record["pipeline"] is None:
+        record["pipeline"] = "document_pipeline"
+    if metadata:
+        record["metadata"] = metadata
+    path = runtime_events_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return record
+
+
+def read_runtime_events(job_id, limit=None, *, visibility=None, category=None):
+    path = runtime_events_path(job_id)
+    if not path.is_file():
+        return []
+    events = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                value = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                event_visibility, event_category = _runtime_event_meta(
+                    value.get("event"), value.get("visibility"), value.get("category"))
+                normalized = {**value, "visibility": event_visibility,
+                              "category": event_category}
+                if visibility and event_visibility != visibility:
+                    continue
+                if category and event_category != category:
+                    continue
+                events.append(normalized)
+    except OSError:
+        return []
+    return events[-limit:] if limit else events
+
+
+def update_runtime_state(job_id, *, event=None, progress=False, heartbeat=False,
+                         event_name=None, event_metadata=None,
+                         event_visibility=None, event_category=None, **changes):
+    """Atomically merge a worker status update into runtime_state.json."""
+    if not job_id:
+        return _runtime_defaults()
+    now = _utc_now_iso()
+    with _RUNTIME_LOCK:
+        current = load_runtime_state(job_id)
+        current.update({key: value for key, value in changes.items()
+                        if value is not None})
+        if heartbeat:
+            current["last_heartbeat_at"] = now
+            worker = dict(current.get("worker") or {})
+            if worker.get("worker_id"):
+                worker["lease_expires_at"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=RUNTIME_LEASE_SECONDS)
+                ).isoformat(timespec="seconds")
+                current["worker"] = worker
+        if progress:
+            current["last_progress_at"] = now
+        if event:
+            message = str(event).strip()
+            if message:
+                event_name = event_name or _runtime_event_code(message)
+                visibility, category = _runtime_event_meta(
+                    event_name, event_visibility, event_category)
+                inline = {
+                    "at": now, "timestamp": now, "event": event_name,
+                    "message": message, "visibility": visibility,
+                    "category": category,
+                }
+                if event_metadata:
+                    inline["metadata"] = event_metadata
+                duplicate = visibility == "user" and bool(current.get("events")) \
+                    and current["events"][-1].get("event") == event_name \
+                    and current["events"][-1].get("message") == message \
+                    and current["events"][-1].get("metadata") == event_metadata
+                if visibility == "user":
+                    current["last_event"] = message
+                    if not duplicate:
+                        current["events"] = (current.get("events") or []) + [inline]
+                        current["events"] = current["events"][-24:]
+                else:
+                    current["last_technical_event"] = message
+                if not duplicate:
+                    _append_runtime_event(
+                        job_id,
+                        {"event": event_name, "message": message,
+                         "pipeline": current.get("pipeline")},
+                        stage=current.get("stage_id") or current.get("stage"),
+                        operation=current.get("operation_id") or current.get("operation"),
+                        metadata=event_metadata, visibility=visibility, category=category)
+        directory = job_dir(job_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        tmp = directory / f"{RUNTIME_STATE_FILE}.tmp"
+        tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        tmp.replace(runtime_state_path(job_id))
+        return current
+
+
+def _runtime_pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _runtime_parse_time(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _runtime_worker_registered(job_id, worker_id=None):
+    with _RUNTIME_WORKERS_LOCK:
+        worker = _RUNTIME_WORKERS.get(job_id)
+        return bool(worker and worker.is_alive() and (
+            worker_id is None or getattr(worker, "worker_id", None) == worker_id))
+
+
+def _runtime_business_complete(state):
+    return bool(state and state.get("p1_done") and state.get("p2_done") and (
+        state.get("p3_done") or not state.get("report_enabled", True)) and (
+        state.get("annotations_done") or not state.get("enable_annotate", True)))
+
+
+def _runtime_mark_lost(job_id, status, message):
+    return update_runtime_state(
+        job_id, status=status, phase=status, phase_label=message,
+        worker={"owner_pid": None, "worker_id": None, "lease_expires_at": None},
+        event=message, event_name=status)
+
+
+def get_job_runtime_status(job_id, state=None):
+    """Return the durable runtime status and reconcile dead local workers."""
+    state = state if isinstance(state, dict) else load_job_state(job_id)
+    runtime = load_runtime_state(job_id)
+    status = runtime.get("status") or "idle"
+    if status in RUNTIME_ACTIVE_STATUSES:
+        worker = runtime.get("worker") or {}
+        pid = worker.get("owner_pid")
+        worker_id = worker.get("worker_id")
+        lease = _runtime_parse_time(worker.get("lease_expires_at"))
+        heartbeat = _runtime_parse_time(runtime.get("last_heartbeat_at"))
+        last_progress = _runtime_parse_time(runtime.get("last_progress_at"))
+        now = datetime.now(timezone.utc)
+        registered = _runtime_worker_registered(job_id, worker_id)
+        transition_age = (now - last_progress).total_seconds() if last_progress else None
+        if status == "resume_requested" and not pid \
+                and transition_age is not None and transition_age <= RUNTIME_STALL_SECONDS:
+            return runtime
+        if not _runtime_pid_alive(pid):
+            return _runtime_mark_lost(job_id, "interrupted", "上次运行已中断")
+        if lease and lease < now or heartbeat and (
+                now - heartbeat).total_seconds() > RUNTIME_STALL_SECONDS:
+            if registered:
+                return _runtime_mark_lost(job_id, "stalled", "暂无新的运行信号")
+            return _runtime_mark_lost(job_id, "interrupted", "上次运行已中断")
+        if not registered and pid == os.getpid() \
+                and status in {"queued", "starting"} \
+                and transition_age is not None and transition_age <= RUNTIME_STALL_SECONDS:
+            return runtime
+        if not registered and pid == os.getpid():
+            return _runtime_mark_lost(job_id, "interrupted", "上次运行已中断")
+        return runtime
+    if status == "idle":
+        inferred = "completed" if _runtime_business_complete(state) else "idle_incomplete"
+        if inferred != status:
+            return update_runtime_state(job_id, status=inferred,
+                                        phase=inferred,
+                                        phase_label="已完成" if inferred == "completed"
+                                        else "尚未完成")
+    return runtime
+
+
+def build_job_runtime_view(job_id, state=None):
+    """Canonical user-facing runtime view shared by every product surface."""
+    state = state if isinstance(state, dict) else load_job_state(job_id)
+    runtime = get_job_runtime_status(job_id, state)
+    status = runtime.get("status") or "idle_incomplete"
+    if status == "idle" and not _runtime_business_complete(state):
+        status = "idle_incomplete"
+    if status == "idle_incomplete" and state and \
+            state.get("stage") == "TERMS_PREPARED" and state.get("quality_mode") \
+            and state.get("glossary") is not None and not state.get("glossary_frozen") \
+            and not state.get("quality_bypass"):
+        status = "waiting_manual"
+    labels = {
+        "resume_requested": "正在恢复任务", "queued": "正在恢复任务",
+        "starting": "正在恢复任务", "running": "正在运行",
+        "waiting_external": "正在运行",
+        "stalled": "暂无运行信号", "interrupted": "上次运行已中断",
+        "failed": "当前步骤失败", "cancelling": "正在取消", "cancelled": "任务已取消",
+        "completed": "已完成", "idle_incomplete": "未完成",
+        "waiting_manual": "待术语确认",
+    }
+    actions = {
+        "resume_requested": ["details"], "queued": ["cancel", "details"],
+        "starting": ["cancel", "details"],
+        "running": ["cancel", "details"],
+        "waiting_external": ["cancel", "details"],
+        "stalled": ["retry", "cancel", "details"],
+        "interrupted": ["resume", "retry", "details"],
+        "failed": ["retry", "resume", "details"],
+        "cancelling": ["details"], "cancelled": ["resume", "details"],
+        "idle_incomplete": ["resume"], "waiting_manual": ["view"],
+        "completed": ["view"],
+    }
+    events = read_runtime_events(job_id, 5, visibility="user") \
+        or runtime.get("events") or []
+    completed, total = int(runtime.get("completed_units") or 0), \
+        int(runtime.get("total_units") or 0)
+    academic_present = bool(state and ((state.get("academic_state") or {}).get("artifacts")
+                                       or (state.get("academic_state") or {}).get(
+                                           "current_stage") not in {None, "", "not_started"}))
+    if state and state.get("p2_done") and (
+            state.get("report_enabled", True) or academic_present):
+        completed, total = _academic_runtime_progress(job_id, state)
+    if status == "completed" and total:
+        completed = total
+    progress = (completed, total) if total else None
+    operation = runtime.get("operation_label") or ""
+    is_report = bool(state and state.get("p2_done") and (
+        state.get("report_enabled", True) or academic_present))
+    surface_label = "实践报告" if is_report else "任务处理"
+    if is_report and (not operation or operation in {"准备工作流", "准备任务", "继续处理"}):
+        operation = _academic_resume_context(state, runtime)["operation_label"]
+    if status in {"resume_requested", "queued", "starting"}:
+        detail = "正在读取最近检查点…"
+        if not operation or operation in {"准备工作流", "准备任务"}:
+            operation = "正在从最近检查点继续学术写作" if is_report \
+                else "正在从最近进度继续处理"
+    elif status == "waiting_external":
+        detail = "正在等待模型响应"
+    elif status == "running":
+        detail = runtime.get("phase_label") or "已恢复 · 正在执行"
+    elif status == "interrupted":
+        detail = "当前进度已安全保存，可以继续处理。"
+    elif status == "stalled":
+        detail = "暂时没有新的运行信号，可以重试当前步骤。"
+    elif status == "idle_incomplete":
+        detail = "当前进度已保存，可以继续处理。"
+    elif status == "failed":
+        error = runtime.get("error") or {}
+        detail = error.get("message") if isinstance(error, dict) else str(error)
+    else:
+        detail = runtime.get("phase_label") or ""
+    primary_action = {
+        "idle_incomplete": "resume", "interrupted": "resume",
+        "cancelled": "resume", "failed": "retry", "stalled": "retry",
+    }.get(status)
+    return {
+        "status": status,
+        "status_label": labels.get(status, status),
+        "runtime_status": status,
+        "headline_status": labels.get(status, status),
+        "badge": status,
+        "surface_label": surface_label,
+        "headline": operation or surface_label,
+        "detail": detail,
+        "current_operation": operation,
+        "operation_id": runtime.get("operation_id") or runtime.get("operation") or "",
+        "progress": progress,
+        "progress_completed": completed,
+        "progress_total": total,
+        "available_actions": actions.get(status, []),
+        "primary_action": primary_action,
+        "show_no_worker_warning": status in {
+            "idle_incomplete", "interrupted", "cancelled"},
+        "last_activity": events[-1].get("message") if events else "",
+        "last_activity_at": events[-1].get("timestamp") if events else None,
+        "user_events": events,
+        "events": events,
+        "runtime": runtime,
+    }
+
+
+def _write_runtime_technical_log(job_id, exc):
+    path = runtime_technical_log_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(f"[{_utc_now_iso()}] {type(exc).__name__}: {exc}\n")
+        stream.write(traceback.format_exc())
+        stream.write("\n")
+        stream.flush()
+
+
+def _runtime_stage_info(label):
+    """Extract the human-facing stage contract from existing status labels."""
+    text = str(label or "").strip()
+    match = re.search(r"学术写作\s+(\d+)\s*/\s*(\d+)", text)
+    if match:
+        index, total = int(match.group(1)), int(match.group(2))
+        operation_label = re.sub(r"^.*?】\s*", "", text).strip(" .…") or text
+        section_match = re.search(r"第\s*([\w.-]+)\s*节", text)
+        stage_id = "academic_writing"
+        for needle, candidate in (
+                ("证据库", "evidence"), ("研究问题", "research_model"),
+                ("论点", "argument_plan"), ("案例", "selected_cases"),
+                ("提纲", "outline"), ("撰写正文", "sections"),
+                ("确定性", "validation"), ("审稿", "review"),
+                ("修订", "quality_repair"), ("质量", "academic_quality")):
+            if needle in text:
+                stage_id = candidate
+                break
+        return {
+            "stage": "academic_writing",
+            "stage_id": stage_id,
+            "stage_index": index,
+            "stage_total": total,
+            "operation": stage_id,
+            "operation_id": "section_rewrite" if section_match else stage_id,
+            "operation_label": operation_label,
+            "section_id": section_match.group(1) if section_match else None,
+        }
+    operation_label = re.sub(r"^.*?】\s*", "", text).strip(" .…") or text
+    if "文档" in text or "排版" in text:
+        stage = "document_processing"
+    elif "术语" in text:
+        stage = "terminology"
+    elif "翻译" in text:
+        stage = "translation"
+    elif "标注" in text:
+        stage = "annotation"
+    elif "报告" in text or "学术" in text:
+        stage = "academic_writing"
+    else:
+        stage = "pipeline"
+    return {
+        "stage": stage,
+        "stage_id": stage,
+        "operation": stage,
+        "operation_id": stage,
+        "operation_label": operation_label,
+    }
+
+
+def _runtime_overall_progress(stage_info, state):
+    """Return a conservative progress estimate; only completion may be 1.0."""
+    if not isinstance(state, dict):
+        return 0.0
+    if state.get("p1_done") and state.get("p2_done") \
+            and (state.get("p3_done") or not state.get("report_enabled", True)) \
+            and (state.get("annotations_done") or not state.get("enable_annotate", True)):
+        return 1.0
+    return None
+
+
+def _academic_runtime_progress(job_id, state):
+    """Count only durable academic artifact checkpoints; no estimated percent."""
+    if not isinstance(state, dict):
+        return 0, 0
+    academic = state.get("academic_state") or {}
+    artifacts = academic.get("artifacts") or {}
+    names = ("evidence", "research_model", "argument_plan", "selected_cases",
+             "outline", "sections", "validation", "review",
+             "literature_support_review", "academic_quality", "report")
+    completed = sum(1 for name in names if (artifacts.get(name) or {}).get("file"))
+    return completed, len(names)
+
+
+_ACADEMIC_RESUME_META = {
+    "evidence": (1, "evidence", "继续构建学术证据"),
+    "literature_evidence": (2, "literature_evidence", "继续整理文献证据"),
+    "research_model": (3, "research_model", "继续建立研究模型"),
+    "literature_claims": (4, "literature_claims", "继续整理文献主张"),
+    "argument_plan": (5, "argument_plan", "继续规划论点"),
+    "case_analysis": (6, "outline", "继续规划案例分析"),
+    "outline": (6, "outline", "继续生成学术提纲"),
+    "writing": (7, "sections", "继续撰写报告章节"),
+    "validation": (8, "validation", "继续验证报告"),
+    "review": (9, "review", "继续执行学术复核"),
+    "repair": (10, "quality_repair", "继续修订受影响章节"),
+    "academic_quality": (11, "academic_quality", "继续评估学术质量"),
+}
+
+
+def _academic_resume_context(state, runtime=None):
+    academic = (state or {}).get("academic_state") or {}
+    current_stage = str(academic.get("current_stage") or "")
+    index, operation, label = _ACADEMIC_RESUME_META.get(
+        current_stage, (1, "academic_writing", "继续学术写作"))
+    runtime = runtime or {}
+    section_id = runtime.get("section_id")
+    if current_stage == "repair" and section_id:
+        operation = "section_rewrite"
+        label = f"继续重新生成第 {section_id} 节"
+    return {
+        "pipeline": "academic_writing",
+        "stage": "academic_writing",
+        "stage_id": operation,
+        "stage_index": index,
+        "stage_total": 11,
+        "operation": operation,
+        "operation_id": operation,
+        "operation_label": label,
+        "section_id": section_id or "",
+    }
+
+
+def _runtime_heartbeat_loop(job_id, stop_event):
+    while not stop_event.wait(RUNTIME_HEARTBEAT_SECONDS):
+        current = load_runtime_state(job_id)
+        if current.get("status") not in RUNTIME_ACTIVE_STATUSES:
+            return
+        update_runtime_state(job_id, heartbeat=True)
+
+
+def _runtime_status_callback(job_id, state, label):
+    stage_info = _runtime_stage_info(label)
+    current = load_runtime_state(job_id)
+    operation = stage_info.get("operation") or current.get("operation")
+    operation_started_at = current.get("operation_started_at")
+    if operation != current.get("operation") or not operation_started_at:
+        operation_started_at = _utc_now_iso()
+    saved_state = load_job_state(job_id)
+    state = saved_state or (state if isinstance(state, dict) else {})
+    changes = dict(stage_info)
+    completed_units, total_units = _academic_runtime_progress(job_id, state)
+    changes.update({
+        "operation": operation,
+        "operation_id": stage_info.get("operation_id") or operation,
+        "operation_label": stage_info.get("operation_label"),
+        "section_id": stage_info.get("section_id") or "",
+        "operation_started_at": operation_started_at,
+        "overall_progress": _runtime_overall_progress(stage_info, state),
+        "status": "running",
+        "phase": "running",
+        "phase_label": "正在处理",
+        "completed_units": completed_units,
+        "total_units": total_units,
+    })
+    update_runtime_state(job_id, progress=True, event=label,
+                         event_name=stage_info.get("stage_id") or operation,
+                         event_visibility="user", event_category="progress",
+                         **changes)
+    if _runtime_cancel_requested(job_id):
+        raise RuntimeError("任务已请求取消")
+
+
+def _runtime_caption_callback(job_id, text):
+    message = str(text or "").strip()
+    if not message:
+        return
+    update_runtime_state(job_id, progress=True, event=message, status="running",
+                         event_visibility="user", event_category="progress")
+    if _runtime_cancel_requested(job_id):
+        raise RuntimeError("任务已请求取消")
+
+
+def _run_job_worker(job_id, filename, file_bytes, pipeline_kwargs, base_url=None):
+    stop_event = threading.Event()
+    heartbeat = threading.Thread(target=_runtime_heartbeat_loop,
+                                 args=(job_id, stop_event), daemon=True)
+    _RUNTIME_CTX.job_id = job_id
+    set_llm_base_url(base_url)
+    heartbeat.start()
+    try:
+        kwargs = dict(pipeline_kwargs or {})
+        kwargs.pop("on_status", None)
+        kwargs.pop("on_caption", None)
+        state = load_job_state(job_id) or new_job_state(filename)
+        queued = load_runtime_state(job_id)
+        update_runtime_state(
+            job_id, status="starting", phase="starting",
+            phase_label="正在读取最近检查点", heartbeat=True, progress=True,
+            event="后台 worker 已接管任务", event_name="worker_started",
+            event_visibility="technical", event_category="orchestration",
+            pipeline="academic_writing" if kwargs.get("enable_report")
+            else "document_pipeline")
+        update_runtime_state(
+            job_id, status="running", phase="running",
+            phase_label="已恢复 · 正在执行" if queued.get("resume_request_id")
+            else "正在执行", heartbeat=True)
+        result = run_job_pipeline(
+            job_id, filename, file_bytes, **kwargs,
+            on_status=lambda label: _runtime_status_callback(job_id, state, label),
+            on_caption=lambda text: _runtime_caption_callback(job_id, text),
+        )
+        result_state = load_job_state(job_id) or state
+        if _runtime_cancel_requested(job_id):
+            update_runtime_state(job_id, status="cancelled", phase="cancelled",
+                                 phase_label="已取消", event="任务已取消",
+                                 event_name="job_cancelled", progress=True,
+                                 event_visibility="user", event_category="lifecycle",
+                                 worker={"owner_pid": None, "worker_id": None,
+                                         "lease_expires_at": None})
+        elif _runtime_business_complete(result_state):
+            update_runtime_state(job_id, status="completed", phase="completed",
+                                 phase_label="已完成", event="任务已完成",
+                                 event_name="job_completed", progress=True,
+                                 event_visibility="user", event_category="lifecycle",
+                                 heartbeat=True, overall_progress=1.0,
+                                 worker={"owner_pid": None, "worker_id": None,
+                                         "lease_expires_at": None})
+        else:
+            update_runtime_state(job_id, status="idle_incomplete", phase="idle_incomplete",
+                                 phase_label="等待继续", event="阶段已保存，等待继续",
+                                 event_name="job_checkpointed", progress=True,
+                                 event_visibility="technical", event_category="checkpoint",
+                                 heartbeat=True,
+                                 worker={"owner_pid": None, "worker_id": None,
+                                         "lease_expires_at": None})
+        return result
+    except Exception as exc:  # noqa: BLE001 - worker must publish failure to UI
+        cancelled = _runtime_cancel_requested(job_id) or "请求取消" in str(exc)
+        if not cancelled:
+            _write_runtime_technical_log(job_id, exc)
+        current = load_runtime_state(job_id)
+        error = None if cancelled else {
+            "type": type(exc).__name__,
+            "message": str(exc)[:500] or "任务执行失败",
+            "stage": current.get("stage_id") or current.get("stage"),
+            "operation": current.get("operation_id") or current.get("operation"),
+            "timestamp": _utc_now_iso(),
+            "technical_log": RUNTIME_TECHNICAL_LOG,
+        }
+        update_runtime_state(
+            job_id, status="cancelled" if cancelled else "failed",
+            phase="cancelled" if cancelled else "failed",
+            phase_label="已取消" if cancelled else "步骤失败",
+            error=error,
+            event="任务已取消" if cancelled else f"步骤失败：{str(exc)[:180]}",
+            event_name="job_cancelled" if cancelled else "job_failed",
+            event_visibility="user",
+            event_category="lifecycle" if cancelled else "error",
+            progress=True, heartbeat=True,
+            worker={"owner_pid": None, "worker_id": None,
+                    "lease_expires_at": None})
+        return None
+    finally:
+        stop_event.set()
+        set_llm_base_url(None)
+        _RUNTIME_CTX.__dict__.clear()
+        update_runtime_state(
+            job_id, event="后台运行已释放", event_name="worker_released",
+            event_visibility="technical", event_category="orchestration")
+        with _RUNTIME_WORKERS_LOCK:
+            _RUNTIME_WORKERS.pop(job_id, None)
+
+
+def start_job_worker(job_id, filename, file_bytes, pipeline_kwargs, base_url=None,
+                     resume_request_id=None):
+    """Start one resumable pipeline worker; repeated UI reruns are idempotent."""
+    with _RUNTIME_WORKERS_LOCK:
+        worker = _RUNTIME_WORKERS.get(job_id)
+        if worker and worker.is_alive():
+            return False
+        runtime = load_runtime_state(job_id)
+        status = runtime.get("status") or "idle"
+        matching_resume = status == "resume_requested" and resume_request_id \
+            and runtime.get("resume_request_id") == resume_request_id
+        if status in RUNTIME_ACTIVE_STATUSES and not matching_resume:
+            return False
+        if not matching_resume:
+            runtime = get_job_runtime_status(job_id)
+            if runtime.get("status") in RUNTIME_ACTIVE_STATUSES:
+                return False
+        state = load_job_state(job_id) or new_job_state(filename)
+        worker_id = uuid.uuid4().hex
+        attempt = int(runtime.get("attempt") or 0) + 1
+        started_at = _utc_now_iso()
+        lease_expires_at = (datetime.now(timezone.utc) +
+                            timedelta(seconds=RUNTIME_LEASE_SECONDS)).isoformat(
+                                timespec="seconds")
+        completed_units, total_units = (0, 0)
+        if state.get("p2_done") and pipeline_kwargs.get("enable_report"):
+            completed_units, total_units = _academic_runtime_progress(job_id, state)
+        context = _academic_resume_context(state, runtime) \
+            if matching_resume and pipeline_kwargs.get("enable_report") else {
+                "pipeline": "document_pipeline", "stage": "pipeline",
+                "stage_id": "pipeline", "operation": "pipeline",
+                "operation_id": "pipeline", "operation_label": "准备任务",
+                "section_id": "", "stage_index": None, "stage_total": None,
+            }
+        update_runtime_state(
+            job_id, status="queued", phase="starting", phase_label="准备中",
+            **context, started_at=runtime.get("started_at") if matching_resume
+            else started_at,
+            operation_started_at=started_at, last_progress_at=started_at,
+            last_heartbeat_at=started_at, cancel_requested=False, error=None,
+            attempt=attempt, resume_request_id=resume_request_id or "",
+            completed_units=completed_units, total_units=total_units,
+            overall_progress=None,
+            worker={"owner_pid": os.getpid(), "worker_id": worker_id,
+                    "lease_expires_at": lease_expires_at},
+            event="已排入后台 worker", event_name="job_queued",
+            event_visibility="technical", event_category="orchestration")
+        worker = threading.Thread(
+            target=_run_job_worker,
+            args=(job_id, filename, file_bytes, dict(pipeline_kwargs or {}), base_url),
+            name=f"transpraxis-{job_id}", daemon=True)
+        worker.worker_id = worker_id
+        _RUNTIME_WORKERS[job_id] = worker
+        worker.start()
+        return True
+
+
+def resume_job(job_id, filename, pipeline_kwargs, base_url=None,
+               resume_request_id=None):
+    """Idempotently request resume and publish the transition before worker start."""
+    with _RUNTIME_WORKERS_LOCK:
+        runtime = get_job_runtime_status(job_id)
+        if runtime.get("status") in RUNTIME_ACTIVE_STATUSES:
+            return False
+        state = load_job_state(job_id) or new_job_state(filename)
+        request_id = resume_request_id or uuid.uuid4().hex
+        if runtime.get("resume_request_id") == request_id:
+            return False
+        pipeline_kwargs = dict(pipeline_kwargs or {})
+        academic = state.get("academic_state") or {}
+        if state.get("p2_done") and (academic.get("artifacts") or academic.get(
+                "current_stage") not in {None, "", "not_started"}):
+            pipeline_kwargs["enable_report"] = True
+        completed_units, total_units = (0, 0)
+        context = {
+            "pipeline": "document_pipeline", "stage": "pipeline",
+            "stage_id": "pipeline", "operation": "pipeline",
+            "operation_id": "pipeline", "operation_label": "继续处理",
+            "section_id": "", "stage_index": None, "stage_total": None,
+        }
+        if state.get("p2_done") and pipeline_kwargs.get("enable_report"):
+            completed_units, total_units = _academic_runtime_progress(job_id, state)
+            context = _academic_resume_context(state, runtime)
+        now = _utc_now_iso()
+        update_runtime_state(
+            job_id, status="resume_requested", phase="resume_requested",
+            phase_label="正在恢复任务", resume_request_id=request_id,
+            started_at=now, operation_started_at=now,
+            last_progress_at=now, completed_units=completed_units,
+            total_units=total_units, overall_progress=None,
+            worker={"owner_pid": None, "worker_id": None,
+                    "lease_expires_at": None},
+            event="已从断点恢复任务", event_name="resume_requested",
+            event_visibility="user", event_category="lifecycle",
+            event_metadata={"resume_request_id": request_id}, **context)
+        return start_job_worker(
+            job_id, filename, None, pipeline_kwargs, base_url=base_url,
+            resume_request_id=request_id)
+
+
+def is_job_worker_alive(job_id):
+    with _RUNTIME_WORKERS_LOCK:
+        worker = _RUNTIME_WORKERS.get(job_id)
+        return bool(worker and worker.is_alive())
+
+
+def request_job_cancel(job_id):
+    """Request cancellation between provider calls; an active HTTP call finishes first."""
+    if not is_job_worker_alive(job_id):
+        return False
+    update_runtime_state(job_id, status="cancelling", cancel_requested=True,
+                         phase="cancelling", phase_label="正在取消",
+                         event="已请求取消任务", event_name="cancel_requested",
+                         progress=True)
+    return True
+
+
+def retry_job_step(job_id):
+    """Invalidate only the failed academic operation and its downstream work."""
+    runtime = get_job_runtime_status(job_id)
+    if runtime.get("status") not in {"failed", "stalled", "interrupted", "cancelled"}:
+        return False
+    operation = runtime.get("operation_id") or runtime.get("operation") or ""
+    scopes = {
+        "validation": "validation", "review": "review",
+        "literature_support_review": "literature_review",
+        "academic_quality": "quality", "quality_repair": "quality",
+        "section_rewrite": "section", "sections": "writer", "repair": "writer",
+        "outline": "planning",
+        "argument_plan": "planning", "selected_cases": "planning",
+        "research_model": "planning", "evidence": "all",
+    }
+    state = load_job_state(job_id)
+    if state and (runtime.get("stage") == "academic_writing" or
+                  operation in scopes):
+        scope = scopes.get(operation, "writer")
+        invalidate_academic_report(job_id, scope, runtime.get("section_id"))
+    update_runtime_state(
+        job_id, status="idle_incomplete", phase="retry_ready", phase_label="等待重试",
+        cancel_requested=False, error=None, event="已准备重试当前步骤",
+        event_name="retry_requested", worker={"owner_pid": None, "worker_id": None,
+                                               "lease_expires_at": None})
+    return True
+
+
 def _invalidate_final_delivery_state(state):
     """Invalidate only the mutable working approval; snapshot history stays on disk."""
     state["delivery_status"] = "draft"
@@ -2321,7 +3304,7 @@ def new_job_state(filename):
         "p1_done": False,
         "p2_done": False,
         "p3_done": False,
-        "report_enabled": True,
+        "report_enabled": False,
         "paras": [],
         "pairs": [],
         "auto_terms": {},
@@ -2659,13 +3642,36 @@ def report_docx_bytes(job_id, state=None, frozen_assets=None):
         if not artifact:
             raise report_template.TemplateParseError(
                 "模板化报告缺少结构化 report artifact，请重新生成报告。")
+        if artifact.get("report_status") != "generated" or artifact.get(
+                "template_compliance") not in {"pass", "pass_with_warnings"}:
+            return None
         return _bytes(report_template.render_report_docx(
             artifact, template["bytes"], template["contract"]))
+    if state.get("report_status") in {
+            "incomplete", "failed_template_validation", "review_required"}:
+        return None
     return _bytes(markdown_to_word(report, state.get("theory") or ""))
 
 
+def _academic_workspace_archive(job_id):
+    from transpraxis import academic_writer
+
+    names = ("research_model", "argument_plan", "selected_cases", "outline",
+             "case_analysis_plans", "human_evidence_questions")
+    output = io.BytesIO()
+    written = 0
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for name in names:
+            filename = academic_writer.ARTIFACT_FILES[name]
+            path = job_dir(job_id) / filename
+            if path.is_file():
+                bundle.writestr(filename, path.read_bytes())
+                written += 1
+    return output.getvalue() if written else None
+
+
 def _delivery_asset_bundle(job_id, state, target_lang, provider, model):
-    """Build the complete approved delivery set once, before freezing it."""
+    """Build the configured delivery set used by both preview and snapshots."""
     from transpraxis import assets as _assets
     from transpraxis import report_evidence as _report_evidence
 
@@ -2674,6 +3680,65 @@ def _delivery_asset_bundle(job_id, state, target_lang, provider, model):
     if source is not None:
         snapshot_state["_source_bin"] = source
     filename = state.get("filename", "")
+    configured = state.get("delivery_config")
+    if isinstance(configured, dict) and configured:
+        config = normalize_delivery_config(
+            configured, enable_report=state.get("report_enabled", False),
+            enable_annotate=state.get("enable_annotate", False))
+        bundle = {}
+        pairs = state.get("pairs") or []
+        glossary = state.get("glossary") or []
+        if state.get("p2_done") and pairs:
+            if config["deliver_plain_docx"]:
+                bundle["translation.docx"] = _bytes(translations_to_word(pairs))
+            if config["deliver_bilingual_docx"]:
+                bundle["bilingual.docx"] = _bytes(pairs_to_word(pairs))
+            if config["deliver_pdf"]:
+                bundle["translation.pdf"] = translations_to_pdf(pairs)
+            if config["enable_annotate"]:
+                bundle["annotated_bilingual.docx"] = _bytes(pairs_to_word(
+                    pairs, annotations=state.get("annotations"),
+                    colors=ANNOTATION_COLORS))
+            if config["deliver_terms_xlsx"]:
+                bundle["terms.xlsx"] = _bytes(glossary_to_excel(
+                    glossary, state.get("auto_terms")))
+            if config["deliver_tbx"]:
+                bundle["terms.tbx"] = _assets.build_tbx(glossary)
+            if config["deliver_tmx"]:
+                bundle["memory.tmx"] = _assets.build_tmx(state, job_id=job_id)
+            if config["deliver_jsonl"]:
+                bundle["bilingual.jsonl"] = _assets.build_jsonl(
+                    state, job_id=job_id).encode("utf-8")
+            if config["deliver_evidence"]:
+                bundle["segment_evidence.jsonl"] = \
+                    _report_evidence.export_segment_evidence_jsonl(
+                        state, job_id).encode("utf-8")
+            if config["deliver_review_report"]:
+                bundle["review_report.md"] = findings_report_md(state).encode("utf-8")
+        if config["deliver_cases"]:
+            selected_cases = load_academic_artifact(job_id, "selected_cases")
+            if selected_cases:
+                bundle["selected_cases.json"] = (
+                    json.dumps(selected_cases, ensure_ascii=False, indent=2) + "\n"
+                ).encode("utf-8")
+        if config["deliver_academic_workspace"]:
+            workspace = _academic_workspace_archive(job_id)
+            if workspace:
+                bundle["academic_workspace.zip"] = workspace
+        if config["enable_report"] and state.get("p3_md"):
+            report_docx = report_docx_bytes(job_id, state)
+            if report_docx is not None:
+                bundle["report.docx"] = report_docx
+            bundle["report.md"] = state["p3_md"].encode("utf-8")
+        generated_assets = sorted([*bundle, "delivery_manifest.json"])
+        manifest = _assets.build_delivery_manifest(
+            snapshot_state, job_id, target_lang, provider, model,
+            generated_assets=generated_assets, source_filename=filename)
+        bundle["delivery_manifest.json"] = (
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        return bundle
+
+    # Existing jobs without a saved selection retain their historical bundle.
     bundle = {}
     if state.get("p1_done") and state.get("paras"):
         bundle["stage1_cleaned.docx"] = _bytes(paragraphs_to_word(state["paras"]))
@@ -2683,7 +3748,9 @@ def _delivery_asset_bundle(job_id, state, target_lang, provider, model):
         bundle["stage2_bilingual.docx"] = _bytes(pairs_to_word(
             state["pairs"], annotations=state.get("annotations"), colors=ANNOTATION_COLORS))
     if state.get("p3_md"):
-        bundle["stage3_report.docx"] = report_docx_bytes(job_id, state)
+        report_docx = report_docx_bytes(job_id, state)
+        if report_docx is not None:
+            bundle["stage3_report.docx"] = report_docx
     bundle.update(_assets.export_all(
         snapshot_state, job_id, target_lang, provider, model,
         source_filename=filename, source_bin=source))
@@ -2698,6 +3765,14 @@ def _delivery_asset_bundle(job_id, state, target_lang, provider, model):
     bundle["delivery_manifest.json"] = (
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     return bundle
+
+
+def build_delivery_assets(job_id, state=None, target_lang="", provider="", model=""):
+    state = state or load_job_state(job_id) or {}
+    return _delivery_asset_bundle(
+        job_id, state, target_lang or state.get("target_lang") or "",
+        provider or state.get("provider") or "",
+        model or state.get("model") or "")
 
 
 def create_delivery_snapshot(job_id, state, target_lang="", provider="", model=""):
@@ -3203,9 +4278,9 @@ def approve_delivery(job_id, note="", accept_blocking=False, actor="user",
     try:
         manifest = create_delivery_snapshot(
             job_id, state,
-            target_lang=target_lang or state.get("target_lang") or "",
-            provider=provider or state.get("provider") or "",
-            model=model or state.get("model") or "")
+            target_lang=state.get("target_lang") or target_lang or "",
+            provider=state.get("provider") or provider or "",
+            model=state.get("model") or model or "")
     except Exception as exc:  # fail closed: final state is not saved without bytes
         persisted = load_job_state(job_id) or state
         return persisted, False, [f"无法冻结最终交付版本：{str(exc)[:200]}"]
@@ -3238,13 +4313,17 @@ def delivery_status_label(state):
 
 
 def academic_status_label(state):
-    status = (state.get("academic_state") or {}).get("quality_status") or \
+    status = state.get("report_status") or \
+        (state.get("academic_state") or {}).get("report_status") or \
+        (state.get("academic_state") or {}).get("quality_status") or \
         (state.get("academic_state") or {}).get("status") or "not_started"
     labels = {
         "not_started": "尚未开始", "stale": "需要重新生成",
         "in_progress": "学术写作中", "failed": "学术写作失败",
         "pass": "验证通过", "pass_with_warnings": "通过（有警告）",
         "review_required": "需要人工学术复核", "fail": "验证失败",
+        "generated": "报告已生成", "incomplete": "当前证据不足，报告不完整",
+        "failed_template_validation": "报告生成未通过模板校验",
     }
     return labels.get(status, status)
 
@@ -3338,6 +4417,7 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
                      enable_annotate=True, use_tm=True,
                      strict_terminology_governance=False, mode=None,
                      research_settings=None, literature_sources=None,
+                     delivery_config=None,
                      enable_understanding=None,
                      on_status=None, on_caption=None):
     """执行单个文档的完整流程；每个里程碑实时落盘，刷新/重启后均可继续。
@@ -3351,9 +4431,35 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
     state = load_job_state(job_id) or base
     state = {**base, **state}  # 兼容旧版本状态缺字段
     state = _state_migration.migrate_state(state)
-    state["report_enabled"] = bool(enable_report)
     if mode is not None:
         strict_terminology_governance = mode == "quality"
+    pipeline_config = {
+        "target_lang": target_lang,
+        "auto_term": bool(auto_term),
+        "enable_report": bool(enable_report),
+        "translation_theory": translation_theory,
+        "style_rules": style_rules,
+        "enable_review": bool(enable_review),
+        "enable_annotate": bool(enable_annotate),
+        "use_tm": bool(use_tm),
+        "strict_terminology_governance": bool(strict_terminology_governance),
+    }
+    state["pipeline_config"] = pipeline_config
+    state.update(
+        target_lang=target_lang, auto_term_enabled=bool(auto_term),
+        report_enabled=bool(enable_report), theory=translation_theory,
+        style_rules=style_rules, enable_review=bool(enable_review),
+        enable_annotate=bool(enable_annotate), use_tm=bool(use_tm),
+        provider=provider, model=model,
+    )
+    if delivery_config is not None:
+        state["delivery_config"] = normalize_delivery_config(
+            delivery_config, enable_report=enable_report,
+            enable_annotate=enable_annotate)
+    elif state.get("delivery_config"):
+        state["delivery_config"] = normalize_delivery_config(
+            state["delivery_config"], enable_report=enable_report,
+            enable_annotate=enable_annotate)
     if enable_understanding is None:
         # Quality mode pays the one-time semantic understanding cost; quick
         # mode still receives rolling target context without extra LLM calls.
@@ -3366,6 +4472,7 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
         academic_writer.prepare_academic_inputs(
             state, translation_theory, research_settings, literature_sources)
         academic_writer.sync_versions(state)
+    save_job_state(job_id, state)
 
     # 术语依赖失效：必须在“全部完成”早退之前执行，
     # 否则冻结术语表变更后的旧译文会继续以 reviewed/final/TM 状态存在。

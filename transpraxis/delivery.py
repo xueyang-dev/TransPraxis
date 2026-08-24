@@ -348,6 +348,14 @@ def compute_delivery_status(state: Dict[str, Any]) -> str:
     return "draft"
 
 
+def report_ready(state: Dict[str, Any]) -> bool:
+    """A requested academic report must pass its final report gate."""
+    if not state.get("report_enabled", False):
+        return True
+    academic = state.get("academic_state") or {}
+    return (state.get("report_status") or academic.get("report_status")) == "generated"
+
+
 def approve_delivery(state: Dict[str, Any], note: str = "", actor: str = "user",
                      accept_blocking: bool = False) -> Tuple[Dict[str, Any], bool, List[str]]:
     """人工交付确认 -> final。
@@ -358,6 +366,8 @@ def approve_delivery(state: Dict[str, Any], note: str = "", actor: str = "user",
     """
     if not state.get("p2_done"):
         return state, False, ["翻译尚未完成，不能创建最终交付版本"]
+    if not report_ready(state):
+        return state, False, ["实践报告尚未完成或未通过校验，不能创建最终交付版本"]
     blockers = unresolved_blocking(state)
     if blockers:
         if not accept_blocking:
