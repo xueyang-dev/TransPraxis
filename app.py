@@ -3274,6 +3274,8 @@ def _workspace_case_views(job_id, state):
     selected = core.load_academic_artifact(job_id, "selected_cases") or {}
     project_evidence = core.load_academic_artifact(job_id, "evidence") or {}
     argument_plan = core.load_academic_artifact(job_id, "argument_plan") or {}
+    case_analysis_plans = core.load_academic_artifact(
+        job_id, "case_analysis_plans") or {}
     outline = core.load_academic_artifact(job_id, "outline") or {}
     literature = core.load_academic_artifact(job_id, "literature_sources") or {}
     cases = selected.get("cases") or []
@@ -3286,6 +3288,13 @@ def _workspace_case_views(job_id, state):
                 if isinstance(item, dict)]
     findings = [item for item in state.get("findings") or []
                 if isinstance(item, dict)]
+    plan_index = {
+        str(item.get("case_id")): item
+        for item in case_analysis_plans.get("plans") or [] if item.get("case_id")
+    }
+    human_by_case = {}
+    for entry in state.get("human_evidence") or []:
+        human_by_case.setdefault(str(entry.get("case_id")), []).append(entry)
     views = []
     for case in cases:
         if not isinstance(case, dict):
@@ -3345,6 +3354,8 @@ def _workspace_case_views(job_id, state):
         if not after and isinstance(segment_index, int) and segment_index + 1 < len(state.get("pairs") or []):
             after = str((state.get("pairs") or [])[segment_index + 1].get("target") or "")
         view.update({
+            "case_plan": plan_index.get(case_id) or {},
+            "human_evidence": human_by_case.get(case_id) or [],
             "related_terms": related_terms[:12],
             "case_findings": case_findings[:12],
             "related_claims": related_claims[:8],
@@ -4467,17 +4478,23 @@ def _case_review_status_label(status):
 
 def _case_review_is_stale(case, state):
     case_id = str(case.get("case_id") or "")
+    if bool(case.get("content_stale")):
+        return True
+    academic = state.get("academic_state") or {}
+    artifact = (academic.get("artifacts") or {}).get(f"case:{case_id}") or {}
+    if artifact.get("status") == "stale":
+        return True
     impact = state.get("dependency_impact") or {}
     if case_id in {str(value) for value in impact.get("affected_case_ids") or []}:
-        return True
-    if case.get("review_status") == "rejected" or case.get("baseline_status") == "rejected":
         return True
     return False
 
 
 def _case_validity_label(case, state):
     if _case_review_is_stale(case, state):
-        return "需要重建", "stale"
+        return "需要重新检查", "stale"
+    if case.get("review_status") == "rejected" or case.get("baseline_status") == "rejected":
+        return "已排除", "stale"
     if case.get("review_status") == "unreviewed":
         return "待人工确认", "pending"
     return "可复用", "valid"
@@ -4542,6 +4559,7 @@ def _render_workspace_cases(job_id, state):
         st.caption(f"全部 {len(views)} · 已批准 {approved} · 已排除 {excluded} · 未审 {len(views) - approved - excluded}")
     item = next(item for item in filtered if str(item.get("case_id")) == selected_id)
     display = _case_provenance.display_contract(item)
+    lifecycle = item.get("artifact_status") or "not_available"
     with detail_col:
         validity_label, tone = _case_validity_label(item, state)
         stale = tone == "stale"
@@ -4552,13 +4570,19 @@ def _render_workspace_cases(job_id, state):
             f'<p>{escape(display["origin_description"])}</p></div>'
             f'<span class="tp-case-validity is-{tone}">{validity_label}</span></div>',
             unsafe_allow_html=True)
-        initial_role_label = ("模拟初译" if item.get("case_origin") == _case_provenance.SYNTHETIC_BASELINE
-                              else "历史初译")
-        st.markdown('<div class="tp-case-role-grid">'
-                    '<span>原文</span><b>原文段落</b>'
-                    f'<span>{escape(initial_role_label)}</span><b>{escape(initial_role_label)}</b>'
-                    '<span>当前译文</span><b>当前译文</b>'
-                    '</div>', unsafe_allow_html=True)
+        has_initial = bool(item.get("initial_text"))
+        initial_role_label = (
+            "模拟初译" if item.get("case_origin") == _case_provenance.SYNTHETIC_BASELINE
+            else "历史初译" if has_initial else "无真实初译（不伪造对照）")
+        role_rows = ['<span>原文</span><b>原文段落</b>']
+        if item.get("case_origin") == _case_provenance.SYNTHETIC_BASELINE or has_initial:
+            role_rows.append(
+                f'<span>{escape(initial_role_label)}</span><b>{escape(initial_role_label)}</b>')
+        role_rows.append('<span>当前译文</span><b>当前译文</b>')
+        st.markdown('<div class="tp-case-role-grid">' + "".join(role_rows) + '</div>',
+                    unsafe_allow_html=True)
+        st.caption(f'目标小节：{item.get("target_subsection") or "—"} · '
+                   f'Artifact lifecycle：{lifecycle}')
         text_col_a, text_col_b = st.columns(2)
         with text_col_a:
             st.markdown(f'<div class="tp-case-text"><label>原文</label><p>{escape(item.get("source_text") or "—")}</p></div>', unsafe_allow_html=True)
@@ -4584,6 +4608,13 @@ def _render_workspace_cases(job_id, state):
                        else "不适用")),
             ("分析状态", "已保存" if analysis else "未提供"),
         ]
+        case_plan = item.get("case_plan") or {}
+        if case_plan:
+            evidence_rows.extend([
+                ("问题类型", (case_plan.get("problem") or {}).get("type") or "—"),
+                ("决策理由", "已保存" if case_plan.get("decision_rationale") else "未提供"),
+                ("理论映射", "已保存" if case_plan.get("theory_mapping") else "未提供"),
+            ])
         st.markdown('<div class="tp-case-evidence-grid">' + "".join(
             f'<span>{escape(label)}</span><b>{escape(str(value))}</b>'
             for label, value in evidence_rows) + '</div>', unsafe_allow_html=True)
@@ -4627,12 +4658,25 @@ def _render_workspace_cases(job_id, state):
                     st.markdown(f'- {escape(str(source.get("title") or source.get("source_id") or "—"))}')
             else:
                 st.caption("未登记案例专属文献证据；当前分析边界仍以项目证据为准。")
+            human_entries = item.get("human_evidence") or []
+            if human_entries:
+                st.markdown("**Human Author Evidence**")
+                for entry in human_entries:
+                    st.markdown(f'- {escape(str(entry.get("question_type") or "说明"))}: '
+                                f'{escape(str(entry.get("answer") or "—"))}')
+            else:
+                st.caption("没有已确认的作者事后解释。")
         if item.get("review_note"):
-            st.caption(f'最近说明：{item["review_note"]}')
-        action_a, action_b, action_c = st.columns(3)
+            st.caption(f'审核说明：{item["review_note"]}')
+        if item.get("reviewed_at"):
+            st.caption(f'审核记录：{item.get("reviewed_at")} · {item.get("review_actor") or "user"}')
+        if stale:
+            st.warning("当前译文或输入已变化，此案例需要重新检查；旧批准不能直接交付。")
+        action_a, action_b, action_c, action_d = st.columns(4)
         if action_a.button("批准纳入" if item.get("review_status") != "approved" else "保持批准",
                           type="primary", key=f"case_approve_{job_id}_{selected_id}",
-                          disabled=item.get("review_status") == "approved", width="stretch"):
+                          disabled=item.get("review_status") == "approved" and not stale,
+                          width="stretch"):
             core.review_academic_case(job_id, selected_id, "approved", actor="user")
             st.rerun()
         exclude_key = f"case_exclude_note_{job_id}_{selected_id}"
@@ -4655,6 +4699,15 @@ def _render_workspace_cases(job_id, state):
                         job_id, int(segment_index), pair)
                 st.session_state.workspace_section = "translation"
                 st.rerun()
+        with action_d:
+            if st.button("从合格池替换", key=f"case_replace_{job_id}_{selected_id}",
+                         disabled=item.get("review_status") != "rejected", width="stretch"):
+                _state, ok, result = core.replace_rejected_case(
+                    job_id, selected_id, actor="user")
+                if not ok:
+                    st.error(result[0] if isinstance(result, list) and result else str(result))
+                else:
+                    st.rerun()
         if item.get("case_origin") == _case_provenance.SYNTHETIC_BASELINE:
             st.markdown('<div class="tp-case-detail-label">模拟初译（分析对照，不是历史初译）</div>', unsafe_allow_html=True)
             baseline_key = f"case_baseline_{job_id}_{selected_id}"
@@ -5842,10 +5895,9 @@ def _render_workspace_delivery(job_id, state):
                 qa.get("author_visual_review") == "CONFIRMED" and
                 qa.get("word_final_review") == "CONFIRMED")
     case_views = _workspace_case_views(job_id, state)
-    case_pending = sum(1 for item in case_views
-                       if item.get("review_status") == "unreviewed"
-                       or (item.get("case_origin") == _case_provenance.SYNTHETIC_BASELINE
-                           and item.get("baseline_status") == "rejected"))
+    case_gate = _finalization.case_review_gate(
+        state, core.load_academic_artifact(job_id, "selected_cases"))
+    case_pending = case_gate.get("blocked_count", 0)
     case_stale = sum(1 for item in case_views if _case_review_is_stale(item, state))
     translation_gate_pass = (bool(state.get("p2_done")) and not blockers and
                              (state.get("delivery_validation") or {}).get("blocking") is not True)
@@ -5899,7 +5951,7 @@ def _render_workspace_delivery(job_id, state):
     ]
     delivery_ready = (translation_gate_pass and impact.get("status") != "stale" and
                       (not state.get("report_enabled") or report_ready) and
-                      (not case_views or not case_pending) and
+                      case_gate.get("status") != "blocked" and
                       compliance.get("status") == "pass" and qa_ready)
     if snapshot.get("current"):
         readiness_title = f"已冻结，可交付 v{latest.get('snapshot_version') if latest else '—'}"

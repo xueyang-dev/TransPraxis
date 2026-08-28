@@ -166,6 +166,24 @@ def case_status(case: Mapping[str, Any], state: Mapping[str, Any] | None = None)
     return case_provenance.with_provenance(case).get("review_status", "unreviewed")
 
 
+def mark_case_reviews_stale(
+    state: Mapping[str, Any], case_ids: Iterable[str], reason: str,
+) -> None:
+    """Mark human review decisions stale without changing their decisions."""
+    reviews = state.setdefault("case_reviews", {})
+    now = now_iso()
+    for case_id in {str(value) for value in case_ids if str(value)}:
+        record = reviews.get(case_id)
+        if not isinstance(record, Mapping):
+            continue
+        reviews[case_id] = {
+            **dict(record),
+            "content_stale": True,
+            "stale_reason": str(reason or "输入已变化")[:700],
+            "stale_at": now,
+        }
+
+
 def case_baseline(case: Mapping[str, Any], state: Mapping[str, Any] | None = None) -> str:
     case_id = str(case.get("case_id") or "")
     overrides = (state or {}).get("case_review_overrides") or {}
@@ -213,6 +231,12 @@ def case_review_view(case: Mapping[str, Any], state: Mapping[str, Any] | None = 
         out.get("legacy_initial") or "")
     record = (state.get("case_reviews") or {}).get(str(out.get("case_id"))) or {}
     override = (state.get("case_review_overrides") or {}).get(str(out.get("case_id"))) or {}
+    academic = state.get("academic_state") or {}
+    artifacts = academic.get("artifacts") or {}
+    artifact_record = artifacts.get(f"case:{str(out.get('case_id'))}") or {}
+    artifact_status = str(artifact_record.get("status") or "not_available")
+    if artifact_status not in {"valid", "stale", "missing", "failed"}:
+        artifact_status = "not_available"
     return {
         **out,
         "source_text": source,
@@ -222,6 +246,14 @@ def case_review_view(case: Mapping[str, Any], state: Mapping[str, Any] | None = 
         "segment_current_text": current_full,
         "review_status": case_status(out, state),
         "review_note": record.get("note") if isinstance(record, Mapping) else "",
+        "review_reason": record.get("review_reason") or record.get("note") or ""
+        if isinstance(record, Mapping) else "",
+        "reviewed_at": record.get("reviewed_at") or record.get("updated_at")
+        if isinstance(record, Mapping) else None,
+        "review_actor": record.get("actor") if isinstance(record, Mapping) else None,
+        "content_stale": bool(record.get("content_stale"))
+        if isinstance(record, Mapping) else False,
+        "artifact_status": artifact_status,
         "baseline_status": override.get("baseline_status", "unreviewed")
         if isinstance(override, Mapping) else "unreviewed",
         "segment_id": segment_id(str(job_id or state.get("job_id") or ""), index or 0, pair or {}),
@@ -229,6 +261,85 @@ def case_review_view(case: Mapping[str, Any], state: Mapping[str, Any] | None = 
         "section_id": case_section_id(out),
         "analysis_fields": dict(out.get("analysis_fields") or {}),
         "synthetic_evidence": dict(out.get("synthetic_evidence") or {}),
+    }
+
+
+def case_review_gate(
+    state: Mapping[str, Any], selected_cases: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Evaluate the author quality gate for cases used by the current report.
+
+    All selected cases are reviewable.  Profile policy remains attached to
+    ``selected_cases.report_case_policy`` so Stage 4 can decide whether a
+    synthetic case counts toward an institutional minimum without changing
+    whether the author has reviewed the case actually used in the report.
+    """
+    selected = selected_cases if isinstance(selected_cases, Mapping) else {}
+    cases = [x for x in selected.get("cases") or [] if isinstance(x, Mapping)]
+    reviews = state.get("case_reviews") or {}
+    overrides = state.get("case_review_overrides") or {}
+    academic = state.get("academic_state") or {}
+    artifacts = academic.get("artifacts") or {}
+    rows = []
+    blocked = []
+    for case in cases:
+        out = case_review_view(case, state)
+        case_id = str(out.get("case_id") or "")
+        review = reviews.get(case_id) if isinstance(reviews, Mapping) else None
+        override = overrides.get(case_id) if isinstance(overrides, Mapping) else None
+        review_status = str(out.get("review_status") or "unreviewed")
+        artifact_status = str(out.get("artifact_status") or "not_available")
+        synthetic = case_provenance.is_synthetic(out)
+        baseline_status = str(out.get("baseline_status") or "unreviewed")
+        evidence = out.get("synthetic_evidence") or {}
+        machine_valid = not synthetic or all(
+            str(evidence.get(key) or "not_checked") in {"pass", "true", "high"}
+            for key in ("baseline_plausibility", "material_difference",
+                        "repair_correctness")
+        )
+        reasons = []
+        if review_status != "approved":
+            reasons.append(f"review_status={review_status}")
+        if review_status == "approved" and bool(out.get("content_stale")):
+            reasons.append("approved content is stale")
+        if artifact_status == "stale":
+            reasons.append("case artifact is stale")
+        if synthetic and baseline_status == "rejected":
+            reasons.append("synthetic baseline rejected")
+        if synthetic and not machine_valid:
+            reasons.append("synthetic machine validation incomplete")
+        row = {
+            "case_id": case_id,
+            "case_origin": out.get("case_origin"),
+            "review_status": review_status,
+            "artifact_status": artifact_status,
+            "content_stale": bool(out.get("content_stale")),
+            "baseline_status": baseline_status,
+            "machine_valid": machine_valid,
+            "target_subsection": out.get("target_subsection") or
+            out.get("subsection_id") or "",
+            "required": True,
+            "blocked": bool(reasons),
+            "reasons": reasons,
+        }
+        rows.append(row)
+        if reasons:
+            blocked.append(case_id)
+    policy = dict(selected.get("report_case_policy") or {})
+    return {
+        "schema_version": VERSION,
+        "policy_id": policy.get("compliance_profile_id") or
+        state.get("compliance_profile_id") or "default",
+        "synthetic_counts_toward_minimum": bool(
+            policy.get("synthetic_counts_toward_minimum", True)),
+        "required_count": len(rows),
+        "approved_count": sum(x["review_status"] == "approved" and not x["blocked"]
+                              for x in rows),
+        "blocked_count": len(blocked),
+        "blocked_case_ids": sorted(blocked),
+        "cases": rows,
+        "status": "blocked" if blocked else
+        "pass" if rows else "not_required",
     }
 
 

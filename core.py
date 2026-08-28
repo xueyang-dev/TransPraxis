@@ -3410,6 +3410,8 @@ def _mark_translation_truth_changed(
     impact = _finalization.build_dependency_impact(
         enriched, job_id, indexes, reason)
     state["dependency_impact"] = impact
+    _finalization.mark_case_reviews_stale(
+        state, impact.get("affected_case_ids") or [], reason)
     stale_names = [item.get("id") for item in impact.get("affected") or []
                    if item.get("kind") == "artifact"]
     academic = state.setdefault("academic_state", {})
@@ -3511,7 +3513,7 @@ def _mark_case_downstream_stale(job_id, state, case_id, reason, *, actor="user",
 
 
 def review_academic_case(job_id, case_id, status, note="", actor="user"):
-    """Approve/exclude one case without changing its provenance dimensions."""
+    """Record one author decision without changing provenance or content."""
     state = load_job_state(job_id)
     if state is None:
         return None, False, "任务不存在"
@@ -3527,17 +3529,130 @@ def review_academic_case(job_id, case_id, status, note="", actor="user"):
         "review_status": review_status,
         "case_origin": normalized.get("case_origin"),
         "text_role": dict(normalized.get("text_role") or {}),
+        "review_reason": str(note or "")[:700],
         "note": str(note or "")[:700],
+        "reviewed_at": _finalization.now_iso(),
         "updated_at": _finalization.now_iso(),
         "actor": actor,
+        "translation_truth_version": int(
+            (state.get("translation_truth") or {}).get("version") or 0),
+        "content_stale": False,
+        "stale_reason": None,
+        "stale_at": None,
     }
-    reason = ("批准案例纳入学术分析" if review_status == "approved"
-              else f"排除案例：{str(note or '人工排除')[:180]}")
-    _mark_case_downstream_stale(
-        job_id, state, str(case_id), reason, actor=actor,
-        action="case_approved" if review_status == "approved" else "case_excluded")
+    state.setdefault("human_actions", []).append({
+        "finding_id": f"case:{case_id}",
+        "action": "case_approved" if review_status == "approved"
+        else "case_excluded",
+        "note": "批准案例纳入学术分析" if review_status == "approved"
+        else f"排除案例：{str(note or '人工排除')[:180]}",
+        "timestamp": _finalization.now_iso(),
+        "actor": actor,
+    })
     save_job_state(job_id, state)
     return state, True, "已保存案例审校状态"
+
+
+def replace_rejected_case(job_id, case_id, *, actor="user"):
+    """Replace one author-rejected case from the already validated pool."""
+    from transpraxis import academic_writer, academic_quality, case_provenance
+    state = load_job_state(job_id)
+    if state is None:
+        return None, False, ["任务不存在"]
+    selected, old_case = _case_artifact_case(job_id, case_id)
+    if selected is None or old_case is None:
+        return state, False, ["找不到案例"]
+    review = (state.get("case_reviews") or {}).get(str(case_id)) or {}
+    if str(review.get("review_status")) != "rejected":
+        return state, False, ["只能替换已被作者排除的案例"]
+    selected_ids = {str(x.get("case_id")) for x in selected.get("cases") or []}
+    reviews = state.get("case_reviews") or {}
+    overrides = state.get("case_review_overrides") or {}
+    candidates = []
+    if case_provenance.is_synthetic(old_case):
+        synthetic = load_academic_artifact(job_id, "synthetic_validation") or {}
+        for candidate in synthetic.get("items") or []:
+            cid = str(candidate.get("case_id") or "")
+            validation = candidate.get("validation") or {}
+            review_record = reviews.get(cid) if isinstance(reviews, dict) else None
+            override = overrides.get(cid) if isinstance(overrides, dict) else None
+            if not cid or cid in selected_ids or candidate is old_case:
+                continue
+            if review_record and review_record.get("review_status") == "rejected":
+                continue
+            if override and override.get("baseline_status") == "rejected":
+                continue
+            if not validation.get("academic_case_eligible"):
+                continue
+            difficulty = candidate.get("difficulty") or {}
+            evidence = candidate.get("synthetic_evidence") or {}
+            old_group = str(old_case.get("difficulty_group") or "")
+            target_match = bool(old_group and str(difficulty.get("group") or "") == old_group)
+            candidates.append((not target_match,
+                               difficulty.get("academic_value") != "high",
+                               difficulty.get("confidence") != "high",
+                               evidence.get("material_difference") != "pass",
+                               candidate.get("segment_index", 0), candidate))
+    else:
+        evidence_artifact = load_academic_artifact(job_id, "evidence") or {}
+        argument_plan = load_academic_artifact(job_id, "argument_plan") or {}
+        candidate = academic_quality.select_replacement_case(
+            str(case_id), list(old_case.get("supports_claims") or []),
+            selected, argument_plan, evidence_artifact)
+        if candidate:
+            candidates.append((False, False, False, False,
+                               candidate.get("segment_index", 0), candidate))
+    candidates.sort(key=lambda item: item[:-1])
+    if not candidates:
+        return state, False, ["没有可用的已验证替换候选；请保持该案例排除并调整案例数量"]
+    candidate = case_provenance.with_provenance(dict(candidates[0][-1]))
+    candidate.update({
+        "supports_claims": sorted(set(old_case.get("supports_claims") or [])),
+        "research_questions": sorted(set(old_case.get("research_questions") or [])),
+        "argument_role": old_case.get("argument_role", "supporting"),
+        "difficulty_group": old_case.get("difficulty_group") or
+        candidate.get("difficulty_group"),
+        "difficulty_subsection": old_case.get("difficulty_subsection"),
+        "strategy_subsection": old_case.get("strategy_subsection"),
+        "target_subsection": old_case.get("target_subsection"),
+        "review_status": "unreviewed",
+        "replacement_of": str(case_id),
+        "selection_rationale": f"replacement of rejected {case_id}: existing validated pool",
+    })
+    selected["cases"] = [
+        candidate if str(x.get("case_id")) == str(case_id)
+        else x for x in selected.get("cases") or []
+    ]
+    record = academic_writer.artifact_record(state, "selected_cases")
+    academic_writer._save_artifact(
+        state, job_dir(job_id), "selected_cases", selected,
+        str(record.get("dependency_hash") or ""),
+        str(record.get("version") or "case-review-v1"))
+    _mark_case_downstream_stale(
+        job_id, state, str(case_id),
+        "作者排除案例后从已验证候选池替换，需重组其写作下游",
+        actor=actor, action="case_replaced")
+    state.setdefault("case_reviews", {})[str(candidate.get("case_id"))] = {
+        "review_status": "unreviewed",
+        "case_origin": candidate.get("case_origin"),
+        "text_role": dict(candidate.get("text_role") or {}),
+        "review_reason": "替换被排除案例；需作者重新终审",
+        "reviewed_at": _finalization.now_iso(),
+        "updated_at": _finalization.now_iso(),
+        "actor": actor,
+        "translation_truth_version": int(
+            (state.get("translation_truth") or {}).get("version") or 0),
+        "content_stale": False,
+    }
+    state.setdefault("human_actions", []).append({
+        "finding_id": f"case:{candidate.get('case_id')}",
+        "action": "case_replaced",
+        "note": f"从已验证候选池替换 {case_id}",
+        "timestamp": _finalization.now_iso(),
+        "actor": actor,
+    })
+    save_job_state(job_id, state)
+    return state, True, [str(candidate.get("case_id"))]
 
 
 def update_synthetic_baseline(job_id, case_id, text, *, status="modified", note="", actor="user"):
@@ -3568,6 +3683,7 @@ def update_synthetic_baseline(job_id, case_id, text, *, status="modified", note=
     state["case_review_overrides"][str(case_id)] = record
     reason = ("修改模拟初译，需重跑该案例下游"
               if status == "modified" else "拒绝模拟初译，需替换或重新确认该案例")
+    _finalization.mark_case_reviews_stale(state, [str(case_id)], reason)
     _mark_case_downstream_stale(
         job_id, state, str(case_id), reason, actor=actor,
         action="synthetic_baseline_modified" if status == "modified"
@@ -4891,6 +5007,13 @@ def approve_delivery(job_id, note="", accept_blocking=False, actor="user",
     state = load_job_state(job_id)
     if state is None:
         return None, False, ["任务不存在"]
+    case_gate = _finalization.case_review_gate(
+        state, load_academic_artifact(job_id, "selected_cases"))
+    if case_gate.get("status") == "blocked":
+        labels = ", ".join(case_gate.get("blocked_case_ids") or [])
+        return state, False, [
+            f"案例人工终审未通过：{labels}。作者拒绝或过期案例不能进入最终交付。"
+        ]
     validation = validate_delivery_translation_state(state)
     if validation["blocking"]:
         _record_delivery_validation_findings(state, validation)

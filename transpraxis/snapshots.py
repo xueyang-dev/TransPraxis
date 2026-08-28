@@ -104,6 +104,8 @@ def create_snapshot(
             "translation_state_identity": state_identity(state),
             "active_terminology_version": dict(active_terminology_version or {}),
             "delivery_status": "final",
+            "case_reviews": deepcopy(state.get("case_reviews") or {}),
+            "case_review_overrides": deepcopy(state.get("case_review_overrides") or {}),
             "assets": sorted(asset_records, key=lambda item: item["name"]),
             "artifact_hashes": {
                 item["name"]: item["sha256"] for item in asset_records
