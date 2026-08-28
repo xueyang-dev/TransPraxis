@@ -234,6 +234,10 @@ def test_configured_delivery_builds_every_selected_format_and_nothing_else():
         config = {key: True for key in core.DELIVERY_CONFIG_DEFAULTS}
         state.update(
             report_enabled=True, p3_done=True, report_status="generated",
+            case_reviews={"case-1": {
+                "review_status": "approved", "content_stale": False,
+                "review_reason": "fixture approved", "reviewed_at": "fixture",
+            }},
             p3_md="# 翻译实践报告\n\n报告正文。",
             enable_annotate=True,
             annotations={0: [{"type": "domain", "src_span": [0, 6],
