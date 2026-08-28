@@ -452,6 +452,7 @@ def retranslate_segments(
     indexes = sorted({int(i) for i in indexes if 0 <= int(i) < len(pairs)})
     if not indexes:
         return state, []
+    was_reviewable_stage = state.get("stage") in ("FINAL", "REVIEW_REQUIRED")
     glossary = core.normalize_glossary(
         glossary if glossary is not None else state.get("glossary") or [])
     glossary_text = core.glossary_block(glossary)
@@ -527,12 +528,14 @@ def retranslate_segments(
                                  if f["severity"] == "informational" and not f.get("resolved"))
     state["has_blocking"] = stats["blocking"] > 0
     if fixed:
-        # Re-translation changes the released document; the old document-level
-        # approval no longer covers the new content.
-        state["delivery_status"] = "draft"
-        state["delivery_approved_by_human"] = False
-        state["delivery_approval"] = None
-        if state.get("stage") in ("FINAL", "REVIEW_REQUIRED"):
+        # Re-translation changes the canonical working translation.  Let the
+        # core mutation entry record the exact dependency slice and revoke
+        # approval/final QA while preserving immutable snapshots.
+        core._mark_translation_truth_changed(
+            job_id, state, fixed,
+            "定点重译改变 CURRENT_TRANSLATION；只重建受影响案例与学术下游",
+            actor=actor, action="retranslate_segments")
+        if was_reviewable_stage:
             state["stage"] = "REVIEW_REQUIRED" if state["has_blocking"] else "TRANSLATED"
     state["delivery_status"] = compute_delivery_status(state)
     core.save_job_state(job_id, state)

@@ -28,9 +28,17 @@ def _sha256(data: bytes) -> str:
 def state_identity(state: Dict[str, Any]) -> str:
     """Hash the approved translation state without snapshot bookkeeping."""
     value = deepcopy(state)
+    # QA confirmations, impact explanations and artifact bookkeeping are
+    # review metadata, not the frozen document bytes.  They must not make an
+    # otherwise identical frozen snapshot appear divergent after a reviewer
+    # records a visual/Word check.
     for key in ("_source_bin", "delivery_snapshots",
-                "latest_delivery_snapshot_version"):
+                "latest_delivery_snapshot_version", "final_qa",
+                "dependency_impact"):
         value.pop(key, None)
+    academic = value.get("academic_state")
+    if isinstance(academic, dict):
+        academic.pop("artifact_status", None)
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True,
                          separators=(",", ":"))
     return _sha256(payload.encode("utf-8"))

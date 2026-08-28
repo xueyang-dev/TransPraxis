@@ -1,10 +1,95 @@
 """Configurable report-structure metadata for the writing pipeline."""
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Dict, Mapping
 
 
 SCHEMA_VERSION = "transpraxis-report-constraints-v4"
+
+
+# This is a concrete project profile, not a generic rules engine.  The
+# roadmap is the currently checked-in authority map; any item that still
+# needs a school-handbook confirmation is explicitly marked manual.
+COMPLIANCE_PROFILES = {
+    "MTI_PRACTICE_REPORT_DEFAULT": {
+        "profile_id": "MTI_PRACTICE_REPORT_DEFAULT",
+        "institution": "示例培养单位",
+        "program": "MTI 英语笔译",
+        "effective_date": "2026",
+        "source_documents": [{
+            "file": "docs/mti-practice-driven-roadmap.md",
+            "page": "—",
+            "clause": "阶段 4：Compliance Profile + Language Constraints",
+            "authority": "TransPraxis 项目规范映射；待学校手册逐条确认的项目显示为 manual",
+        }],
+        "rules": [
+            {"id": "abstract_zh_length", "label": "中文摘要 400—600 字",
+             "source_clause": "阶段 4 / 首批确定性检查 / 中文摘要",
+             "applicability": "启用实践报告时",
+             "check_level": "deterministic"},
+            {"id": "keywords_count", "label": "中英文关键词各 5—8 个",
+             "source_clause": "阶段 4 / 首批确定性检查 / 中英文关键词",
+             "applicability": "启用实践报告时",
+             "check_level": "deterministic"},
+            {"id": "toc_depth", "label": "目录最多三级",
+             "source_clause": "阶段 4 / 首批确定性检查 / 目录",
+             "applicability": "启用实践报告时",
+             "check_level": "deterministic"},
+            {"id": "citation_reference_bidirectional", "label": "正文引用与参考文献双向对应",
+             "source_clause": "阶段 4 / 首批确定性检查 / 正文引用与参考文献",
+             "applicability": "存在参考文献或正文引用时",
+             "check_level": "deterministic"},
+            {"id": "figure_table_numbering", "label": "图表按章编号",
+             "source_clause": "阶段 4 / 首批确定性检查 / 图号与表号",
+             "applicability": "报告含图表时",
+             "check_level": "deterministic"},
+            {"id": "front_back_matter", "label": "正文与附录角色正确",
+             "source_clause": "阶段 4 / 首批确定性检查 / 正文与附录",
+             "applicability": "启用模板或报告要求附录时",
+             "check_level": "deterministic"},
+            {"id": "bilingual_appendix", "label": "存在双语对照附录",
+             "source_clause": "阶段 4 / 首批确定性检查 / 双语对照附录",
+             "applicability": "实践报告终稿",
+             "check_level": "deterministic"},
+            {"id": "source_word_count", "label": "源文原则上不少于 10,000 词",
+             "source_clause": "阶段 4 / 首批确定性检查 / 笔译实践源文",
+             "applicability": "实践报告终稿",
+             "check_level": "deterministic"},
+            {"id": "case_conclusion_coverage", "label": "案例分析为核心章节且结论回应研究问题",
+             "source_clause": "阶段 4 / 首批确定性检查 / 案例分析与结论",
+             "applicability": "启用实践报告时",
+             "check_level": "deterministic"},
+            {"id": "layout_structure", "label": "页面与标题结构符合模板",
+             "source_clause": "阶段 4 / 首批确定性检查 / 页面结构与样式",
+             "applicability": "存在 DOCX 时",
+             "check_level": "manual"},
+            {"id": "synthetic_case_policy", "label": "合成案例计数与披露符合 profile",
+             "source_clause": "阶段 4 / 首批确定性检查 / synthetic case 政策",
+             "applicability": "报告含合成对照案例时",
+             "check_level": "deterministic"},
+            {"id": "author_placeholders", "label": "人工确认项已处理",
+             "source_clause": "阶段 4 / 首批确定性检查 / 【待作者填写】",
+             "applicability": "报告或模板含人工确认项时",
+             "check_level": "manual"},
+        ],
+    },
+}
+
+
+def compliance_profile(profile_id: str = "MTI_PRACTICE_REPORT_DEFAULT") -> Dict[str, Any]:
+    """Return a copy of one explicit compliance profile."""
+    profile = deepcopy(COMPLIANCE_PROFILES.get(profile_id) or
+                       COMPLIANCE_PROFILES["MTI_PRACTICE_REPORT_DEFAULT"])
+    source = profile.get("source_documents", [{}])[0]
+    for rule in profile.get("rules") or []:
+        rule["source"] = {
+            "file": source.get("file", "—"),
+            "page": source.get("page", "—"),
+            "clause": rule.get("source_clause") or "—",
+            "authority": source.get("authority", "—"),
+        }
+    return profile
 
 CASE_POLICIES = {
     "proposal": {

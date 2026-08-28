@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -87,7 +88,18 @@ ARTIFACT_FILES = {
     "quality_repair_history": "academic-quality-repair-history.json",
     "repair_history": "academic-repair-history.json",
     "final_docx_validation": "final-docx-validation.json",
+    "libreoffice_render": "libreoffice-render-status.json",
 }
+
+ARTIFACT_STATUSES = {"valid", "stale", "missing", "failed"}
+
+_LLM_ARTIFACTS = {
+    "research_model", "literature_claims", "argument_plan",
+    "case_analysis_plans", "sections", "review", "literature_support_review",
+    "academic_quality",
+}
+_COMPOSITE_ARTIFACTS = {"sections", "report"}
+_QA_ARTIFACTS = {"validation", "final_docx_validation", "libreoffice_render"}
 
 
 def _now() -> str:
@@ -105,6 +117,10 @@ def default_academic_state() -> Dict[str, Any]:
         "template_contract_version": None,
         "versions": {},
         "artifacts": {},
+        # ``artifacts`` remains the active artifact index for compatibility;
+        # this parallel status map preserves an explainable stale/reusable
+        # record when targeted invalidation removes an active entry.
+        "artifact_status": {},
         "forced_sections": [],
         "stale_reasons": [],
         "last_error": "",
@@ -122,9 +138,9 @@ def _state(state: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("artifact_history", "validation_history", "review_history",
                 "literature_review_history", "academic_quality_history", "repair_history"):
         base.pop(key, None)
-    for key in ("artifacts", "forced_sections", "stale_reasons", "versions"):
-        if not isinstance(base.get(key), (dict if key in ("artifacts", "versions") else list)):
-            base[key] = {} if key in ("artifacts", "versions") else []
+    for key in ("artifacts", "artifact_status", "forced_sections", "stale_reasons", "versions"):
+        if not isinstance(base.get(key), (dict if key in ("artifacts", "artifact_status", "versions") else list)):
+            base[key] = {} if key in ("artifacts", "artifact_status", "versions") else []
     state["academic_state"] = base
     return base
 
@@ -183,20 +199,238 @@ def _read_artifact(path: Path) -> Optional[Dict[str, Any]]:
     return _read_jsonl(path) if path.suffix == ".jsonl" else _read_json(path)
 
 
+def _normalize_id_list(values: Any) -> List[str]:
+    """Canonicalize edge ids once at the artifact boundary."""
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, Iterable):
+        return []
+    return sorted({str(value).strip() for value in values
+                   if str(value).strip()})
+
+
+def _value_segment_ids(value: Any) -> List[str]:
+    """Collect only fields whose schema denotes project segment ids."""
+    found = set()
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                key = str(key)
+                if key in {"segment_id", "source_segment_id"} and child is not None:
+                    found.add(str(child))
+                elif key in {"project_evidence", "segment_ids"}:
+                    found.update(_normalize_id_list(child))
+                visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+    visit(value)
+    return sorted(found)
+
+
+def _value_case_artifact_ids(value: Any) -> List[str]:
+    found = set()
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            case_id = item.get("case_id")
+            if case_id is not None and str(case_id).strip():
+                found.add(f"case:{str(case_id).strip()}")
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+    visit(value)
+    return sorted(found)
+
+
+_DEFAULT_ARTIFACT_INPUTS = {
+    "synthetic_baselines": ["synthetic_opportunities"],
+    "synthetic_error_manifest": ["synthetic_baselines"],
+    "synthetic_optimized": ["synthetic_error_manifest"],
+    "synthetic_validation": ["synthetic_optimized"],
+    # These artifacts retain scoped segment edges from their payload.  An
+    # umbrella ``evidence`` edge would turn an unrelated segment edit into a
+    # document-wide invalidation.
+    "research_model": [],
+    "literature_evidence": ["literature_sources"],
+    "literature_claims": ["literature_evidence"],
+    "argument_plan": ["research_model", "literature_sources",
+                       "literature_evidence", "literature_claims", "human_evidence"],
+    "selected_cases": ["argument_plan", "synthetic_validation"],
+    "case_analysis_plans": ["argument_plan", "selected_cases", "literature_claims",
+                            "human_evidence"],
+    "outline": ["research_model", "argument_plan", "selected_cases",
+                "literature_evidence", "literature_claims", "case_analysis_plans"],
+    "sections": ["outline", "argument_plan", "selected_cases", "case_analysis_plans"],
+    "report": ["sections", "outline", "selected_cases", "case_analysis_plans"],
+    "validation": ["report", "evidence", "synthetic_validation", "outline"],
+    "review": ["report", "argument_plan", "outline"],
+    "literature_support_review": ["report", "argument_plan", "literature_claims"],
+    "academic_quality": ["report", "validation", "review"],
+    "human_evidence_needs": ["evidence", "case_analysis_plans", "academic_quality"],
+    "human_evidence_questions": ["human_evidence_needs", "evidence", "case_analysis_plans"],
+}
+_DELEGATED_SEGMENT_ARTIFACTS = {
+    "selected_cases", "outline", "sections", "report", "validation", "review",
+    "literature_support_review", "academic_quality", "final_docx_validation",
+    "libreoffice_render", "repair_history", "quality_repair_history",
+}
+
+
+def _artifact_type(name: str) -> str:
+    name = str(name)
+    if name.startswith("subsection:"):
+        return "writing_subsection"
+    if name.startswith("chapter:"):
+        return "chapter_composite"
+    if name == "report":
+        return "report_composite"
+    if name == "sections":
+        return "writing_units_composite"
+    if name in {"final_docx_validation"}:
+        # This record certifies the exported DOCX and is consumed by render QA.
+        return "docx_export"
+    if name in {"libreoffice_render"}:
+        return "render_qa"
+    if name in _COMPOSITE_ARTIFACTS:
+        return "composite"
+    if name in _QA_ARTIFACTS:
+        return "qa"
+    if name in _LLM_ARTIFACTS:
+        return "llm_artifact"
+    return "deterministic_artifact"
+
+
+def _normalize_stale_reason(value: Any, *, default_code: str = "legacy_stale",
+                            default_source_type: str = "system") -> Optional[Dict[str, str]]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, Mapping):
+        code = str(value.get("code") or default_code)
+        source_type = str(value.get("source_type") or default_source_type)
+        source_id = str(value.get("source_id") or "")
+        return {"code": code, "source_type": source_type, "source_id": source_id}
+    return {"code": default_code, "source_type": default_source_type,
+            "source_id": str(value)}
+
+
+def _normalize_artifact_record(name: str, value: Any = None, *,
+                               legacy_status: Any = None) -> Dict[str, Any]:
+    """Read both canonical and pre-Stage-2 records without mutating state."""
+    raw = dict(value) if isinstance(value, Mapping) else {}
+    legacy = dict(legacy_status) if isinstance(legacy_status, Mapping) else {}
+    record = {**legacy, **raw}
+    status = str(record.get("status") or "valid")
+    if status not in ARTIFACT_STATUSES:
+        status = "valid"
+    record.update({
+        "artifact_id": str(record.get("artifact_id") or name),
+        "artifact_type": str(record.get("artifact_type") or _artifact_type(name)),
+        "file": str(record.get("file") or ARTIFACT_FILES.get(name) or ""),
+        "content_hash": record.get("content_hash"),
+        "dependency_hash": record.get("dependency_hash"),
+        "input_segment_ids": _normalize_id_list(record.get("input_segment_ids")),
+        "input_artifact_ids": _normalize_id_list(record.get("input_artifact_ids")),
+        "version": record.get("version"),
+        "updated_at": record.get("updated_at"),
+        "status": status,
+        "stale_reason": _normalize_stale_reason(record.get("stale_reason")),
+    })
+    if status != "stale":
+        record["stale_reason"] = None
+    return record
+
+
+def artifact_record(state: Mapping[str, Any], name: str) -> Dict[str, Any]:
+    """Return one canonical record, including a valid legacy fallback."""
+    academic = state.get("academic_state") or {}
+    artifacts = academic.get("artifacts") or {}
+    statuses = academic.get("artifact_status") or {}
+    return _normalize_artifact_record(
+        name, artifacts.get(name),
+        legacy_status=statuses.get(name) if isinstance(statuses, Mapping) else None)
+
+
+def _write_status_mirror(academic: Dict[str, Any], name: str,
+                         record: Mapping[str, Any]) -> None:
+    """Keep the pre-Stage-2 view readable; ``artifacts`` is authoritative."""
+    academic.setdefault("artifact_status", {})[name] = {
+        key: record.get(key) for key in (
+            "status", "stale_reason", "input_segment_ids", "input_artifact_ids",
+            "updated_at")
+    }
+
+
 def _save_artifact(
     state: Dict[str, Any], artifact_dir: Path, name: str, value: Dict[str, Any],
     dependency_hash: str, version: str,
+    *, input_segment_ids: Optional[Iterable[Any]] = None,
+    input_artifact_ids: Optional[Iterable[Any]] = None,
+    status: str = "valid", stale_reason: Any = None,
 ) -> Dict[str, Any]:
     academic = _state(state)
-    filename = ARTIFACT_FILES[name]
+    filename = ARTIFACT_FILES.get(name) or str(value.get("_artifact_file") or "")
+    if not filename:
+        raise ValueError(f"缺少 artifact 文件映射：{name}")
+    if status not in ARTIFACT_STATUSES:
+        raise ValueError(f"未知 artifact lifecycle status：{status}")
+    if input_segment_ids is None:
+        input_segment_ids = value.get("input_segment_ids")
+        if name in _DELEGATED_SEGMENT_ARTIFACTS:
+            # Composite/aggregate nodes consume child artifact IDs, not a
+            # transitive copy of every descendant segment.
+            input_segment_ids = []
+        elif input_segment_ids is None:
+            input_segment_ids = _value_segment_ids(value)
+    if input_artifact_ids is None:
+        input_artifact_ids = value.get("input_artifact_ids")
+        if input_artifact_ids is None:
+            input_artifact_ids = _DEFAULT_ARTIFACT_INPUTS.get(name, [])
+        if name in {"selected_cases", "case_analysis_plans", "outline", "sections", "report",
+                    "validation", "review", "literature_support_review",
+                    "academic_quality"}:
+            input_artifact_ids = list(input_artifact_ids) + _value_case_artifact_ids(value)
+    content_hash = value.get("content_hash") or academic_evidence.stable_hash(value)
+    normalized_segment_ids = _normalize_id_list(input_segment_ids)
+    normalized_artifact_ids = _normalize_id_list(input_artifact_ids)
+    previous_raw = academic.get("artifacts", {}).get(name)
+    previous = _normalize_artifact_record(
+        name, previous_raw,
+        legacy_status=(academic.get("artifact_status") or {}).get(name))
+    if (isinstance(previous_raw, Mapping)
+            and previous_raw.get("artifact_id") == name
+            and previous.get("status") == status
+            and previous.get("content_hash") == content_hash
+            and previous.get("dependency_hash") == dependency_hash
+            and previous.get("version") == version
+            and previous.get("input_segment_ids") == normalized_segment_ids
+            and previous.get("input_artifact_ids") == normalized_artifact_ids
+            and (artifact_dir / filename).is_file()):
+        if name == "selected_cases":
+            _save_case_artifact_records(state, value, dependency_hash, version)
+        return value
     _write_artifact(artifact_dir / filename, value)
-    academic["artifacts"][name] = {
+    updated_at = _now()
+    record = {
+        "artifact_id": name,
+        "artifact_type": _artifact_type(name),
         "file": filename,
-        "content_hash": value.get("content_hash") or academic_evidence.stable_hash(value),
+        "content_hash": content_hash,
         "dependency_hash": dependency_hash,
+        "input_segment_ids": normalized_segment_ids,
+        "input_artifact_ids": normalized_artifact_ids,
         "version": version,
-        "updated_at": _now(),
+        "updated_at": updated_at,
+        "status": status,
+        "stale_reason": _normalize_stale_reason(stale_reason),
     }
+    if status != "stale":
+        record["stale_reason"] = None
+    academic["artifacts"][name] = record
+    _write_status_mirror(academic, name, record)
+    if name == "selected_cases":
+        _save_case_artifact_records(state, value, dependency_hash, version)
     academic["updated_at"] = _now()
     return value
 
@@ -205,14 +439,105 @@ def _load_valid_artifact(
     state: Dict[str, Any], artifact_dir: Path, name: str,
     dependency_hash: str, version: str,
 ) -> Optional[Dict[str, Any]]:
-    record = _state(state)["artifacts"].get(name) or {}
+    academic = _state(state)
+    record = artifact_record(state, name)
+    if record.get("status") != "valid":
+        return None
     if record.get("dependency_hash") != dependency_hash or record.get("version") != version:
         return None
-    value = _read_artifact(artifact_dir / ARTIFACT_FILES[name])
+    filename = record.get("file") or ARTIFACT_FILES.get(name)
+    if not filename:
+        return None
+    value = _read_artifact(artifact_dir / filename)
     if not value:
         return None
     content_hash = value.get("content_hash") or academic_evidence.stable_hash(value)
     return value if content_hash == record.get("content_hash") else None
+
+
+def _save_embedded_artifact_record(
+    state: Dict[str, Any], artifact_id: str, value: Mapping[str, Any],
+    dependency_hash: str, version: str, *, input_segment_ids: Iterable[Any] = (),
+    input_artifact_ids: Iterable[Any] = (), file: str = "academic-sections.json",
+    artifact_type: str = "writing_subsection",
+) -> Dict[str, Any]:
+    """Index a writing unit stored inside the sections container."""
+    academic = _state(state)
+    artifact_id = str(artifact_id)
+    content_hash = str(value.get("content_hash") or academic_evidence.stable_hash(dict(value)))
+    segment_ids = _normalize_id_list(input_segment_ids)
+    artifact_ids = _normalize_id_list(input_artifact_ids)
+    raw = academic.get("artifacts", {}).get(artifact_id)
+    previous = _normalize_artifact_record(artifact_id, raw)
+    if (isinstance(raw, Mapping) and raw.get("artifact_id") == artifact_id
+            and previous.get("artifact_type") == artifact_type
+            and previous.get("status") == "valid"
+            and previous.get("content_hash") == content_hash
+            and previous.get("dependency_hash") == dependency_hash
+            and previous.get("version") == version
+            and previous.get("input_segment_ids") == segment_ids
+            and previous.get("input_artifact_ids") == artifact_ids):
+        return dict(value)
+    record = {
+        "artifact_id": artifact_id,
+        "artifact_type": artifact_type,
+        "file": file,
+        "content_hash": content_hash,
+        "dependency_hash": dependency_hash,
+        "input_segment_ids": segment_ids,
+        "input_artifact_ids": artifact_ids,
+        "version": version,
+        "updated_at": _now(),
+        "status": "valid",
+        "stale_reason": None,
+    }
+    academic["artifacts"][artifact_id] = record
+    _write_status_mirror(academic, artifact_id, record)
+    academic["updated_at"] = _now()
+    return dict(value)
+
+
+def _save_case_artifact_records(
+    state: Dict[str, Any], value: Mapping[str, Any],
+    dependency_hash: str, version: str,
+) -> None:
+    """Index selected cases as lightweight graph nodes inside their artifact.
+
+    Cases remain part of ``selected_cases`` and do not become a second case
+    schema or separate LLM writing units.  The records expose the direct
+    source-segment edge needed for Case-15-style propagation.
+    """
+    for case in value.get("cases") or []:
+        if not isinstance(case, Mapping) or not case.get("case_id"):
+            continue
+        artifact_id = f"case:{case['case_id']}"
+        content_hash = academic_evidence.stable_hash(dict(case))
+        segment_ids = _value_segment_ids(case)
+        raw = state.get("academic_state", {}).get("artifacts", {}).get(artifact_id)
+        previous = _normalize_artifact_record(artifact_id, raw)
+        if (isinstance(raw, Mapping) and raw.get("artifact_id") == artifact_id
+                and previous.get("content_hash") == content_hash
+                and previous.get("dependency_hash") == dependency_hash
+                and previous.get("version") == version
+                and previous.get("input_segment_ids") == segment_ids
+                and previous.get("status") == "valid"):
+            continue
+        record = {
+            "artifact_id": artifact_id,
+            "artifact_type": "case_selection_unit",
+            "file": ARTIFACT_FILES["selected_cases"],
+            "content_hash": content_hash,
+            "dependency_hash": dependency_hash,
+            "input_segment_ids": segment_ids,
+            "input_artifact_ids": [],
+            "version": version,
+            "updated_at": _now(),
+            "status": "valid",
+            "stale_reason": None,
+        }
+        academic = state.setdefault("academic_state", {})
+        academic.setdefault("artifacts", {})[artifact_id] = record
+        _write_status_mirror(academic, artifact_id, record)
 
 
 def _load_reusable_sections(artifact_dir: Path) -> Dict[str, Dict[str, Any]]:
@@ -220,8 +545,101 @@ def _load_reusable_sections(artifact_dir: Path) -> Dict[str, Dict[str, Any]]:
     value = _read_artifact(artifact_dir / ARTIFACT_FILES["sections"]) or {}
     if value.get("schema_version") != VERSIONS["writer_version"]:
         return {}
-    return {str(x.get("section_id")): x for x in value.get("sections", [])
-            if x.get("section_id") and x.get("dependency_hash")}
+    cached = {}
+    items = [*value.get("sections", []), *value.get("writing_units", [])]
+    for item in items:
+        if not isinstance(item, Mapping) or not item.get("dependency_hash"):
+            continue
+        if item.get("status") == "stale":
+            continue
+        if item.get("artifact_id"):
+            cached[str(item["artifact_id"])] = item
+        if item.get("section_id"):
+            cached.setdefault(str(item["section_id"]), item)
+    return cached
+
+
+def _section_cache_index(value: Optional[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    cached: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(value, Mapping):
+        return cached
+    for item in [*(value.get("sections") or []), *(value.get("writing_units") or [])]:
+        if not isinstance(item, Mapping) or not item.get("dependency_hash"):
+            continue
+        item = dict(item)
+        if item.get("status") == "stale":
+            continue
+        if item.get("artifact_id"):
+            cached[str(item["artifact_id"])] = item
+        if item.get("section_id"):
+            cached.setdefault(str(item["section_id"]), item)
+    return cached
+
+
+def apply_case_review_overlays(
+    selected_cases: Dict[str, Any], state: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Apply human review decisions without changing case provenance."""
+    reviews = state.get("case_reviews") or {}
+    overrides = state.get("case_review_overrides") or {}
+    if not isinstance(reviews, Mapping):
+        reviews = {}
+    if not isinstance(overrides, Mapping):
+        overrides = {}
+    cases = []
+    for raw in selected_cases.get("cases") or []:
+        case = case_provenance.with_provenance(raw)
+        case_id = str(case.get("case_id") or "")
+        review = reviews.get(case_id) or {}
+        override = overrides.get(case_id) or {}
+        if isinstance(review, Mapping) and review.get("review_status") in \
+                case_provenance.REVIEW_STATUSES:
+            case["review_status"] = review["review_status"]
+            case["review_note"] = str(review.get("note") or "")
+        if case_provenance.is_synthetic(case) and isinstance(override, Mapping):
+            if override.get("synthetic_baseline_text") is not None:
+                baseline = dict(case.get("synthetic_baseline") or {})
+                baseline["text"] = str(override.get("synthetic_baseline_text") or "")
+                case["synthetic_baseline"] = baseline
+            if override.get("baseline_status"):
+                case["baseline_status"] = str(override["baseline_status"])
+        cases.append(case)
+    out = {**selected_cases, "cases": cases}
+    out["content_hash"] = academic_evidence.stable_hash(
+        {key: value for key, value in out.items() if key != "content_hash"})
+    return out
+
+
+def _synthetic_optimizer_dependency_inputs(
+    error_manifest: Dict[str, Any], evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return only the inputs consumed by project-target binding."""
+    segments = academic_evidence.segment_index(evidence)
+    items = []
+    for case in error_manifest.get("items") or []:
+        segment = segments.get(str(case.get("source_segment_id") or "")) or {}
+        items.append({
+            "case": case,
+            "segment": {
+                "source": segment.get("source") or "",
+                "current_target": str(
+                    segment.get("final_target") or segment.get("target") or ""
+                ).strip(),
+            },
+        })
+    return {
+        "pipeline_status": error_manifest.get("pipeline_status", "complete"),
+        "items": items,
+    }
+
+
+def _synthetic_optimizer_dependency_hash(
+    error_manifest: Dict[str, Any], evidence: Dict[str, Any],
+) -> str:
+    return academic_evidence.stable_hash({
+        **_synthetic_optimizer_dependency_inputs(error_manifest, evidence),
+        "version": VERSIONS["synthetic_optimizer_version"],
+    })
 
 
 def _section_dependency_hash(
@@ -232,45 +650,471 @@ def _section_dependency_hash(
     literature_claims_artifact: Dict[str, Any],
     case_plans: Dict[str, Any], human_entries: Iterable[Dict[str, Any]],
 ) -> str:
-    """Hash only case-selection state that can affect this section."""
+    """Hash only the evidence and cases that can affect this section.
+
+    Older versions hashed the complete evidence, argument and literature
+    artifacts.  That made a one-segment edit look like a document-wide
+    rewrite.  Keep this selector deterministic and explicit so the existing
+    section cache can reuse unrelated writing units.
+    """
+    inputs = _section_dependency_inputs(
+        plan, argument_plan, selected_cases, evidence,
+        literature_sources_artifact, literature_evidence_artifact,
+        literature_claims_artifact, case_plans, human_entries)
+    return academic_evidence.stable_hash({
+        **inputs,
+        "writer": VERSIONS["writer_version"],
+    })
+
+
+def _section_dependency_inputs(
+    plan: Dict[str, Any], argument_plan: Dict[str, Any],
+    selected_cases: Dict[str, Any], evidence: Dict[str, Any],
+    literature_sources_artifact: Dict[str, Any],
+    literature_evidence_artifact: Dict[str, Any],
+    literature_claims_artifact: Dict[str, Any],
+    case_plans: Dict[str, Any], human_entries: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return the bounded, inspectable inputs for one writing unit."""
     case_ids = set(plan.get("cases") or [])
     scoped_cases = [x for x in selected_cases.get("cases", [])
                     if x.get("case_id") in case_ids]
     section_id = str(plan.get("section_id") or "")
-    synthetic_ids = {str(x.get("case_id")) for x in selected_cases.get("cases", [])
-                     if x.get("case_type") == "synthetic_contrast"}
-    return academic_evidence.stable_hash({
-        "plan": plan,
-        "claims": argument_plan["content_hash"],
-        "evidence": evidence["content_hash"],
+    claim_ids = {str(x) for x in plan.get("claims") or []}
+    scoped_claims = [x for x in argument_plan.get("claims", [])
+                     if str(x.get("claim_id")) in claim_ids]
+    segment_ids = {
+        str(segment_id) for claim in scoped_claims
+        for segment_id in claim.get("project_evidence") or [] if segment_id
+    }
+    for item in scoped_cases:
+        for key in ("segment_id", "source_segment_id"):
+            if item.get(key):
+                segment_ids.add(str(item[key]))
+    scoped_evidence = [
+        x for x in (evidence.get("project_evidence") or {}).get("segments", [])
+        if str(x.get("segment_id") or x.get("id") or "") in segment_ids
+    ]
+    scoped_case_plans = [
+        {k: p.get(k) for k in (
+            "case_id", "source_segment_id", "target_subsection", "problem",
+            "initial_failure", "alternatives", "decision_rationale",
+            "translation_effect", "theory_mapping", "bounded_conclusion",
+            "human_evidence_ids", "human_evidence", "review_status")}
+        for p in case_plans.get("plans", []) if p.get("case_id") in case_ids
+    ]
+    literature_claim_ids = {
+        str(value) for claim in scoped_claims
+        for value in claim.get("literature_claims") or [] if value
+    }
+    literature_claim_ids.update(str(value) for value in plan.get("literature_claims") or []
+                                if value)
+    literature_evidence_ids = {
+        str(value) for claim in scoped_claims
+        for value in claim.get("literature_evidence") or [] if value
+    }
+    literature_evidence_ids.update(str(value) for value in plan.get("literature_evidence") or []
+                                   if value)
+    literature_source_ids = {
+        str(value) for value in plan.get("literature_sources") or [] if value
+    }
+    scoped_literature_claims = [
+        x for x in literature_claims_artifact.get("items", [])
+        if str(x.get("claim_id") or x.get("literature_claim_id") or "")
+        in literature_claim_ids
+    ]
+    scoped_literature_evidence = [
+        x for x in literature_evidence_artifact.get("items", [])
+        if str(x.get("evidence_id") or x.get("literature_evidence_id") or "")
+        in literature_evidence_ids
+    ]
+    scoped_literature_sources = [
+        x for x in literature_sources_artifact.get("sources", [])
+        if str(x.get("source_id") or "") in literature_source_ids
+    ]
+    scoped_human = [
+        {k: x.get(k) for k in ("human_evidence_id", "status", "answer", "question_type")}
+        for x in human_entries if str(x.get("case_id")) in case_ids
+    ]
+    return {
+        "plan": {k: plan.get(k) for k in (
+            "section_id", "title", "role", "level", "claims", "cases",
+            "literature_claims", "literature_evidence", "literature_sources",
+            "required_subsections", "required_statistics", "allowed_conclusions",
+            "writing_unit_id", "parent_section_id", "target_subsection")},
+        "claims": scoped_claims,
+        "evidence": scoped_evidence,
         "cases": academic_evidence.stable_hash(scoped_cases),
+        "case_ids": sorted(case_ids),
+        "segment_ids": sorted(segment_ids),
         "synthetic_policy": selected_cases.get("synthetic_contrast_cases", 0)
-        if section_id == "1" or case_ids & synthetic_ids else None,
+        if section_id == "1" or any(
+            case_provenance.is_synthetic(x) for x in scoped_cases) else None,
         "case_count_policy": selected_cases.get("authentic_selection_status")
         if case_ids else None,
-        "writer": VERSIONS["writer_version"],
-        "literature_sources": literature_sources_artifact["sources_metadata_hash"],
-        "literature_evidence": literature_evidence_artifact["content_hash"],
-        "literature_claims": literature_claims_artifact["content_hash"],
-        "case_analysis": academic_evidence.stable_hash([
-            {k: p.get(k) for k in (
-                "case_id", "problem", "initial_failure", "alternatives",
-                "decision_rationale", "translation_effect", "theory_mapping",
-                "bounded_conclusion", "human_evidence_ids", "human_evidence")}
-            for p in case_plans.get("plans", []) if p.get("case_id") in case_ids]),
-        "human_evidence": academic_evidence.stable_hash([
-            {k: x.get(k) for k in ("human_evidence_id", "status",
-                                   "answer", "question_type")}
-            for x in human_entries if str(x.get("case_id")) in case_ids]),
-    })
+        "case_analysis": scoped_case_plans,
+        "human_evidence": scoped_human,
+        "literature_claims": scoped_literature_claims,
+        "literature_evidence": scoped_literature_evidence,
+        "literature_sources": scoped_literature_sources,
+    }
 
 
-def _invalidate_names(state: Dict[str, Any], names: Sequence[str], reason: str) -> None:
+def _case_analysis_writing_units(
+    chapter: Mapping[str, Any], case_plans: Mapping[str, Any],
+    selected_cases: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Split one case-analysis chapter by its already assigned target subsection."""
+    chapter_id = str(chapter.get("section_id") or "")
+    case_ids = [str(x) for x in chapter.get("cases") or [] if str(x)]
+    if not case_ids:
+        return [dict(chapter)]
+    selected_by_id = {str(x.get("case_id")): x
+                      for x in selected_cases.get("cases") or []}
+    plan_by_id = case_analysis.plan_index(dict(case_plans or {}))
+    groups: Dict[str, List[str]] = {}
+    for case_id in case_ids:
+        selected = selected_by_id.get(case_id) or {}
+        plan = plan_by_id.get(case_id) or {}
+        subsection = str(
+            plan.get("target_subsection") or selected.get("target_subsection") or "").strip()
+        if not subsection:
+            return [dict(chapter)]
+        if chapter_id and not (subsection == chapter_id or subsection.startswith(chapter_id + ".")):
+            return [dict(chapter)]
+        groups.setdefault(subsection, []).append(case_id)
+    if not groups:
+        return [dict(chapter)]
+
+    # The argument claim-to-case relation is represented by chapter cases; a
+    # unit keeps the chapter claims that mention at least one case in its group.
+    units = []
+    for subsection in sorted(groups, key=lambda value: [
+            int(part) if part.isdigit() else part for part in value.split(".")]):
+        unit = deepcopy(dict(chapter))
+        member_ids = groups[subsection]
+        member_claims = []
+        for claim_id in chapter.get("claims") or []:
+            # ``case_analysis_plans`` may carry supports_claims from the
+            # selected case; preserve a claim only when this unit has a case
+            # whose plan declares it.  If that relation is absent, retain the
+            # chapter assignment so the writer does not silently lose it.
+            if any(str(claim_id) in set(
+                    (plan_by_id.get(case_id) or {}).get("supports_claims") or
+                    (selected_by_id.get(case_id) or {}).get("supports_claims") or [])
+                    for case_id in member_ids):
+                member_claims.append(claim_id)
+        unit.update({
+            "writing_unit_id": subsection,
+            "parent_section_id": chapter_id,
+            "target_subsection": subsection,
+            "cases": member_ids,
+            "claims": member_claims or list(chapter.get("claims") or []),
+            "required_subsections": [],
+            "target_words": max(200, round(int(chapter.get("target_words") or 700)
+                                             / max(len(groups), 1))),
+            "unit_title": next((str((selected_by_id.get(case_id) or {}).get(
+                "strategy_group") or (plan_by_id.get(case_id) or {}).get(
+                "strategy_group") or "案例分析") for case_id in member_ids),
+                                "案例分析"),
+            "artifact_id": f"subsection:{subsection}",
+        })
+        units.append(unit)
+    return units
+
+
+def _write_writing_units(
+    state: Dict[str, Any], artifact_dir: Path, outline: Mapping[str, Any],
+    research_model: Dict[str, Any], argument_plan: Dict[str, Any],
+    selected_cases: Dict[str, Any], evidence: Dict[str, Any],
+    literature_sources_artifact: Dict[str, Any],
+    literature_evidence_artifact: Dict[str, Any],
+    literature_claims_artifact: Dict[str, Any], case_plans: Dict[str, Any],
+    human_entries: Iterable[Dict[str, Any]], sections_dep: str,
+    existing: Mapping[str, Dict[str, Any]], forced: set[str],
+    call_llm: Callable, provider: str, api_key: str, model: str,
+    save_state: Callable, on_status: Optional[Callable] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Write/reuse scoped units, then deterministically assemble each chapter."""
+    written: List[Dict[str, Any]] = []
+    writing_units: List[Dict[str, Any]] = []
+    prior_summaries: List[Dict[str, str]] = []
+
+    def save_checkpoint() -> None:
+        partial = {"schema_version": VERSIONS["writer_version"],
+                   "sections": written, "writing_units": writing_units}
+        partial["content_hash"] = academic_evidence.stable_hash(
+            {k: v for k, v in partial.items() if k != "content_hash"})
+        _save_artifact(
+            state, artifact_dir, "sections", partial, sections_dep,
+            VERSIONS["writer_version"],
+            input_segment_ids=[],
+            input_artifact_ids=["outline", *[
+                str(item.get("artifact_id")) for item in writing_units
+                if item.get("artifact_id")]])
+        save_state(state)
+
+    for chapter in outline.get("sections", []):
+        chapter_id = str(chapter.get("section_id") or "")
+        units = (_case_analysis_writing_units(chapter, case_plans, selected_cases)
+                 if str(chapter.get("role") or "") == "case_analysis"
+                 else [dict(chapter)])
+        chapter_units: List[Dict[str, Any]] = []
+        for unit in units:
+            unit_id = str(unit.get("writing_unit_id") or unit.get("section_id"))
+            artifact_id = str(unit.get("artifact_id") or f"section:{unit_id}")
+            inputs = _section_dependency_inputs(
+                unit, argument_plan, selected_cases, evidence,
+                literature_sources_artifact, literature_evidence_artifact,
+                literature_claims_artifact, case_plans, human_entries)
+            unit_hash = _section_dependency_hash(
+                unit, argument_plan, selected_cases, evidence,
+                literature_sources_artifact, literature_evidence_artifact,
+                literature_claims_artifact, case_plans, human_entries)
+            # Case-bearing units consume scoped plans through explicit case
+            # nodes.  An umbrella selected-cases or case-plan edge would make
+            # one stale case invalidate every sibling subsection.
+            input_artifact_ids = [
+                *(["argument_plan"] if inputs.get("claims") else []),
+                *( [f"case:{case_id}" for case_id in unit.get("cases") or []]
+                  if unit.get("cases") else
+                  (["selected_cases"]
+                   if inputs.get("synthetic_policy") is not None or
+                   inputs.get("case_count_policy") is not None else [])),
+                *( ["literature_claims", "literature_evidence", "literature_sources"]
+                  if inputs.get("literature_claims") or inputs.get(
+                      "literature_evidence") or inputs.get("literature_sources") else []),
+            ]
+            old = existing.get(artifact_id) or existing.get(unit_id)
+            old_record = artifact_record(state, artifact_id)
+            can_reuse = bool(
+                old and old.get("dependency_hash") == unit_hash
+                and old_record.get("status") == "valid"
+                and unit_id not in forced and chapter_id not in forced)
+            if can_reuse:
+                item = dict(old)
+            else:
+                packet = _section_packet(
+                    unit, research_model, argument_plan, selected_cases, evidence,
+                    outline, prior_summaries, literature_sources_artifact,
+                    literature_evidence_artifact, literature_claims_artifact, case_plans)
+                if on_status:
+                    on_status(f"【学术写作 7/11】正在生成写作单元 {unit_id}...")
+                content = _write_section(packet, call_llm, provider, api_key, model)
+                item = {
+                    "section_id": unit_id,
+                    "parent_section_id": chapter_id if unit.get("writing_unit_id") else None,
+                    "writing_unit_id": unit.get("writing_unit_id"),
+                    "artifact_id": artifact_id,
+                    "artifact_type": "writing_subsection"
+                    if unit.get("writing_unit_id") else "writing_section",
+                    "title": unit.get("unit_title") or unit.get("title") or unit_id,
+                    "content": content,
+                    "summary": re.sub(r"<!--.*?-->", "", content)[:240],
+                    "dependency_hash": unit_hash,
+                    "input_segment_ids": inputs.get("segment_ids") or [],
+                    "input_artifact_ids": input_artifact_ids,
+                    "provenance": _packet_provenance(packet),
+                }
+            item = dict(item)
+            item.update({
+                "section_id": unit_id,
+                "parent_section_id": chapter_id if unit.get("writing_unit_id") else
+                item.get("parent_section_id"),
+                "writing_unit_id": unit.get("writing_unit_id") or
+                item.get("writing_unit_id"),
+                "artifact_id": artifact_id,
+                "artifact_type": "writing_subsection"
+                if unit.get("writing_unit_id") else "writing_section",
+                "title": item.get("title") or unit.get("unit_title") or
+                unit.get("title") or unit_id,
+                "dependency_hash": unit_hash,
+                "input_segment_ids": _normalize_id_list(
+                    inputs.get("segment_ids") or item.get("input_segment_ids")),
+                "input_artifact_ids": _normalize_id_list(input_artifact_ids),
+                "status": "valid",
+                "stale_reason": None,
+            })
+            normalized = _ensure_section_contract(str(item.get("content") or ""), unit)
+            if str(unit.get("role") or "") == "case_analysis" and unit.get("cases"):
+                packet = _section_packet(
+                    unit, research_model, argument_plan, selected_cases, evidence,
+                    outline, prior_summaries, literature_sources_artifact,
+                    literature_evidence_artifact, literature_claims_artifact, case_plans)
+                _bound, visible_nodes = _realize_visible_case_examples(
+                    normalized, evidence, selected_cases, case_plans)
+                visible_ids = {str(node.get("case_id")) for node in visible_nodes}
+                missing = [str(case_id) for case_id in unit.get("cases") or []
+                           if str(case_id) not in visible_ids]
+                if missing:
+                    normalized = _repair_missing_case_examples(
+                        normalized, packet, missing, call_llm, provider, api_key, model)
+            if normalized != item.get("content"):
+                item.update(content=normalized,
+                            summary=re.sub(r"<!--.*?-->", "", normalized)[:240])
+            item["content_hash"] = academic_evidence.stable_hash({
+                "content": item.get("content") or "",
+                "dependency_hash": unit_hash,
+            })
+            _save_embedded_artifact_record(
+                state, artifact_id, item, unit_hash, VERSIONS["writer_version"],
+                input_segment_ids=item.get("input_segment_ids") or [],
+                input_artifact_ids=item.get("input_artifact_ids") or [],
+                artifact_type=str(item.get("artifact_type") or "writing_section"))
+            chapter_units.append(item)
+            writing_units.append(item)
+            save_checkpoint()
+
+        is_composite = len(units) > 1 or bool(
+            units and units[0].get("writing_unit_id"))
+        if is_composite:
+            chapter_hash = academic_evidence.stable_hash({
+                "chapter_id": chapter_id, "title": chapter.get("title"),
+                "subsections": [x.get("dependency_hash") for x in chapter_units],
+                "writer": VERSIONS["writer_version"],
+            })
+            old_chapter = existing.get(f"chapter:{chapter_id}")
+            if (old_chapter and old_chapter.get("dependency_hash") == chapter_hash
+                    and chapter_id not in forced):
+                chapter_item = dict(old_chapter)
+            else:
+                chapter_item = {
+                    "section_id": chapter_id,
+                    "artifact_id": f"chapter:{chapter_id}",
+                    "artifact_type": "chapter_composite",
+                    "title": chapter.get("title") or chapter_id,
+                    "content": "\n\n".join(str(x.get("content") or "").strip()
+                                                for x in chapter_units),
+                    "summary": " ".join(str(x.get("summary") or "")
+                                           for x in chapter_units)[:240],
+                    "dependency_hash": chapter_hash,
+                    # Chapter composition depends directly on subsection
+                    # artifacts; segment closure belongs to those children.
+                    "input_segment_ids": [],
+                    "input_artifact_ids": [str(x.get("artifact_id"))
+                                           for x in chapter_units if x.get("artifact_id")],
+                    "subsection_ids": [str(x.get("writing_unit_id"))
+                                       for x in chapter_units if x.get("writing_unit_id")],
+                }
+            chapter_item["subsections"] = chapter_units
+            chapter_item["status"] = "valid"
+            chapter_item["stale_reason"] = None
+            chapter_item["content_hash"] = academic_evidence.stable_hash({
+                "content": chapter_item.get("content") or "",
+                "dependency_hash": chapter_hash,
+            })
+            _save_embedded_artifact_record(
+                state, f"chapter:{chapter_id}", chapter_item, chapter_hash,
+                VERSIONS["writer_version"],
+                input_segment_ids=chapter_item.get("input_segment_ids") or [],
+                input_artifact_ids=chapter_item.get("input_artifact_ids") or [],
+                artifact_type="chapter_composite")
+            chapter_units = [chapter_item]
+        written.append(chapter_units[0])
+        prior_summaries.append({"section_id": chapter_id,
+                                "summary": written[-1].get("summary") or ""})
+        save_checkpoint()
+    return written, writing_units
+
+
+def _sections_container(written: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build a sections checkpoint without losing embedded subsection caches."""
+    units = []
+    seen = set()
+    for chapter in written:
+        if str(chapter.get("artifact_id") or "").startswith("chapter:"):
+            for unit in chapter.get("subsections") or []:
+                artifact_id = str(unit.get("artifact_id") or "")
+                if artifact_id and artifact_id not in seen:
+                    units.append(unit)
+                    seen.add(artifact_id)
+        else:
+            artifact_id = str(chapter.get("artifact_id") or "")
+            if artifact_id and artifact_id not in seen:
+                units.append(chapter)
+                seen.add(artifact_id)
+    return {"schema_version": VERSIONS["writer_version"],
+            "sections": written, "writing_units": units}
+
+
+def _rebuild_targeted_case_plans(
+    old_plans: Optional[Dict[str, Any]], selected_cases: Mapping[str, Any],
+    stale_case_ids: Iterable[str], evidence: Dict[str, Any],
+    argument_plan: Dict[str, Any], literature_claims_artifact: Dict[str, Any],
+    call_llm: Callable, provider: str, api_key: str, model: str,
+    human_entries: Iterable[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Rewrite only stale case analyses and retain untouched plans verbatim."""
+    if not old_plans:
+        return None
+    stale_ids = {str(x) for x in stale_case_ids if str(x)}
+    if not stale_ids:
+        return None
+    old_by_id = {str(x.get("case_id")): x for x in old_plans.get("plans") or []}
+    selected_ids = {str(x.get("case_id")) for x in selected_cases.get("cases") or []}
+    targets = sorted(stale_ids & selected_ids)
+    if not targets:
+        return None
+    subset = {**selected_cases, "cases": [
+        x for x in selected_cases.get("cases") or []
+        if str(x.get("case_id")) in set(targets)]}
+    rebuilt = case_analysis.build_case_analysis_plans(
+        evidence, subset, argument_plan, literature_claims_artifact,
+        call_llm, provider, api_key, model, human_entries)
+    rebuilt_by_id = {str(x.get("case_id")): x for x in rebuilt.get("plans") or []}
+    merged = [rebuilt_by_id.get(str(x.get("case_id"))) or x
+              for x in old_plans.get("plans") or []]
+    artifact = {**old_plans, "plans": sorted(
+        merged, key=lambda x: str(x.get("case_id")))}
+    artifact.pop("content_hash", None)
+    artifact["content_hash"] = academic_evidence.stable_hash(
+        {key: value for key, value in artifact.items() if key != "content_hash"})
+    return artifact
+
+
+def _invalidate_names(state: Dict[str, Any], names: Sequence[str], reason: Any) -> None:
     academic = _state(state)
+    statuses = academic.setdefault("artifact_status", {})
+    normalized_reason = _normalize_stale_reason(reason)
     for name in names:
-        academic["artifacts"].pop(name, None)
-    if reason not in academic["stale_reasons"]:
-        academic["stale_reasons"].append(reason)
+        raw = academic["artifacts"].get(name)
+        if not raw and name not in statuses:
+            # No downstream artifact exists yet.  Do not manufacture a stale
+            # record merely because an upstream input changed.
+            continue
+        if not raw:
+            # A status-only entry can be the compatibility marker left by a
+            # legacy record that was removed from the active index above.
+            statuses[name] = {
+                **dict(statuses.get(name) or {}),
+                "status": "stale", "stale_reason": normalized_reason,
+                "updated_at": _now(),
+            }
+            continue
+        # A pre-Stage-2 record has no lifecycle fields.  Keep its historical
+        # active-index behavior; the next successful rebuild upgrades it.
+        legacy = isinstance(raw, Mapping) and not any(
+            key in raw for key in ("artifact_id", "artifact_type", "status",
+                                   "input_segment_ids", "input_artifact_ids"))
+        if legacy:
+            academic["artifacts"].pop(name, None)
+            statuses[name] = {
+                **dict(statuses.get(name) or {}),
+                "status": "stale",
+                "stale_reason": normalized_reason,
+                "updated_at": _now(),
+            }
+            continue
+        record = _normalize_artifact_record(name, raw,
+                                            legacy_status=statuses.get(name))
+        record.update(status="stale", stale_reason=normalized_reason,
+                      updated_at=_now())
+        academic["artifacts"][name] = record
+        _write_status_mirror(academic, name, record)
+    reason_key = normalized_reason or {"code": "legacy_stale", "source_type": "system",
+                                       "source_id": ""}
+    if reason_key not in academic["stale_reasons"]:
+        academic["stale_reasons"].append(reason_key)
     if set(names) & {"research_model", "argument_plan", "selected_cases", "outline",
                      "sections", "validation", "review"}:
         state["p3_done"] = False
@@ -278,6 +1122,136 @@ def _invalidate_names(state: Dict[str, Any], names: Sequence[str], reason: str) 
     if "report" in names:
         state["p3_md"] = ""
         state["p3_sections"] = []
+
+
+def _artifact_records(state: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    academic = state.get("academic_state") or {}
+    artifacts = academic.get("artifacts") or {}
+    statuses = academic.get("artifact_status") or {}
+    records = {}
+    for name, raw in artifacts.items():
+        records[str(name)] = _normalize_artifact_record(
+            str(name), raw,
+            legacy_status=statuses.get(name) if isinstance(statuses, Mapping) else None)
+    return records
+
+
+def _artifact_impact_slice(
+    state: Mapping[str, Any], *, input_segment_ids: Iterable[Any] = (),
+    input_artifact_ids: Iterable[Any] = (),
+) -> Dict[str, Dict[str, Any]]:
+    """Find direct and reverse-transitive dependents from persisted edges."""
+    records = _artifact_records(state)
+    changed_segments = set(_normalize_id_list(input_segment_ids))
+    changed_artifacts = set(_normalize_id_list(input_artifact_ids))
+    queue: List[Tuple[str, str, Dict[str, str]]] = []
+    if changed_segments:
+        source_id = ",".join(sorted(changed_segments))
+        root_reason = {"code": "translation_segment_changed",
+                       "source_type": "segment", "source_id": source_id}
+        queue.append(("segment", source_id, root_reason))
+    for artifact_id in sorted(changed_artifacts):
+        queue.append(("artifact", artifact_id, {
+            "code": "artifact_changed", "source_type": "artifact",
+            "source_id": artifact_id}))
+    affected: Dict[str, Dict[str, Any]] = {}
+    while queue:
+        source_type, source_id, source_reason = queue.pop(0)
+        for name in sorted(records):
+            if name in affected:
+                continue
+            record = records[name]
+            if record.get("status") == "missing":
+                continue
+            direct_segments = set(record.get("input_segment_ids") or [])
+            direct_artifacts = set(record.get("input_artifact_ids") or [])
+            matches_segment = source_type == "segment" and bool(
+                direct_segments & {source_id} if "," not in source_id else
+                direct_segments & set(source_id.split(",")))
+            matches_artifact = source_type == "artifact" and source_id in direct_artifacts
+            self_changed = source_type == "artifact" and (
+                source_id == str(record.get("artifact_id") or name))
+            if not (matches_segment or matches_artifact or self_changed):
+                continue
+            reason = source_reason if matches_segment and source_type == "segment" else {
+                "code": "dependency_stale", "source_type": "artifact",
+                "source_id": source_id,
+            }
+            affected[name] = {
+                "record": record,
+                "stale_reason": reason,
+                "source_type": source_type,
+                "source_id": source_id,
+            }
+            queue.append(("artifact", str(record.get("artifact_id") or name), reason))
+    return affected
+
+
+def propagate_artifact_staleness(
+    state: Dict[str, Any], *, input_segment_ids: Iterable[Any] = (),
+    input_artifact_ids: Iterable[Any] = (),
+) -> Dict[str, Dict[str, Any]]:
+    """Persist targeted stale status while preserving each direct edge."""
+    academic = _state(state)
+    affected = _artifact_impact_slice(
+        state, input_segment_ids=input_segment_ids,
+        input_artifact_ids=input_artifact_ids)
+    for name, item in affected.items():
+        record = _normalize_artifact_record(
+            name, academic.get("artifacts", {}).get(name),
+            legacy_status=(academic.get("artifact_status") or {}).get(name))
+        record.update(status="stale", stale_reason=item["stale_reason"],
+                      updated_at=_now())
+        academic["artifacts"][name] = record
+        _write_status_mirror(academic, name, record)
+        item["record"] = record
+    if affected:
+        academic["updated_at"] = _now()
+    return affected
+
+
+def artifact_execution_action(name: str, record: Optional[Mapping[str, Any]] = None) -> str:
+    """Derive the next operation; actions are not persisted as lifecycle states."""
+    record = record or {}
+    status = str(record.get("status") or "valid")
+    if status == "valid":
+        return "reuse"
+    if status == "failed":
+        return "blocked"
+    artifact_type = str(record.get("artifact_type") or _artifact_type(name))
+    if artifact_type in {"report_composite", "writing_units_composite",
+                         "chapter_composite", "composite"}:
+        return "deterministic_reassemble"
+    if artifact_type in {"docx_export"} or name == "delivery_assets":
+        return "reexport"
+    if artifact_type in {"render_qa", "qa"}:
+        return "rerun_qa"
+    if artifact_type in {"writing_subsection", "writing_section"} or \
+            name in _LLM_ARTIFACTS or name in {
+            "synthetic_baselines", "synthetic_error_manifest", "synthetic_optimized"}:
+        return "llm_rewrite"
+    return "deterministic_reassemble"
+
+
+def artifact_execution_plan(
+    state: Mapping[str, Any], names: Optional[Iterable[str]] = None,
+) -> List[Dict[str, Any]]:
+    records = _artifact_records(state)
+    selected = set(str(x) for x in names) if names is not None else set(records)
+    plan = []
+    for name in sorted(selected):
+        record = records.get(name)
+        if record is None:
+            record = _normalize_artifact_record(name)
+            record["status"] = "missing"
+        plan.append({
+            "artifact_id": str(record.get("artifact_id") or name),
+            "artifact_type": record.get("artifact_type") or _artifact_type(name),
+            "status": record.get("status") or "missing",
+            "action": artifact_execution_action(name, record),
+            "stale_reason": record.get("stale_reason"),
+        })
+    return plan
 
 
 def sync_versions(state: Dict[str, Any], versions: Optional[Dict[str, str]] = None) -> None:
@@ -2440,6 +3414,7 @@ def _ensure_section_contract(text: str, section: Mapping[str, Any]) -> str:
     """Keep required template headings visible even when the model omits them."""
     required = list(section.get("required_subsections") or [])
     is_case_section = str(section.get("role") or "") == "case_analysis"
+    is_case_unit = is_case_section and bool(section.get("writing_unit_id"))
     case_roots = thesis_constraints.case_subsection_roots(section) \
         if is_case_section else ()
     lines = str(text or "").splitlines()
@@ -2504,7 +3479,7 @@ def _ensure_section_contract(text: str, section: Mapping[str, Any]) -> str:
     text = "\n".join(normalized).strip()
     if is_case_section:
         problem_root, solution_root = case_roots
-        if section.get("cases"):
+        if section.get("cases") and not is_case_unit:
             for root, title in ((problem_root, "翻译难点"),
                                 (solution_root, "翻译策略与解决方案")):
                 if not re.search(rf"^#{{3,6}}\s+{re.escape(root)}(?:\s|$)", text,
@@ -2516,12 +3491,13 @@ def _ensure_section_contract(text: str, section: Mapping[str, Any]) -> str:
         solution_ids = set(re.findall(
             rf"^#{{4,6}}\s+{re.escape(solution_root)}\.(\d+)\b", text,
             re.MULTILINE))
-        for root, suffixes in ((problem_root, problem_ids - solution_ids),
-                               (solution_root, solution_ids - problem_ids)):
-            for suffix in suffixes:
-                text = re.sub(
-                    rf"^#{{4,6}}\s+({re.escape(root)}\.{suffix}\s+.+)$",
-                    r"**\1**", text, flags=re.MULTILINE)
+        if not is_case_unit:
+            for root, suffixes in ((problem_root, problem_ids - solution_ids),
+                                   (solution_root, solution_ids - problem_ids)):
+                for suffix in suffixes:
+                    text = re.sub(
+                        rf"^#{{4,6}}\s+({re.escape(root)}\.{suffix}\s+.+)$",
+                        r"**\1**", text, flags=re.MULTILINE)
     missing_rqs = [str(rq) for rq in section.get("research_questions") or []
                    if f"<!--rq:{rq}-->" not in text]
     if missing_rqs:
@@ -3616,6 +4592,29 @@ def _normalize_user_facing_language(text: Any) -> str:
     return normalized
 
 
+def normalize_report_rendering(text: Any) -> str:
+    """Repair reachable transport/presentation artefacts in report prose.
+
+    ``>。`` is not a meaningful quotation: it is the remnant of a writer
+    label being passed through the case renderer.  Likewise, some legacy
+    report blocks contain a bold subsection title glued to the previous
+    paragraph.  Repair only these known shapes so legitimate Markdown
+    blockquotes and bold prose remain untouched.
+    """
+    normalized = str(text or "")
+    normalized = re.sub(
+        r"((?:\*{0,2}分析\*{0,2})\s*[：:]\s*)>\s*[。．]\s*",
+        r"\1", normalized)
+    normalized = re.sub(
+        r"(?P<lead>[。！？])\s*(?P<title>\d+(?:\.\d+)+\s+[^。\n*]{2,100})"
+        r"\*{2}\s*[。！？]",
+        r"\g<lead>\n\n### \g<title>\n\n",
+        normalized,
+    )
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized
+
+
 def finalize_report_tokens(
     report_md: str, evidence: Dict[str, Any],
     selected_cases: Optional[Dict[str, Any]] = None,
@@ -3639,7 +4638,7 @@ def finalize_report_tokens(
     # Internal portfolio labels stay in structured artifacts.  The visible
     # thesis should use ordinary academic wording instead of planner/debug
     # vocabulary, while source excerpts and internal JSON remain untouched.
-    return _normalize_user_facing_language(normalized)
+    return normalize_report_rendering(_normalize_user_facing_language(normalized))
 
 
 def _semantic_review(
@@ -4327,12 +5326,8 @@ def run_academic_pipeline(
                 VERSIONS["synthetic_error_manifest_version"])
 
         stage("synthetic_optimization", "【学术写作】绑定项目当前正式译文并进行对照...")
-        synthetic_optimizer_dep = academic_evidence.stable_hash({
-            "errors": synthetic_error_manifest["content_hash"],
-            "terminology": academic_evidence.stable_hash(
-                evidence.get("project_evidence", {}).get("glossary", [])),
-            "version": VERSIONS["synthetic_optimizer_version"],
-        })
+        synthetic_optimizer_dep = _synthetic_optimizer_dependency_hash(
+            synthetic_error_manifest, evidence)
         synthetic_optimized = _load_valid_artifact(
             state, artifact_dir, "synthetic_optimized", synthetic_optimizer_dep,
             VERSIONS["synthetic_optimizer_version"])
@@ -4475,6 +5470,11 @@ def run_academic_pipeline(
             "report_case_policy": report_case_policy,
             "version": VERSIONS["case_selection_version"],
         })
+        stale_case_ids = {
+            str(record.get("artifact_id", "").split(":", 1)[-1])
+            for name, record in _artifact_records(state).items()
+            if name.startswith("case:") and record.get("status") == "stale"
+        }
         selected_cases = _load_valid_artifact(
             state, artifact_dir, "selected_cases", case_dep,
             VERSIONS["case_selection_version"])
@@ -4491,6 +5491,11 @@ def run_academic_pipeline(
             selected_cases = _save_artifact(
                 state, artifact_dir, "selected_cases", selected_cases, case_dep,
                 VERSIONS["case_selection_version"])
+        # Human case decisions live in state.json, while the generated
+        # selection artifact remains the reproducible candidate record.  Apply
+        # the overlay before every downstream consumer so approval/exclusion
+        # is visible without ever changing case_origin or text_role.
+        selected_cases = apply_case_review_overlays(selected_cases, state)
 
         if report_stage == "final_report":
             portfolio_path = artifact_dir / "final-contrast-case-portfolio.md"
@@ -4583,9 +5588,17 @@ def run_academic_pipeline(
             state, artifact_dir, "case_analysis_plans", case_analysis_dep,
             VERSIONS["case_analysis_version"])
         if case_plans is None:
-            case_plans = case_analysis.build_case_analysis_plans(
-                evidence, selected_cases, argument_plan, literature_claims_artifact,
+            old_case_plans = _read_artifact(
+                artifact_dir / ARTIFACT_FILES["case_analysis_plans"])
+            case_plans = _rebuild_targeted_case_plans(
+                old_case_plans, selected_cases, stale_case_ids, evidence,
+                argument_plan, literature_claims_artifact,
                 call_llm, provider, api_key, model, human_entries)
+            if case_plans is None:
+                case_plans = case_analysis.build_case_analysis_plans(
+                    evidence, selected_cases, argument_plan,
+                    literature_claims_artifact, call_llm, provider, api_key,
+                    model, human_entries)
             case_plans = _save_artifact(
                 state, artifact_dir, "case_analysis_plans", case_plans,
                 case_analysis_dep, VERSIONS["case_analysis_version"])
@@ -4613,74 +5626,36 @@ def run_academic_pipeline(
                                      VERSIONS["outline_version"])
 
         stage("writing", "【学术写作 7/11】按论点与分节证据撰写正文...")
+        unit_plans = []
+        for chapter in outline.get("sections", []):
+            if str(chapter.get("role") or "") == "case_analysis":
+                unit_plans.extend(_case_analysis_writing_units(
+                    chapter, case_plans, selected_cases))
+            else:
+                unit_plans.append(dict(chapter))
+        unit_keys = [_section_dependency_hash(
+            unit, argument_plan, selected_cases, evidence,
+            literature_sources_artifact, literature_evidence_artifact,
+            literature_claims_artifact, case_plans, human_entries)
+                     for unit in unit_plans]
         sections_dep = academic_evidence.stable_hash({
-            "outline": outline["content_hash"], "evidence": evidence["content_hash"],
-            "literature_sources": literature_sources_artifact["sources_metadata_hash"],
-            "literature_evidence": literature_evidence_artifact["content_hash"],
-            "literature_claims": literature_claims_artifact["content_hash"],
+            "outline": outline["content_hash"], "writing_units": unit_keys,
             "writer": VERSIONS["writer_version"],
         })
         section_artifact = _load_valid_artifact(
             state, artifact_dir, "sections", sections_dep, VERSIONS["writer_version"])
-        existing = ({x["section_id"]: x
-                     for x in (section_artifact or {}).get("sections", [])}
+        existing = (_section_cache_index(section_artifact)
                     if section_artifact else _load_reusable_sections(artifact_dir))
         forced = set(academic.get("forced_sections") or [])
-        written: List[Dict[str, Any]] = []
-        prior_summaries: List[Dict[str, str]] = []
-        for plan in outline.get("sections", []):
-            sid = plan["section_id"]
-            section_key = _section_dependency_hash(
-                plan, argument_plan, selected_cases, evidence,
-                literature_sources_artifact, literature_evidence_artifact,
-                literature_claims_artifact, case_plans, human_entries)
-            old = existing.get(sid)
-            if old and old.get("dependency_hash") == section_key and sid not in forced:
-                item = old
-            else:
-                packet = _section_packet(plan, research_model, argument_plan,
-                                         selected_cases, evidence, outline, prior_summaries,
-                                         literature_sources_artifact,
-                                         literature_evidence_artifact,
-                                         literature_claims_artifact, case_plans)
-                if on_status:
-                    on_status(f"【学术写作 7/11】正在生成第 {sid} 节...")
-                content = _write_section(packet, call_llm, provider, api_key, model)
-                item = {
-                    "section_id": sid, "title": plan["title"], "content": content,
-                    "summary": re.sub(r"<!--.*?-->", "", content)[:240],
-                    "dependency_hash": section_key,
-                    "provenance": _packet_provenance(packet),
-                }
-            normalized_content = _ensure_section_contract(
-                str(item.get("content") or ""), plan)
-            if str(plan.get("role") or "") == "case_analysis" and plan.get("cases"):
-                packet = _section_packet(
-                    plan, research_model, argument_plan, selected_cases, evidence,
-                    outline, prior_summaries, literature_sources_artifact,
-                    literature_evidence_artifact, literature_claims_artifact,
-                    case_plans)
-                _bound, visible_nodes = _realize_visible_case_examples(
-                    normalized_content, evidence, selected_cases, case_plans)
-                visible_ids = {str(node.get("case_id")) for node in visible_nodes}
-                missing_case_ids = [str(case_id) for case_id in plan.get("cases") or []
-                                    if str(case_id) not in visible_ids]
-                if missing_case_ids:
-                    normalized_content = _repair_missing_case_examples(
-                        normalized_content, packet, missing_case_ids,
-                        call_llm, provider, api_key, model)
-            if normalized_content != item.get("content"):
-                item = {**item, "content": normalized_content,
-                        "summary": re.sub(
-                            r"<!--.*?-->", "", normalized_content)[:240]}
-            written.append(item)
-            prior_summaries.append({"section_id": sid, "summary": item["summary"]})
-            partial = {"schema_version": VERSIONS["writer_version"], "sections": written}
-            partial["content_hash"] = academic_evidence.stable_hash(
-                {k: v for k, v in partial.items() if k != "content_hash"})
-            _save_artifact(state, artifact_dir, "sections", partial, sections_dep,
-                           VERSIONS["writer_version"])
-            save_state(state)
+        written, writing_units = _write_writing_units(
+            state, artifact_dir, outline, research_model, argument_plan,
+            selected_cases, evidence, literature_sources_artifact,
+            literature_evidence_artifact, literature_claims_artifact, case_plans,
+            human_entries, sections_dep, existing, forced, call_llm, provider,
+            api_key, model, save_state, on_status)
+        prior_summaries = [{"section_id": str(item.get("section_id")),
+                            "summary": str(item.get("summary") or "")}
+                           for item in written]
         academic["forced_sections"] = []
         report_md = _compose_report(written)
         report_md = finalize_report_tokens(report_md, evidence, selected_cases, outline)
@@ -4829,8 +5804,7 @@ def run_academic_pipeline(
                         "repaired_at": _now(),
                     })
                 written = [by_id[x["section_id"]] for x in outline.get("sections", [])]
-                section_artifact = {"schema_version": VERSIONS["writer_version"],
-                                    "sections": written}
+                section_artifact = _sections_container(written)
                 section_artifact["content_hash"] = academic_evidence.stable_hash(
                     {k: v for k, v in section_artifact.items() if k != "content_hash"})
                 _save_artifact(state, artifact_dir, "sections", section_artifact,
@@ -4925,8 +5899,7 @@ def run_academic_pipeline(
                            argument_dep, VERSIONS["argument_plan_version"])
             _save_artifact(state, artifact_dir, "outline", outline, outline_dep,
                            VERSIONS["outline_version"])
-            section_artifact = {"schema_version": VERSIONS["writer_version"],
-                                "sections": written}
+            section_artifact = _sections_container(written)
             section_artifact["content_hash"] = academic_evidence.stable_hash(
                 {k: v for k, v in section_artifact.items() if k != "content_hash"})
             _save_artifact(state, artifact_dir, "sections", section_artifact,

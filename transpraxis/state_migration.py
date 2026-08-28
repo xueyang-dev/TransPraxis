@@ -26,6 +26,7 @@ DELIVERY_STATUSES = ("draft", "review_required", "approved", "final")
 def _default_new_fields() -> Dict[str, Any]:
     """新增字段的默认值（旧任务加载时补齐，避免 KeyError）。"""
     from .academic_writer import default_academic_state
+    from .finalization import default_dependency_impact, default_final_qa
     return {
         "stage": "INGESTED",
         "delivery_status": "draft",
@@ -72,6 +73,19 @@ def _default_new_fields() -> Dict[str, Any]:
         "literature_sources": [],
         "report_template": None,
         "report_template_contract": None,
+        # v0.4 finalization state.  These are intentionally plain records in
+        # state.json so older jobs can be opened without a migration step.
+        "translation_truth": {
+            "authority": "CURRENT_TRANSLATION",
+            "version": 0,
+            "last_changed_at": None,
+            "last_change": None,
+        },
+        "dependency_impact": default_dependency_impact(),
+        "case_reviews": {},
+        "case_review_overrides": {},
+        "final_qa": default_final_qa(),
+        "compliance_profile_id": "MTI_PRACTICE_REPORT_DEFAULT",
         "academic_state": default_academic_state(),
     }
 

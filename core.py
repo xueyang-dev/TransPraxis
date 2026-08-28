@@ -8,7 +8,9 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import threading
+import tempfile
 import time
 import traceback
 import uuid
@@ -38,6 +40,7 @@ from transpraxis import model_roles as _model_roles
 from transpraxis import pdf_ingestion as _pdf_ingestion
 from transpraxis import translation_protocol as _translation_protocol
 from transpraxis import translation_target as _translation_target
+from transpraxis import finalization as _finalization
 
 # ================= 常量 =================
 # 任务进度与过程文件的本地存储目录（已加入 .gitignore）
@@ -1426,6 +1429,30 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
             save_job_state(job_id, state)
     paras = state["paras"]
     pairs = state["pairs"]
+    truncated_indexes = []
+
+    def _commit_translation_batch(batch_pairs, offset):
+        nonlocal truncated_indexes
+        pairs.extend(batch_pairs)
+        changed_indexes = list(range(offset, offset + len(batch_pairs)))
+        if changed_indexes:
+            _mark_translation_truth_changed(
+                job_id, state, changed_indexes,
+                "翻译流水线写入 CURRENT_TRANSLATION；记录该批次影响范围",
+                actor="pipeline", action="translation_batch")
+        truncated_indexes = []
+        save_job_state(job_id, state)
+
+    def _save_translation_failure():
+        nonlocal truncated_indexes
+        if truncated_indexes:
+            _mark_translation_truth_changed(
+                job_id, state, truncated_indexes,
+                "断点恢复截断未完成批次；CURRENT_TRANSLATION 已改变",
+                actor="pipeline", action="translation_checkpoint_truncate")
+            truncated_indexes = []
+        save_job_state(job_id, state)
+
     batches = make_batches(
         paras, max_chars=TRANSLATION_MAX_BATCH_CHARS,
         semantic_units=state.get("semantic_units")
@@ -1439,6 +1466,7 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
         cum_end += len(b)
         if cum_end > len(pairs):
             if len(pairs) > prev_end:
+                truncated_indexes = list(range(prev_end, len(pairs)))
                 del pairs[prev_end:]
             start_batch = bi
             break
@@ -1566,7 +1594,7 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                 })
                 # 批次解析失败时降级为逐段翻译，保证进度不中断
                 if len(texts) == 1:
-                    save_job_state(job_id, state)
+                    _save_translation_failure()
                     raise
                 if on_caption:
                     on_caption("⚠️ 批次翻译返回格式异常，降级为逐段翻译...")
@@ -1581,7 +1609,7 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                             call_llm_fn=translator_call)[0])
                 except Exception as single_error:
                     failure["reason"] = str(single_error)[:500]
-                    save_job_state(job_id, state)
+                    _save_translation_failure()
                     raise
                 failure["recovered"] = True
             for (i, src), tgt in zip(to_translate, targets):
@@ -1943,8 +1971,7 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                         tm[p["source"]] = {"target": p["target"], "reviewed": True}
                     stats["reviewed_segments"] += 1
 
-        pairs.extend(batch_pairs)
-        save_job_state(job_id, state)  # 正式状态先提交，TM 只随后晋升
+        _commit_translation_batch(batch_pairs, offset)  # 正式状态先提交，TM 只随后晋升
         _checkpoint.append_event(job_dir(job_id), {
             "batch": bi, "offset": offset, "phase": "state_commit_done",
             "pairs_count": len(pairs),
@@ -3324,6 +3351,361 @@ def _invalidate_final_delivery_state(state):
     return state
 
 
+def _finalization_artifacts(job_id):
+    """Load only the small set of artifacts needed for impact explanations."""
+    names = ("selected_cases", "outline", "argument_plan", "sections")
+    return {name: load_academic_artifact(job_id, name) for name in names}
+
+
+def _reset_final_qa(state, reason=""):
+    qa = _finalization.normalize_final_qa(state.get("final_qa"))
+    qa.update({
+        "structural_qa": "NOT_RUN",
+        "libreoffice_render": "NOT_RUN",
+        "author_visual_review": "NOT_CONFIRMED",
+        "word_final_review": "NOT_CONFIRMED",
+        "rendered_at": None,
+        "page_count": None,
+        "updated_at": _finalization.now_iso(),
+    })
+    if reason:
+        notes = dict(qa.get("notes") or {})
+        notes["stale_reason"] = reason
+        qa["notes"] = notes
+    state["final_qa"] = qa
+    return qa
+
+
+def _mark_translation_truth_changed(
+    job_id, state, indexes, reason, *, actor="user", action="translation_changed",
+):
+    """Record one canonical CURRENT_TRANSLATION mutation and its impact slice."""
+    indexes = sorted({int(index) for index in indexes
+                      if isinstance(index, int) or str(index).lstrip("-").isdigit()})
+    truth = dict(state.get("translation_truth") or {})
+    truth["authority"] = _finalization.CURRENT_TRANSLATION
+    truth["version"] = int(truth.get("version") or 0) + 1
+    truth["last_changed_at"] = _finalization.now_iso()
+    truth["last_change"] = {
+        "action": action,
+        "actor": actor,
+        "reason": reason,
+        "segment_indexes": indexes,
+        "segment_ids": [
+            _finalization.segment_id(
+                job_id, index, (state.get("pairs") or [])[index]
+                if 0 <= index < len(state.get("pairs") or []) else {})
+            for index in indexes
+        ],
+    }
+    state["translation_truth"] = truth
+    changed_segment_ids = list(truth["last_change"]["segment_ids"])
+    from transpraxis import academic_writer
+    propagated = academic_writer.propagate_artifact_staleness(
+        state, input_segment_ids=changed_segment_ids)
+    # Make the read-only artifact inputs available to the pure impact helper,
+    # then remove them before state is persisted.
+    enriched = dict(state)
+    enriched["_finalization_artifacts"] = _finalization_artifacts(job_id)
+    impact = _finalization.build_dependency_impact(
+        enriched, job_id, indexes, reason)
+    state["dependency_impact"] = impact
+    stale_names = [item.get("id") for item in impact.get("affected") or []
+                   if item.get("kind") == "artifact"]
+    academic = state.setdefault("academic_state", {})
+    # Legacy records have no direct edges and retain their historical
+    # invalidation behavior. Canonical records are changed only by the graph
+    # propagation above, preserving their own direct inputs.
+    if not propagated and stale_names:
+        academic_writer._invalidate_names(
+            state, [name for name in stale_names
+                    if name not in {"delivery_assets", "libreoffice_render"}], reason)
+    if propagated:
+        if any(name in propagated for name in {"sections", "report", "validation", "review"}):
+            state["p3_done"] = False
+            academic["status"] = "stale"
+        if any(name in propagated for name in {"report", "sections"}):
+            state["p3_md"] = ""
+            state["p3_sections"] = []
+    _reset_final_qa(state, reason)
+    _invalidate_final_delivery_state(state)
+    state.setdefault("human_actions", []).append({
+        "finding_id": f"segment-mutation:{','.join(map(str, indexes)) or 'none'}",
+        "action": action,
+        "note": reason,
+        "timestamp": _finalization.now_iso(),
+        "actor": actor,
+    })
+    return state
+
+
+def translation_truth_view(job_id, state=None):
+    """Return the user-facing authority/version summary for current targets."""
+    state = state if state is not None else load_job_state(job_id) or {}
+    truth = dict(state.get("translation_truth") or {})
+    pairs = state.get("pairs") or []
+    return {
+        "authority": truth.get("authority") or _finalization.CURRENT_TRANSLATION,
+        "version": int(truth.get("version") or 0),
+        "segment_count": len(pairs),
+        "last_changed_at": truth.get("last_changed_at"),
+        "last_change": dict(truth.get("last_change") or {}),
+        "label": "CURRENT_TRANSLATION · 当前工作译文",
+    }
+
+
+def dependency_impact_view(job_id, state=None):
+    state = state if state is not None else load_job_state(job_id) or {}
+    return _finalization.normalize_dependency_impact(state.get("dependency_impact"))
+
+
+def compliance_profile_view(job_id, state=None):
+    """Evaluate the explicit default MTI profile against current persisted artifacts."""
+    state = state if state is not None else load_job_state(job_id) or {}
+    from transpraxis import thesis_constraints
+    artifacts = {
+        name: load_academic_artifact(job_id, name)
+        for name in ("evidence", "report", "validation", "outline",
+                     "selected_cases", "literature_sources",
+                     "final_docx_validation")
+    }
+    profile_id = str(state.get("compliance_profile_id") or "MTI_PRACTICE_REPORT_DEFAULT")
+    profile = thesis_constraints.compliance_profile(profile_id)
+    return _finalization.evaluate_compliance(
+        state, artifacts, profile, state.get("p3_md") or "")
+
+
+def _case_artifact_case(job_id, case_id):
+    selected = load_academic_artifact(job_id, "selected_cases") or {}
+    case = next((item for item in selected.get("cases") or []
+                 if str(item.get("case_id")) == str(case_id)), None)
+    return selected, case
+
+
+def _mark_case_downstream_stale(job_id, state, case_id, reason, *, actor="user", action="case_changed"):
+    from transpraxis import academic_writer
+    propagated = academic_writer.propagate_artifact_staleness(
+        state, input_artifact_ids=[f"case:{case_id}"])
+    enriched = dict(state)
+    enriched["_finalization_artifacts"] = _finalization_artifacts(job_id)
+    impact = _finalization.build_dependency_impact(
+        enriched, job_id, [], reason, changed_case_ids=[str(case_id)])
+    state["dependency_impact"] = impact
+    stale_names = [item.get("id") for item in impact.get("affected") or []
+                   if item.get("kind") == "artifact"]
+    academic = state.setdefault("academic_state", {})
+    # The old fallback is retained only for pre-Stage-2 records. Canonical
+    # records are invalidated by their case direct edge and reverse traversal.
+    if not propagated and stale_names:
+        academic_writer._invalidate_names(state, stale_names, reason)
+    if propagated and any(name in propagated for name in {"sections", "report"}):
+        state["p3_done"] = False
+        academic["status"] = "stale"
+    _reset_final_qa(state, reason)
+    _invalidate_final_delivery_state(state)
+    state.setdefault("human_actions", []).append({
+        "finding_id": f"case:{case_id}", "action": action, "note": reason,
+        "timestamp": _finalization.now_iso(), "actor": actor,
+    })
+    return state
+
+
+def review_academic_case(job_id, case_id, status, note="", actor="user"):
+    """Approve/exclude one case without changing its provenance dimensions."""
+    state = load_job_state(job_id)
+    if state is None:
+        return None, False, "任务不存在"
+    selected, case = _case_artifact_case(job_id, case_id)
+    if case is None:
+        return state, False, "找不到案例"
+    from transpraxis import case_provenance
+    normalized = case_provenance.with_provenance(case)
+    review_status = str(status or "").strip().lower()
+    if review_status not in case_provenance.REVIEW_STATUSES:
+        return state, False, "案例审校状态无效"
+    state.setdefault("case_reviews", {})[str(case_id)] = {
+        "review_status": review_status,
+        "case_origin": normalized.get("case_origin"),
+        "text_role": dict(normalized.get("text_role") or {}),
+        "note": str(note or "")[:700],
+        "updated_at": _finalization.now_iso(),
+        "actor": actor,
+    }
+    reason = ("批准案例纳入学术分析" if review_status == "approved"
+              else f"排除案例：{str(note or '人工排除')[:180]}")
+    _mark_case_downstream_stale(
+        job_id, state, str(case_id), reason, actor=actor,
+        action="case_approved" if review_status == "approved" else "case_excluded")
+    save_job_state(job_id, state)
+    return state, True, "已保存案例审校状态"
+
+
+def update_synthetic_baseline(job_id, case_id, text, *, status="modified", note="", actor="user"):
+    """Modify or reject a synthetic baseline; never mutate translation truth."""
+    state = load_job_state(job_id)
+    if state is None:
+        return None, False, "任务不存在"
+    _selected, case = _case_artifact_case(job_id, case_id)
+    if case is None:
+        return state, False, "找不到案例"
+    from transpraxis import case_provenance
+    if not case_provenance.is_synthetic(case):
+        return state, False, "只有合成对照案例可以修改或拒绝模拟初译"
+    if status not in {"modified", "rejected", "approved"}:
+        return state, False, "模拟初译状态无效"
+    record = dict((state.setdefault("case_review_overrides", {}).get(str(case_id)) or {}))
+    if status == "modified":
+        text = str(text or "").strip()
+        if not text:
+            return state, False, "模拟初译不能为空"
+        record["synthetic_baseline_text"] = text
+    record.update({
+        "baseline_status": status,
+        "note": str(note or "")[:700],
+        "updated_at": _finalization.now_iso(),
+        "actor": actor,
+    })
+    state["case_review_overrides"][str(case_id)] = record
+    reason = ("修改模拟初译，需重跑该案例下游"
+              if status == "modified" else "拒绝模拟初译，需替换或重新确认该案例")
+    _mark_case_downstream_stale(
+        job_id, state, str(case_id), reason, actor=actor,
+        action="synthetic_baseline_modified" if status == "modified"
+        else "synthetic_baseline_rejected")
+    save_job_state(job_id, state)
+    return state, True, "已保存模拟初译决定"
+
+
+def record_final_qa(job_id, field, status, note="", actor="user"):
+    """Persist one of the four independent final-QA facts."""
+    if field not in _finalization.QA_FIELDS:
+        raise ValueError(f"未知最终 QA 项：{field}")
+    state = load_job_state(job_id)
+    if state is None:
+        return None
+    allowed = {"PASS", "FAIL", "NOT_RUN"} if field in {
+        "structural_qa", "libreoffice_render"} else {"CONFIRMED", "NOT_CONFIRMED"}
+    if status not in allowed:
+        raise ValueError(f"{field} 状态无效：{status}")
+    qa = _finalization.normalize_final_qa(state.get("final_qa"))
+    qa[field] = status
+    qa["translation_truth_version"] = int(
+        (state.get("translation_truth") or {}).get("version") or 0)
+    notes = dict(qa.get("notes") or {})
+    if note:
+        notes[field] = str(note)[:700]
+    qa["notes"] = notes
+    qa["updated_at"] = _finalization.now_iso()
+    state["final_qa"] = qa
+    save_job_state(job_id, state)
+    return state
+
+
+def run_libreoffice_render_qa(job_id, state=None):
+    """Render the current report/translation DOCX with LibreOffice and record QA."""
+    state = state or load_job_state(job_id)
+    if state is None:
+        raise ValueError(f"找不到任务 {job_id}")
+    docx = report_docx_bytes(job_id, state)
+    document_kind = "report"
+    if docx is None:
+        try:
+            docx = build_delivery_assets(job_id, state).get("translation.docx")
+            document_kind = "translation"
+        except Exception as exc:
+            raise RuntimeError(f"当前 DOCX 不可生成：{str(exc)[:180]}") from exc
+    if not docx:
+        raise RuntimeError("当前没有可渲染的 DOCX")
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise RuntimeError("未找到 LibreOffice（soffice），无法运行渲染预检")
+    from transpraxis import academic_evidence, academic_writer
+    with tempfile.TemporaryDirectory(prefix=f"transpraxis-lo-{job_id}-") as tmp:
+        tmp_path = Path(tmp)
+        source_path = tmp_path / "current.docx"
+        source_path.write_bytes(docx)
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        command = [soffice, "--headless", "-env:UserInstallation=file://"
+                   + str(profile), "--convert-to", "pdf", "--outdir", tmp,
+                   str(source_path)]
+        result = subprocess.run(command, capture_output=True, text=True,
+                                timeout=120, check=False)
+        pdf_path = tmp_path / "current.pdf"
+        if result.returncode != 0 or not pdf_path.is_file():
+            detail = (result.stderr or result.stdout or "未知 LibreOffice 错误").strip()
+            qa = _finalization.normalize_final_qa(state.get("final_qa"))
+            qa.update({"libreoffice_render": "FAIL",
+                       "rendered_at": _finalization.now_iso(),
+                       "translation_truth_version": int(
+                           (state.get("translation_truth") or {}).get("version") or 0),
+                       "updated_at": _finalization.now_iso()})
+            qa.setdefault("notes", {})["libreoffice_render"] = detail[:700]
+            state["final_qa"] = qa
+            render_value = {
+                "status": "fail", "qa_status": "FAIL", "document_kind": document_kind,
+                "detail": detail[:700],
+            }
+            academic_writer._save_artifact(
+                state, job_dir(job_id), "libreoffice_render", render_value,
+                academic_evidence.stable_hash({
+                    "final_docx_validation": (state.get("academic_state") or {}).get(
+                        "artifacts", {}).get("final_docx_validation", {}).get(
+                            "content_hash"),
+                    "version": _finalization.VERSION,
+                }), _finalization.VERSION,
+                input_artifact_ids=["final_docx_validation"], status="failed",
+                stale_reason={"code": "render_failed", "source_type": "artifact",
+                              "source_id": "final_docx_validation"})
+            save_job_state(job_id, state)
+            raise RuntimeError(f"LibreOffice 渲染失败：{detail[:180]}")
+        pdf_bytes = pdf_path.read_bytes()
+    output = job_dir(job_id) / "libreoffice-render.pdf"
+    output.write_bytes(pdf_bytes)
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
+        page_count = document.page_count
+        page_metrics = []
+        for page in document:
+            blocks = page.get_text("blocks")
+            page_metrics.append({
+                "text_blocks": len(blocks),
+                "text_chars": len(page.get_text("text")),
+                "images": len(page.get_images(full=True)),
+                "drawings": len(page.get_drawings()),
+            })
+    qa = _finalization.normalize_final_qa(state.get("final_qa"))
+    qa.update({
+        "libreoffice_render": "PASS" if page_count and all(
+            item["text_chars"] > 0 for item in page_metrics) else "FAIL",
+        "rendered_at": _finalization.now_iso(),
+        "page_count": page_count,
+        "translation_truth_version": int(
+            (state.get("translation_truth") or {}).get("version") or 0),
+        "updated_at": _finalization.now_iso(),
+    })
+    qa.setdefault("notes", {})["document_kind"] = document_kind
+    qa["page_metrics"] = page_metrics
+    state["final_qa"] = qa
+    render_value = {
+        "status": "pass" if qa["libreoffice_render"] == "PASS" else "fail",
+        "qa_status": qa["libreoffice_render"],
+        "document_kind": document_kind,
+        "page_count": page_count,
+        "page_metrics": page_metrics,
+    }
+    academic_writer._save_artifact(
+        state, job_dir(job_id), "libreoffice_render", render_value,
+        academic_evidence.stable_hash({
+            "final_docx_validation": (state.get("academic_state") or {}).get(
+                "artifacts", {}).get("final_docx_validation", {}).get("content_hash"),
+            "version": _finalization.VERSION,
+        }), _finalization.VERSION,
+        input_artifact_ids=["final_docx_validation"],
+        status="valid" if qa["libreoffice_render"] == "PASS" else "failed")
+    save_job_state(job_id, state)
+    return state, qa
+
+
 def _reconcile_final_delivery_snapshot(job_id, state):
     latest = _snapshots.latest_snapshot(job_dir(job_id))
     if latest and state.get("delivery_status") == "final" \
@@ -3485,20 +3867,52 @@ def save_translation_edit(job_id, index, target, actor="user"):
     pair["from_tm"] = False
     _recount_reviewed_segments(state)
 
-    if state.get("delivery_status") in ("approved", "final") \
-            or state.get("delivery_approved_by_human"):
-        _invalidate_final_delivery_state(state)
-    else:
-        state["delivery_status"] = _delivery.compute_delivery_status(state)
-    state.setdefault("human_actions", []).append({
-        "finding_id": f"segment-{index}",
-        "action": "translation_edit",
-        "note": "人工修改译文",
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "actor": actor,
-    })
+    _mark_translation_truth_changed(
+        job_id, state, [index], "人工修改 CURRENT_TRANSLATION；相关案例与学术下游需要重建",
+        actor=actor, action="translation_edit")
+    _recheck_delivery_invariants_for_segments(state, [index], actor=actor)
     save_job_state(job_id, state)
     return state
+
+
+def _recheck_delivery_invariants_for_segments(state, indexes, *, actor="user"):
+    """Refresh deterministic target blockers after a working-text edit.
+
+    A target invariant describes the text that existed when it was recorded.
+    When a user edits that target, a resolved old invariant must not continue
+    to block delivery; if the same problem remains, the existing finding stays
+    open and the current validation report remains authoritative.
+    """
+    from transpraxis import delivery as _delivery
+
+    indexes = {int(index) for index in indexes}
+    report = validate_delivery_translation_state(state)
+    active = {
+        (issue.get("segment_index"), issue.get("code"))
+        for issue in report.get("issues") or []
+    }
+    for finding in state.setdefault("findings", []):
+        if not isinstance(finding, dict) \
+                or finding.get("type") != "delivery_invariant" \
+                or finding.get("segment_index") not in indexes \
+                or finding.get("resolved"):
+            continue
+        key = (finding.get("segment_index"), finding.get("invariant_code"))
+        if key in active:
+            continue
+        finding["resolved"] = True
+        finding["resolution"] = {
+            "action": "target_rechecked",
+            "note": "CURRENT_TRANSLATION 编辑后重新通过目标文本门禁",
+            "timestamp": _finalization.now_iso(),
+            "actor": actor,
+        }
+        _delivery.add_human_action(
+            state, _delivery.finding_id(finding), "target_rechecked",
+            "CURRENT_TRANSLATION 编辑后重新通过目标文本门禁", actor)
+    _record_delivery_validation_findings(state, report)
+    state["delivery_status"] = _delivery.compute_delivery_status(state)
+    return report
 
 
 def restore_translation_edit(job_id, index, actor="user"):
@@ -3524,18 +3938,9 @@ def restore_translation_edit(job_id, index, actor="user"):
     pair.pop("human_edited", None)
     _recount_reviewed_segments(state)
 
-    if state.get("delivery_status") in ("approved", "final") \
-            or state.get("delivery_approved_by_human"):
-        _invalidate_final_delivery_state(state)
-    else:
-        state["delivery_status"] = _delivery.compute_delivery_status(state)
-    state.setdefault("human_actions", []).append({
-        "finding_id": f"segment-{index}",
-        "action": "translation_restore",
-        "note": "恢复修改前的译文",
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "actor": actor,
-    })
+    _mark_translation_truth_changed(
+        job_id, state, [index], "恢复前版本也改变了 CURRENT_TRANSLATION；相关下游需要重建",
+        actor=actor, action="translation_restore")
     save_job_state(job_id, state)
     return state
 
@@ -3671,7 +4076,7 @@ def report_docx_bytes(job_id, state=None, frozen_assets=None):
         return None
     template = load_report_template(job_id)
     if template:
-        from transpraxis import final_docx, report_template
+        from transpraxis import academic_evidence, academic_writer, final_docx, report_template
         artifact = load_academic_artifact(job_id, "report")
         if not artifact:
             raise report_template.TemplateParseError(
@@ -3683,8 +4088,19 @@ def report_docx_bytes(job_id, state=None, frozen_assets=None):
         rendered = _bytes(report_template.render_report_docx(
             artifact, template["bytes"], template["contract"]))
         final_validation = final_docx.validate_final_docx(rendered, artifact)
-        (job_dir(job_id) / "final-docx-validation.json").write_text(
-            json.dumps(final_validation, ensure_ascii=False, indent=2), encoding="utf-8")
+        final_validation_dep = academic_evidence.stable_hash({
+            "report": (state.get("academic_state") or {}).get("artifacts", {}).get(
+                "report", {}).get("content_hash") or artifact.get("content_hash"),
+            "template": template.get("contract", {}).get("template_identity") or
+            template.get("contract", {}).get("template_hash"),
+            "version": final_docx.SCHEMA_VERSION,
+        })
+        academic_writer._save_artifact(
+            state, job_dir(job_id), "final_docx_validation", final_validation,
+            final_validation_dep, final_docx.SCHEMA_VERSION,
+            input_artifact_ids=["report"],
+            status="valid" if final_validation.get("status") != "fail" else "failed")
+        save_job_state(job_id, state)
         if final_validation.get("status") == "fail":
             return None
         return rendered
@@ -3765,7 +4181,7 @@ def _record_delivery_validation_findings(state, report):
         (item.get("type"), item.get("segment_index"), item.get("invariant_code"),
          item.get("reason"))
         for item in state.setdefault("findings", [])
-        if isinstance(item, dict)
+        if isinstance(item, dict) and not item.get("resolved")
     }
     findings = _translation_target.target_invariant_findings(report)
     for item in report.get("entity_findings") or []:
@@ -4529,7 +4945,7 @@ def academic_status_label(state):
         (state.get("academic_state") or {}).get("quality_status") or \
         (state.get("academic_state") or {}).get("status") or "not_started"
     labels = {
-        "not_started": "尚未开始", "stale": "需要重新生成",
+        "not_started": "尚未开始", "stale": "需要更新（按影响范围）",
         "in_progress": "学术写作中", "failed": "学术写作失败",
         "pass": "验证通过", "pass_with_warnings": "通过（有警告）",
         "review_required": "需要人工学术复核", "fail": "验证失败",
