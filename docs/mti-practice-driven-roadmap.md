@@ -287,6 +287,16 @@ valid record               reuse
 
 正式导出增加人工质量门禁：“当前译文在准确性、完整性和中文表达上不劣于对照译文。”案例 15 型场景若不通过，不得继续生成“改译更优”的分析。
 
+#### Stage 3 实际完成
+
+`case_reviews / case_review_overrides` 保存当前工作版本的审核事实，包括 `review_reason、reviewed_at、actor、content_stale`。批准只表达作者接受当前内容，不改变 provenance；内容变化后旧批准标记 `content_stale`，必须重新检查。
+
+四个入口均已接入：批准、带原因排除、从案例卡跳转修改 `CURRENT_TRANSLATION`、修改/拒绝模拟初译。被排除案例可从已通过机器 validation 的候选池替换；替换案例必须是 `unreviewed`，不能继承前例批准。
+
+`case_review_gate()` 在 `approve_delivery()` 中 fail-closed：required case 未审、被拒、内容 stale、case artifact stale/failed，或 synthetic baseline 被拒时均阻止冻结。profile policy 仍从 selected-case policy 读取；完整 compliance engine 留给 Stage 4。
+
+冻结 manifest 保存当时的 `case_reviews` 和 `case_review_overrides`；后续工作版本审核变化只改变当前 identity，不会回写历史快照。
+
 ### 阶段 4：Compliance Profile + Language Constraints（P1，3—5 天）
 
 在现有 `thesis_constraints` 和 template contract 上增加 **Compliance Profile**，不开发通用规则 DSL。第一份 profile 为：
