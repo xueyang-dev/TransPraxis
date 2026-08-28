@@ -12,6 +12,8 @@ CASE_POLICIES = {
         "recommended_cases": 8,
         "target_cases": 8,
         "candidate_pool_target": 10,
+        "synthetic_counts_toward_minimum": True,
+        "synthetic_count_policy": "counts_toward_minimum",
     },
     "final_report": {
         "minimum_cases": 20,
@@ -24,6 +26,8 @@ CASE_POLICIES = {
         "translation_decision_final_allowed": False,
         "research_question_minimum_contrasts": 2,
         "synthetic_gate_count": 4,
+        "synthetic_counts_toward_minimum": True,
+        "synthetic_count_policy": "counts_toward_minimum",
     },
 }
 
@@ -35,7 +39,32 @@ def report_stage(settings: Mapping[str, Any] | None = None) -> str:
 
 def case_policy(settings: Mapping[str, Any] | None = None) -> Dict[str, Any]:
     stage = report_stage(settings)
-    return {"report_stage": stage, **CASE_POLICIES[stage]}
+    settings = settings or {}
+    policy = {"report_stage": stage, **CASE_POLICIES[stage]}
+    profile = settings.get("strict_compliance_profile")
+    if profile is None:
+        profile = settings.get("compliance_profile")
+    profile_value = profile.get("synthetic_counts_toward_minimum") \
+        if isinstance(profile, Mapping) else None
+    if profile_value is None and isinstance(profile, bool):
+        profile_value = not profile
+    if profile_value is None and isinstance(profile, str) \
+            and profile.casefold() in {"strict", "strict_compliance"}:
+        profile_value = False
+    if "synthetic_counts_toward_minimum" in settings:
+        profile_value = bool(settings["synthetic_counts_toward_minimum"])
+    if profile_value is not None:
+        policy["synthetic_counts_toward_minimum"] = bool(profile_value)
+    policy["synthetic_count_policy"] = (
+        "counts_toward_minimum" if policy["synthetic_counts_toward_minimum"]
+        else "supplement_only")
+    if isinstance(profile, Mapping) and profile.get("profile_id"):
+        policy["compliance_profile_id"] = str(profile["profile_id"])
+    elif isinstance(profile, str) and profile:
+        policy["compliance_profile_id"] = profile
+    elif isinstance(profile, bool):
+        policy["compliance_profile_id"] = "strict" if profile else "generic"
+    return policy
 
 
 def _sections(settings: Mapping[str, Any], raw=None) -> list[Dict[str, Any]]:

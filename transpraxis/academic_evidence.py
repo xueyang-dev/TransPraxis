@@ -16,6 +16,7 @@ from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import assets
+from . import case_provenance
 from . import report_evidence
 
 SCHEMA_VERSION = "academic-evidence-v5"
@@ -842,7 +843,7 @@ def mine_candidate_cases(
         if role != "revision_case":
             continue
         details = _candidate_features(segment, glossary or [])
-        scored.append({
+        scored.append(case_provenance.with_provenance({
             "case_id": segment["segment_id"],
             "segment_id": segment["segment_id"],
             "segment_index": segment["segment_index"],
@@ -852,17 +853,17 @@ def mine_candidate_cases(
             "generated_for_analysis": False,
             "source_provenance": "project_source",
             "initial_provenance": "project_historical_initial_target",
-            "target_provenance": "project_historical_final_target",
+            "target_provenance": "project_current_target",
             "provenance": {
                 "historical": True,
                 "generated_for_analysis": False,
                 "source_provenance": "project_source",
                 "initial_provenance": "project_historical_initial_target",
-                "target_provenance": "project_historical_final_target",
+                "target_provenance": "project_current_target",
             },
             "case_role": role,
             **details,
-        })
+        }))
     scored.sort(key=lambda x: (-x["score"], x["segment_index"]))
 
     # Keep whole-corpus coverage explicit even when the highest scores cluster.
@@ -902,7 +903,7 @@ def mine_translation_decision_cases(
         if not has_decision_evidence or not segment.get("source") \
                 or not segment.get("final_target"):
             continue
-        scored.append({
+        scored.append(case_provenance.with_provenance({
             "case_id": f"TD-{int(segment['segment_index']) + 1:04d}",
             "source_segment_id": segment["segment_id"],
             "segment_index": segment["segment_index"],
@@ -929,7 +930,7 @@ def mine_translation_decision_cases(
             "score": details["score"],
             "reasons": ["unchanged_translation_decision", *details["reasons"]],
             "features": features,
-        })
+        }))
     scored.sort(key=lambda x: (-x["score"], x["segment_index"]))
     chosen: Dict[str, Dict[str, Any]] = {}
     for zone in ("beginning", "middle", "end"):

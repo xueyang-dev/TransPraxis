@@ -20,6 +20,7 @@ from docx.text.paragraph import Paragraph
 from docx.oxml.ns import qn
 
 from . import academic_evidence
+from . import case_provenance
 from . import synthetic_cases
 
 
@@ -407,7 +408,7 @@ def recover_legacy_cases(
         target_text = str((target_alignment.get("target_span") or {}).get("text") or "")
         issue = _targeted_issue(str(legacy.get("legacy_source") or ""), category)
         authentic = _authentic_match(legacy, segment, revision_candidates)
-        prepared.append({
+        prepared.append(case_provenance.with_provenance({
             "case_id": case_id,
             "case_type": "authentic_revision" if authentic else "synthetic_contrast",
             "legacy_example_number": number,
@@ -458,7 +459,7 @@ def recover_legacy_cases(
                     "legacy_example_number": number,
                 },
             },
-        })
+        }))
 
     cached_reviews = {}
     for old in (cached_recovery or {}).get("items") or []:
@@ -683,7 +684,7 @@ def merge_synthetic_artifacts(
         for raw in (artifact or {}).get("items") or []:
             if raw.get("case_type") != "synthetic_contrast":
                 continue
-            case = dict(raw)
+            case = case_provenance.with_provenance(raw)
             case_id = str(case.get("case_id") or "")
             if not case_id or case_id in seen:
                 continue
@@ -750,7 +751,7 @@ def apply_manual_reviews(
         "academic_analysis_value": "academic_analysis_value",
     }
     for raw in recovery.get("items") or []:
-        case = dict(raw)
+        case = case_provenance.with_provenance(raw)
         review = by_id.get(str(case.get("case_id") or ""))
         if not review or case.get("case_type") != "synthetic_contrast":
             items.append(case)
@@ -779,6 +780,8 @@ def apply_manual_reviews(
         if review.get("rationale_override"):
             case["contrast_rationale"] = str(review["rationale_override"])[:700]
             evidence_status["academic_analysis_reason"] = case["contrast_rationale"]
+        case = case_provenance.review_case(
+            case, "approved" if eligible else "rejected", reason)
         case.update({
             "synthetic_evidence": evidence_status,
             "validation": validation,

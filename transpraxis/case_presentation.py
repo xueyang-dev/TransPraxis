@@ -6,8 +6,10 @@ from collections import Counter
 from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, Mapping, Optional
 
+from . import case_provenance
 
-VERSION = "case-presentation-v2"
+
+VERSION = "case-presentation-v3"
 VISIBLE_FIELDS = frozenset({
     "原文", "初译", "模拟初译", "改译", "译文", "注释", "分析",
 })
@@ -43,6 +45,10 @@ _LIMIT_NEEDED = re.compile(
 
 def _clean(value: Any) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
+    # A legacy writer label occasionally leaked a literal ``>。`` before the
+    # analysis paragraph.  It is not a user-authored blockquote and must not
+    # survive into the canonical case presentation.
+    text = re.sub(r"^>\s*[。．]\s*", "", text)
     return re.sub(r"^(?:[-*]\s*)+", "", text)
 
 
@@ -136,7 +142,7 @@ def _focus_terms(case_node: Mapping[str, Any]) -> Dict[str, list[str]]:
 
 def build_case_presentation(case_node: Mapping[str, Any]) -> Dict[str, Any]:
     """Return the sole user-facing representation of one structured case node."""
-    case_type = str(case_node.get("case_type") or "authentic_revision")
+    case_type = case_provenance.case_type(case_node)
     focus = case_node.get("focus") or {}
     source = _span_text(focus, "source")
     if case_type == "authentic_revision":
@@ -182,17 +188,15 @@ def render_case_presentation_markdown(presentation: Mapping[str, Any]) -> str:
     """Render only the fields permitted by the MTI report presentation contract."""
     number = int(presentation.get("example_number") or 0)
     case_id = str(presentation.get("case_id") or "")
-    case_type = str(presentation.get("case_type") or "authentic_revision")
+    case_type = case_provenance.case_type(presentation)
+    labels = case_provenance.display_contract(presentation)
     lines = [f"**例[{number}]**", f"<!--case:{case_id}-->", "",
              f"**原文**：{presentation.get('source') or ''}", ""]
-    if case_type == "authentic_revision":
-        lines.extend([f"**初译**：{presentation.get('initial') or ''}", "",
-                      f"**改译**：{presentation.get('target') or ''}", ""])
-    elif case_type == "synthetic_contrast":
-        lines.extend([f"**模拟初译**：{presentation.get('initial') or ''}", "",
-                      f"**改译**：{presentation.get('target') or ''}", ""])
+    if labels["initial_label"]:
+        lines.extend([f"**{labels['initial_label']}**：{presentation.get('initial') or ''}", "",
+                      f"**{labels['target_label']}**：{presentation.get('target') or ''}", ""])
     else:
-        lines.extend([f"**译文**：{presentation.get('target') or ''}", ""])
+        lines.extend([f"**{labels['target_label']}**：{presentation.get('target') or ''}", ""])
     if presentation.get("note"):
         lines.extend([f"**注释**：{presentation['note']}", ""])
     lines.append(f"**分析**：{presentation.get('analysis') or ''}")

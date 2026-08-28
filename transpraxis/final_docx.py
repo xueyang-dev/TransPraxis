@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Mapping
 from docx import Document
 from docx.oxml.ns import qn
 
-from . import case_presentation, report_template
+from . import case_presentation, case_provenance, report_template
 
 
 SCHEMA_VERSION = "final-docx-validation-v2"
@@ -252,12 +252,23 @@ def validate_final_docx(
         r"^\s*译文\s*[：:]", block, re.MULTILINE)) and not re.search(
             r"^\s*(?:初译|模拟初译|对比译法（模拟）)\s*[：:]", block,
             re.MULTILINE) for _heading, block in case_blocks)
+    countable_case_count = len(numbers)
     if final_contract:
         minimum = int(final_policy.get("minimum_cases") or 20)
-        if len(numbers) < minimum:
+        if final_case_nodes:
+            countable_case_count = sum(
+                case_provenance.counts_toward_minimum(node, final_policy)
+                for node in final_case_nodes)
+        else:
+            type_map = report_artifact.get("case_types") or {}
+            countable_case_count = sum(
+                case_provenance.counts_toward_minimum({"case_type": case_type}, final_policy)
+                for case_type in type_map.values()) if type_map else len(numbers)
+        if countable_case_count < minimum:
             issues.append(_issue(
                 "docx_final_case_count_below_minimum",
-                f"最终 DOCX 只有 {len(numbers)} 个正式案例，至少需要 {minimum} 个。"))
+                f"最终 DOCX 只有 {countable_case_count} 个可计数正式案例，"
+                f"总案例 {len(numbers)} 个，至少需要 {minimum} 个。"))
         if final_case_nodes and len(numbers) != len(final_case_nodes):
             issues.append(_issue(
                 "docx_final_case_node_count_mismatch",
@@ -334,6 +345,7 @@ def validate_final_docx(
             "project_placeholder_count": len(placeholders),
             "abstract_chinese_character_count": len(_CJK.findall(abstract_text)),
             "case_count": len(numbers),
+            "countable_case_count": countable_case_count,
             "synthetic_label_count": synthetic_label_count,
             "authentic_initial_label_count": authentic_initial_label_count,
             "rewrite_label_count": rewrite_label_count,

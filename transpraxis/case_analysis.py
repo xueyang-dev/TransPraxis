@@ -17,6 +17,7 @@ from .academic_evidence import (
     case_role, has_meaningful_revision, is_eligible_revision_case, segment_index,
     stable_hash,
 )
+from . import case_provenance
 
 ANALYSIS_VERSION = "case-analysis-v5"
 
@@ -510,8 +511,9 @@ def build_case_analysis_plans(
             continue
         seen.add(case_id)
         adequacy = adequacy_by_case.get(case_id, {})
-        selected_case = selected_by_id.get(case_id) or {}
-        case_type = selected_case.get("case_type") or "authentic_revision"
+        selected_case = case_provenance.with_provenance(
+            selected_by_id.get(case_id) or {})
+        case_type = case_provenance.case_type(selected_case)
         cannot = set(adequacy.get("cannot_support") or [])
         problem = item.get("problem") if isinstance(item.get("problem"), dict) else {}
         human_ids = [str(x) for x in item.get("human_evidence_ids") or []]
@@ -568,6 +570,9 @@ def build_case_analysis_plans(
         plans.append({
             "case_id": case_id,
             "case_type": case_type,
+            "case_origin": selected_case.get("case_origin"),
+            "text_role": dict(selected_case.get("text_role") or {}),
+            "review_status": selected_case.get("review_status", "unreviewed"),
             "analysis_contract_type": case_type,
             "case_role": adequacy.get("case_role", "non_revision_case"),
             "capabilities": {
@@ -629,11 +634,15 @@ def build_case_analysis_plans(
     missing = sorted(valid_cases - seen)
     for case_id in missing:
         adequacy = adequacy_by_case.get(case_id, {})
-        selected_case = selected_by_id.get(case_id) or {}
-        case_type = selected_case.get("case_type") or "authentic_revision"
+        selected_case = case_provenance.with_provenance(
+            selected_by_id.get(case_id) or {})
+        case_type = case_provenance.case_type(selected_case)
         plans.append({
             "case_id": case_id,
             "case_type": case_type,
+            "case_origin": selected_case.get("case_origin"),
+            "text_role": dict(selected_case.get("text_role") or {}),
+            "review_status": selected_case.get("review_status", "unreviewed"),
             "analysis_contract_type": case_type,
             "case_role": adequacy.get("case_role", "non_revision_case"),
             "capabilities": adequacy.get("capabilities", {}),
@@ -675,8 +684,12 @@ def build_case_analysis_plans(
                 component: "unplanned" for component in ANALYSIS_CONTRACT},
         })
     for plan in plans:
-        selected_case = selected_by_id.get(str(plan.get("case_id"))) or {}
+        selected_case = case_provenance.with_provenance(
+            selected_by_id.get(str(plan.get("case_id"))) or {})
         plan.update({
+            "case_origin": selected_case.get("case_origin"),
+            "text_role": dict(selected_case.get("text_role") or {}),
+            "review_status": selected_case.get("review_status", "unreviewed"),
             "source_segment_id": selected_case.get("source_segment_id") or
             selected_case.get("segment_id") or plan.get("source_segment_id"),
             "research_question_ids": list(selected_case.get("research_questions") or []),

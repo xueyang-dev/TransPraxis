@@ -18,6 +18,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.text.paragraph import Paragraph
+from . import case_provenance
 
 
 SCHEMA_VERSION = "report-template-contract-v3"
@@ -584,9 +585,15 @@ def public_report_markdown(
                         lines.append("")
                     lines.extend([f"**{labels.get(case_id, '例')}**", ""])
                 seen.add(case_id)
-            label = "译文" if kind == "TARGET" and (
-                case_types.get(case_id) == "translation_decision" or
-                case_id.upper().startswith("TD-")) else quote_labels[kind]
+            case_type = case_types.get(case_id)
+            if not case_type and case_id.upper().startswith("TD-"):
+                case_type = "translation_decision"
+            case = {"case_type": case_type}
+            display = case_provenance.display_contract(case)
+            label = display["target_label"] if kind in {"TARGET", "OPTIMIZED"} else (
+                "模拟初译" if kind == "SIMULATED" else
+                display["initial_label"] if kind == "INITIAL" and
+                display["initial_label"] else quote_labels[kind])
             lines.append(f"> {label}：{value}")
             continue
         for case_id, label in labels.items():

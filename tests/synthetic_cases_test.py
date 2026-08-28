@@ -115,8 +115,11 @@ def test_successful_staged_pipeline_preserves_history():
         optimized, model, "fake", "key", "model", evidence)
     case = validated["items"][0]
     assert case["case_type"] == "synthetic_contrast"
-    assert case["provenance"] == {
-        "historical": False, "generated_for_analysis": True}
+    assert case["provenance"]["historical"] is False
+    assert case["provenance"]["generated_for_analysis"] is True
+    assert case["case_origin"] == "SYNTHETIC_BASELINE"
+    assert case["text_role"]["initial"] == "SYNTHETIC_BASELINE"
+    assert case["review_status"] == "unreviewed"
     assert case["validation"]["academic_case_eligible"]
     assert case["opportunity_id"] == "EO-0000"
     assert case["optimized_translation"]["repairs_error_id"] == \
@@ -145,8 +148,10 @@ def test_project_target_binding_is_read_only_and_uses_three_gates():
     assert row["optimized_translation"]["text"] == segment["final_target"]
     assert row["optimized_translation"]["generation_status"] == "project_target"
     assert row["optimized_translation"]["provenance"] == "project_current_target"
-    assert row["provenance"] == {
-        "historical": False, "generated_for_analysis": True}
+    assert row["provenance"]["historical"] is False
+    assert row["provenance"]["generated_for_analysis"] is True
+    assert row["case_origin"] == "SYNTHETIC_BASELINE"
+    assert row["text_role"]["target"] == "CURRENT_TRANSLATION"
 
     class GateReviewer:
         def __call__(self, _provider, _api_key, _model, system, user, temperature=0.1):

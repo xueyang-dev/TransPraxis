@@ -10,8 +10,9 @@ from typing import Any, Dict, Iterable, List, Optional
 from .academic_evidence import (
     is_eligible_revision_case, literature_index, segment_index, stable_hash,
 )
-from . import (case_analysis, case_presentation, literature_evidence, report_template,
-               synthetic_cases, thesis_constraints, claim_strength)
+from . import (case_analysis, case_presentation, case_provenance,
+               literature_evidence, report_template, synthetic_cases,
+               thesis_constraints, claim_strength)
 
 SCHEMA_VERSION = "academic-validation-v9"
 VALIDATOR_VERSION = "validator-v17"
@@ -183,6 +184,7 @@ _CASE_VALIDATION_ISSUE_TYPES = frozenset({
     "final_case_rewrite_label_count_mismatch",
     "final_research_question_contrast_coverage_insufficient",
     "qa_case_selected_as_final_synthetic", "synthetic_gate_failed_in_final_case",
+    "case_provenance_mismatch",
 })
 
 
@@ -673,11 +675,18 @@ def validate_template_compliance(
         "final_report"))
     minimum_cases = int(case_requirement.get("minimum_cases") or 0) \
         if case_requirement.get("applies_to_report_stage") == report_stage else 0
+    case_policy = thesis_constraints.case_policy({"report_stage": report_stage})
+    case_policy.update(dict((selected_cases or {}).get(
+        "report_case_policy") or {}))
     actual_case_count = len((selected_cases or {}).get("cases") or [])
-    if minimum_cases and actual_case_count < minimum_cases:
+    countable_case_count = sum(
+        case_provenance.counts_toward_minimum(case, case_policy)
+        for case in (selected_cases or {}).get("cases") or [])
+    if minimum_cases and countable_case_count < minimum_cases:
         issues.append(_issue(
             "template_case_minimum_not_met",
-            f"模板至少要求 {minimum_cases} 个例证，当前只有 {actual_case_count} 个。",
+            f"模板至少要求 {minimum_cases} 个可计数例证，当前只有 "
+            f"{countable_case_count} 个（总案例 {actual_case_count} 个）。",
             suggested_action="仅重建案例选择与第三章；证据仍不足时保持报告 incomplete。"))
 
     public_md = report_template.public_report_markdown(
@@ -809,6 +818,7 @@ def validate_case_portfolio(
     stage = str(report_stage or (selected_cases.get("report_case_policy") or {}).get(
         "report_stage") or "final_report")
     policy = thesis_constraints.case_policy({"report_stage": stage})
+    policy.update(dict(selected_cases.get("report_case_policy") or {}))
     nodes = [x for x in (report_artifact or {}).get("case_nodes") or []
              if isinstance(x, Mapping) and x.get("type") == "case_example"]
     node_by_case = {str(x.get("case_id")): x for x in nodes}
@@ -823,7 +833,17 @@ def validate_case_portfolio(
 
     for case in cases:
         case_id = str(case.get("case_id") or "")
-        case_type = str(case.get("case_type") or "authentic_revision")
+        case_type = case_provenance.case_type(case)
+        provenance_errors = case_provenance.provenance_issues(case)
+        if provenance_errors:
+            issue_type = "synthetic_case_provenance_mismatch" \
+                if case_type == "synthetic_contrast" else "case_provenance_mismatch"
+            issues.append(_issue(
+                issue_type,
+                f"案例 {case.get('case_id')} 的 provenance 维度不一致："
+                f"{', '.join(provenance_errors)}。",
+                evidence_id=str(case.get("case_id") or ""),
+                suggested_action="人工 review 只能改变 review_status，恢复 canonical case_origin 与 text_role。"))
         argument_role = str(case.get("argument_role") or "")
         if argument_role not in {"core", "supporting"}:
             issues.append(_issue(
@@ -980,16 +1000,21 @@ def validate_case_portfolio(
             core_support_claims[str(rq)] += 1
     minimum = int(policy["minimum_cases"])
     recommended = int(policy["recommended_cases"])
-    if len(provenance_safe_ids) < minimum:
+    countable_safe_ids = {
+        case_id for case_id in provenance_safe_ids
+        if case_provenance.counts_toward_minimum(
+            selected_by_id.get(case_id) or {}, policy)
+    }
+    if len(countable_safe_ids) < minimum:
         issues.append(_issue(
             "case_minimum_not_met",
             f"{stage} 至少需要 {minimum} 个 unique provenance-safe cases，"
-            f"当前只有 {len(provenance_safe_ids)} 个。",
+            f"按当前 profile 可计数的只有 {len(countable_safe_ids)} 个。",
             suggested_action="只增加真实、聚焦且通过 provenance 的案例；证据不足时保持 incomplete。"))
-    elif len(provenance_safe_ids) < recommended:
+    elif len(countable_safe_ids) < recommended:
         issues.append(_issue(
             "case_coverage_below_recommended",
-            f"已有 {len(provenance_safe_ids)} 个有效案例，达到最低值但低于建议值 {recommended}。",
+            f"已有 {len(countable_safe_ids)} 个可计数案例，达到最低值但低于建议值 {recommended}。",
             severity="warning",
             suggested_action="有额外强证据时扩展到建议值；不得为了数量伪造。"))
 
@@ -1028,7 +1053,10 @@ def validate_case_portfolio(
         policy.get("contrast_required"))
     final_types = set(policy.get("final_case_types") or {
         "authentic_revision", "synthetic_contrast"})
-    final_cases = [case for case in cases if case.get("case_type") in final_types]
+    final_cases = [case for case in cases
+                   if case_provenance.case_type(case) in final_types]
+    countable_final_cases = [case for case in final_cases
+                             if case_provenance.counts_toward_minimum(case, policy)]
     contrast_ready_cases = [case for case in final_cases
                             if case.get("final_case_eligible") is True
                             and case.get("contrast_ready") is True
@@ -1058,16 +1086,17 @@ def validate_case_portfolio(
         "qa_excluded_source_segment_ids") or []}
 
     if final_contract:
-        if any(case.get("case_type") not in final_types for case in cases):
+        if any(case_provenance.case_type(case) not in final_types for case in cases):
             issues.append(_issue(
                 "final_case_type_contract_violation",
                 "final_report 的正式案例只能是 authentic_revision 或 synthetic_contrast；"
                 "translation_decision 只能留在后台候选池。",
                 suggested_action="从最终案例池移除 decision-only 案例，并用通过四门 gate 的对比案例补位。"))
-        if len(final_cases) < minimum:
+        if len(countable_final_cases) < minimum:
             issues.append(_issue(
                 "final_case_count_below_minimum",
-                f"final_report 至少需要 {minimum} 个正式翻译对比案例，当前只有 {len(final_cases)} 个。",
+                f"final_report 至少需要 {minimum} 个可计数正式翻译对比案例，"
+                f"当前只有 {len(countable_final_cases)} 个（总正式案例 {len(final_cases)} 个）。",
                 suggested_action="从候选池重新筛选并通过 synthetic 四门 gate；不得用 translation_decision 凑数。"))
         if len(contrast_ready_cases) != len(final_cases):
             issues.append(_issue(
@@ -1116,15 +1145,8 @@ def validate_case_portfolio(
         gate_names = ("baseline_plausibility", "material_difference",
                       "repair_correctness", "academic_analysis_value")
         for case in final_cases:
-            if case.get("case_type") != "synthetic_contrast":
+            if case_provenance.case_type(case) != "synthetic_contrast":
                 continue
-            if case.get("historical") is not False or case.get(
-                    "generated_for_analysis") is not True:
-                issues.append(_issue(
-                    "synthetic_case_provenance_mismatch",
-                    f"synthetic {case.get('case_id')} 必须 historical=false 且 generated_for_analysis=true。",
-                    evidence_id=str(case.get("case_id")),
-                    suggested_action="恢复 analytical provenance；不得升级为历史初译。"))
             if case.get("baseline_origin") not in {
                     "legacy_analytical_draft", "newly_generated"}:
                 issues.append(_issue(
@@ -1157,6 +1179,13 @@ def validate_case_portfolio(
         "recommended_cases": recommended,
         "selected_case_count": len(cases),
         "final_case_count": len(final_cases) if final_contract else 0,
+        "countable_case_count": len(countable_safe_ids),
+        "final_countable_case_count": len(countable_final_cases)
+        if final_contract else 0,
+        "synthetic_case_count_policy": policy.get(
+            "synthetic_count_policy", "counts_toward_minimum"),
+        "synthetic_supplement_case_count": len(provenance_safe_ids)
+        - len(countable_safe_ids),
         "contrast_case_count": len(contrast_ready_cases) if final_contract else 0,
         "contrast_ready_case_count": len(contrast_ready_cases) if final_contract else 0,
         "translation_decision_visible_count": (

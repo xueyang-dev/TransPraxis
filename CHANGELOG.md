@@ -9,6 +9,12 @@
 - 增加不含私人论文全文的匿名 MTI finalization fixture 与离线回归入口，覆盖真实修订和合成对照案例的基本边界。
 - 当前工作树基线为 281 项自动化测试通过；后续 provenance 与合规改动继续以该基线为准。
 
+### Translation Truth + Provenance
+
+- 固化 `case_origin`、`text_role`、`review_status` 三维语义；旧 `authentic_revision` / `synthetic_contrast` 案例仍可读取并自动补齐公开字段。
+- 人工批准只改变 `review_status`，不会把合成对照升格为真实修订；真实与模拟案例在报告、DOCX 和案例工作区使用确定性标签与说明。
+- 增加 strict compliance profile 的 synthetic 计数策略：严格 profile 下合成案例只能作为补充，不能满足正式最低案例数。
+
 ## [0.3.0] - 2026-08-24
 
 ### 工作区与任务恢复

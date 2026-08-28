@@ -19,6 +19,7 @@ from . import academic_quality
 from . import academic_validator
 from . import case_analysis
 from . import case_presentation
+from . import case_provenance
 from . import human_evidence
 from . import literature_evidence
 from . import legacy_cases
@@ -29,6 +30,7 @@ from . import thesis_constraints
 PIPELINE_VERSION = "academic-pipeline-v13"
 VERSIONS = {
     "evidence_version": academic_evidence.SCHEMA_VERSION,
+    "case_provenance_version": case_provenance.VERSION,
     "report_constraints_version": thesis_constraints.SCHEMA_VERSION,
     "template_contract_version": report_template.SCHEMA_VERSION,
     "research_model_version": "research-model-v3",
@@ -284,7 +286,16 @@ def sync_versions(state: Dict[str, Any], versions: Optional[Dict[str, str]] = No
     academic = _state(state)
     old = academic.get("versions") or {}
     if old:
-        if old.get("template_contract_version") != versions["template_contract_version"] \
+        if old.get("case_provenance_version") != versions["case_provenance_version"]:
+            _invalidate_names(state, [
+                "evidence", "research_model", "argument_plan", "synthetic_opportunities",
+                "synthetic_baselines", "synthetic_error_manifest", "synthetic_optimized",
+                "synthetic_validation", "legacy_inventory", "legacy_recovery",
+                "selected_cases", "outline", "case_analysis_plans", "sections",
+                "validation", "review", "academic_quality", "report",
+                "literature_support_review", "quality_repair_history", "repair_history",
+            ], "case provenance schema/version changed")
+        elif old.get("template_contract_version") != versions["template_contract_version"] \
                 or old.get("report_artifact_version") != versions["report_artifact_version"]:
             _invalidate_names(state, [
                 "research_model", "argument_plan", "selected_cases", "outline",
@@ -1156,7 +1167,7 @@ def select_academic_cases(
     qa_rejected_source_ids = set()
     seen_identities = set()
     for item in raw_pool:
-        case = dict(item)
+        case = case_provenance.with_provenance(item)
         case_id = str(case.get("case_id") or "")
         case_type = str(case.get("case_type") or "authentic_revision")
         segment_id = str(case.get("source_segment_id") or case.get("segment_id") or case_id)
@@ -1553,6 +1564,11 @@ def select_academic_cases(
     cases = sorted(selected, key=lambda x: (
         str(x.get("difficulty_group") or ""), -x["analytical_value_score"],
         int(x.get("segment_index") or 0)))
+    countable_case_ids = {
+        str(x.get("case_id")) for x in cases
+        if case_provenance.counts_toward_minimum(x, report_policy)
+    }
+    countable_case_count = len(countable_case_ids)
     authentic_count = sum(x.get("case_type") == "authentic_revision" for x in cases)
     decision_count = sum(x.get("case_type") == "translation_decision" for x in cases)
     synthetic_count = sum(x.get("case_type") == "synthetic_contrast" for x in cases)
@@ -1606,7 +1622,7 @@ def select_academic_cases(
             f"现有项目证据仅支持 {authentic_count} 个通过修订资格门禁的真实修订案例，"
             f"少于最低要求 {minimum} 个。")
     selection_status = (
-        "final_contrast_case_selection" if final_contract and len(cases) >= target else
+        "final_contrast_case_selection" if final_contract and countable_case_count >= target else
         "insufficient_contrast_cases" if final_contract else
         "mixed_case_selection" if sum(bool(x) for x in (
             authentic_count, decision_count, synthetic_count)) > 1 else
@@ -1678,6 +1694,10 @@ def select_academic_cases(
         "preferred_core_case_count": preferred_authentic_count,
         "minimum_core_case_count": minimum,
         "case_count_policy": "authentic_and_synthetic_pools_remain_distinct",
+        "synthetic_case_count_policy": report_policy.get(
+            "synthetic_count_policy", "counts_toward_minimum"),
+        "countable_case_count": countable_case_count,
+        "synthetic_supplement_case_count": len(cases) - countable_case_count,
         "eligible_case_count": len(ranked),
         "revision_candidate_pool_count": len(revision_pool),
         "eligible_synthetic_case_count": sum(
@@ -1699,6 +1719,7 @@ def select_academic_cases(
             "pipeline_status", "not_run"),
         "selected_case_count": len(cases),
         "final_case_count": len(cases) if final_contract else 0,
+        "final_countable_case_count": countable_case_count if final_contract else 0,
         "contrast_case_count": sum(bool(x.get("contrast_ready")) for x in cases)
         if final_contract else 0,
         "contrast_ready_case_count": sum(bool(x.get("contrast_ready")) for x in cases)
@@ -1712,9 +1733,9 @@ def select_academic_cases(
         "authentic_selection_status": authentic_status,
         "selection_status": selection_status,
         "case_coverage_status": (
-            "insufficient" if len(cases) < int(report_policy.get(
+            "insufficient" if countable_case_count < int(report_policy.get(
                 "minimum_cases") or 0) else
-            "minimum_with_warning" if len(cases) < int(report_policy.get(
+            "minimum_with_warning" if countable_case_count < int(report_policy.get(
                 "recommended_cases") or len(cases)) else "good"),
         "difficulty_distribution": dict(Counter(
             str(x.get("difficulty_group") or "未分类") for x in cases)),
@@ -1738,6 +1759,9 @@ def select_academic_cases(
             "cases": [{
                 "case_id": x.get("case_id"),
                 "case_type": x.get("case_type"),
+                "case_origin": x.get("case_origin"),
+                "text_role": dict(x.get("text_role") or {}),
+                "review_status": x.get("review_status", "unreviewed"),
                 "baseline_origin": x.get("baseline_origin"),
                 "segment_id": x.get("segment_id"),
                 "focus": x.get("focus"),
@@ -3059,6 +3083,13 @@ def build_report_artifact(
         "case_types": {str(x.get("case_id")): str(x.get("case_type") or
                                                     "authentic_revision")
                        for x in (selected_cases or {}).get("cases") or []},
+        "case_origins": {str(x.get("case_id")): x.get("case_origin")
+                         for x in (selected_cases or {}).get("cases") or []},
+        "text_roles": {str(x.get("case_id")): dict(x.get("text_role") or {})
+                        for x in (selected_cases or {}).get("cases") or []},
+        "case_review_statuses": {str(x.get("case_id")): x.get(
+            "review_status", "unreviewed")
+            for x in (selected_cases or {}).get("cases") or []},
         "report_status": "draft",
         "source_markdown_hash": academic_evidence.stable_hash(report_md),
     }
@@ -3436,7 +3467,7 @@ def _realize_visible_case_examples(
             chunks.append(block)
             cursor = end
             continue
-        selected_case = selected_by_id[case_id]
+        selected_case = case_provenance.with_provenance(selected_by_id[case_id])
         case_type = str(selected_case.get("case_type") or "authentic_revision")
         focus = _case_focus_for_assembly(selected_case, segment, evidence)
         plan = plan_by_id.get(case_id) or {}
@@ -3479,6 +3510,9 @@ def _realize_visible_case_examples(
             "type": "case_example",
             "case_id": case_id,
             "case_type": case_type,
+            "case_origin": selected_case.get("case_origin"),
+            "text_role": dict(selected_case.get("text_role") or {}),
+            "review_status": selected_case.get("review_status", "unreviewed"),
             "baseline_origin": selected_case.get("baseline_origin")
             if case_type == "synthetic_contrast" else None,
             "chapter_id": actual_subsection.split(".", 1)[0] if actual_subsection else "3",
@@ -4479,10 +4513,14 @@ def run_academic_pipeline(
                 minimum = int(report_policy.get("minimum_cases") or 20)
                 decision_visible = int(selected_cases.get(
                     "translation_decision_visible_count") or 0)
-                if final_count < minimum or contrast_count != final_count \
+                countable_count = int(selected_cases.get(
+                    "final_countable_case_count", selected_cases.get(
+                        "countable_case_count", final_count)) or 0)
+                if countable_count < minimum or contrast_count != final_count \
                         or decision_visible:
                     message = (
                         f"Final Report case contract blocked: final={final_count}, "
+                        f"countable={countable_count}, "
                         f"contrast_ready={contrast_count}, minimum={minimum}, "
                         f"translation_decision_visible={decision_visible}."
                     )

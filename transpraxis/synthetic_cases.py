@@ -12,6 +12,7 @@ from collections import Counter
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from . import academic_evidence
+from . import case_provenance
 from .academic_evidence import has_meaningful_revision, segment_index, stable_hash
 
 OPPORTUNITY_VERSION = "synthetic-opportunity-v6"
@@ -510,7 +511,7 @@ def generate_baselines(
         case_id = f"SC-{int(opportunity['segment_index']):04d}"
         value = generated.get(case_id) or {}
         text = str(value.get("text") or "").strip()
-        items.append({
+        items.append(case_provenance.with_provenance({
             "case_id": case_id,
             "case_type": CASE_TYPE,
             "baseline_origin": "newly_generated",
@@ -548,7 +549,7 @@ def generate_baselines(
             },
             "generation_reason": opportunity["difficulty_reason"][:500],
             "targeted_issue": opportunity["error_category"],
-        })
+        }))
     return _artifact(BASELINE_VERSION, items, generated=sum(
         x["synthetic_baseline"]["generation_status"] == "generated" for x in items),
         pipeline_status="complete" if raw.get("_call_status") == "ok" else "failed",
@@ -687,7 +688,7 @@ def optimize_translations(
             target_contrast = _target_excerpt_for_source(
                 str(segment.get("source") or ""),
                 str(case.get("source_text") or ""), target)
-            items.append({
+            items.append(case_provenance.with_provenance({
                 **case,
                 "final_target": target,
                 "target_contrast_text": target_contrast,
@@ -709,7 +710,7 @@ def optimize_translations(
                     "historical": False,
                     "generated_for_analysis": True,
                 },
-            })
+            }))
         return _artifact(
             OPTIMIZER_VERSION, items,
             generated=0,
@@ -756,7 +757,7 @@ def optimize_translations(
     for case in error_manifest.get("items", []):
         value = optimized.get(case["case_id"]) or {}
         text = str(value.get("text") or "").strip()
-        items.append({
+        items.append(case_provenance.with_provenance({
             **case,
             "optimized_translation": {
                 "text": text,
@@ -766,7 +767,7 @@ def optimize_translations(
                 "addresses_error": str(value.get("addresses_error") or "")[:500],
                 "generation_status": "generated" if text else "skipped_or_failed",
             },
-        })
+        }))
     return _artifact(OPTIMIZER_VERSION, items, generated=sum(
         x["optimized_translation"]["generation_status"] == "generated" for x in items),
         pipeline_status="complete" if raw.get("_call_status") == "ok" else "failed",
@@ -1007,7 +1008,7 @@ def validate_synthetic_cases(
                 "academic_analysis_value_reason") or raw_validation.get(
                     "reason") or "")[:500],
         }
-        items.append({
+        items.append(case_provenance.with_provenance({
             **case,
             "synthetic_evidence": synthetic_evidence,
             "actual_delta": delta,
@@ -1036,7 +1037,7 @@ def validate_synthetic_cases(
                 "模拟初译不代表作者的历史译文。",
                 "该案例只展示一种合理的失败模式，不证明其在人类译者中的发生频率。",
             ],
-        })
+        }))
     return _artifact(
         VALIDATION_VERSION, items,
         pipeline_status=(

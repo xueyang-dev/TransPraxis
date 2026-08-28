@@ -5,6 +5,13 @@
     {
       "case_id": "AR-0382",
       "case_type": "authentic_revision",
+      "case_origin": "REAL_REVISION",
+      "text_role": {
+        "source": "SOURCE",
+        "initial": "HISTORICAL_INITIAL",
+        "target": "CURRENT_TRANSLATION"
+      },
+      "review_status": "unreviewed",
       "source": "Although the field appears stable, its meaning shifts with context.",
       "historical_initial": "虽然该领域看似稳定，但其含义会随语境变化。",
       "current_translation": "尽管该领域表面稳定，其含义仍会随语境变化。"
@@ -12,6 +19,12 @@
     {
       "case_id": "SC-0015",
       "case_type": "synthetic_contrast",
+      "case_origin": "SYNTHETIC_BASELINE",
+      "text_role": {
+        "source": "SOURCE",
+        "initial": "SYNTHETIC_BASELINE",
+        "target": "CURRENT_TRANSLATION"
+      },
       "source": "The image does not merely describe distance; it makes distance felt.",
       "synthetic_baseline": "这幅图不仅仅描述距离。",
       "current_translation": "这幅图不只是描述距离，更让人切身感受到距离。",

@@ -17,6 +17,7 @@ import streamlit as st
 import core
 from transpraxis import assets as _assets
 from transpraxis import academic_validator as _academic_validator
+from transpraxis import case_provenance as _case_provenance
 from transpraxis import context as _context
 from transpraxis import delivery as _delivery
 from transpraxis import knowledge as _knowledge
@@ -4616,14 +4617,11 @@ def _render_report_issue_detail(job_id, state, groups, artifacts):
                 f"选择状态：{selected.get('authentic_selection_status') or '未记录'} · "
                 f"当前案例 {len(cases)} 个")
             if cases:
-                type_labels = {
-                    "authentic_revision": "真实修订",
-                    "translation_decision": "翻译决策",
-                    "synthetic_contrast": "合成对比",
-                }
                 rows = [{
                     "案例": item.get("case_id") or "—",
-                    "类型": type_labels.get(item.get("case_type"), "—"),
+                    "类型": _case_provenance.display_contract(item)["origin_label"],
+                    "类型说明": _case_provenance.display_contract(item)[
+                        "origin_description"],
                     "来源段": item.get("segment_id") or item.get("source_segment_id") or "—",
                     "聚焦问题": (item.get("focus") or {}).get("issue") or "—",
                     "难点": item.get("difficulty_group") or "—",
@@ -4723,18 +4721,16 @@ def _render_case_portfolio(selected_cases, validation):
     distribution = (selected_cases or {}).get("difficulty_distribution") or {}
     if distribution:
         st.caption(" · ".join(f"{label} {count}" for label, count in distribution.items()))
+    st.caption("真实修订：项目保存的历史初译与当前译文；合成对照：模拟初译仅用于分析，不是历史初译。")
     rows = []
-    type_labels = {
-        "authentic_revision": "真实修订",
-        "translation_decision": "翻译决策",
-        "synthetic_contrast": "合成对比",
-    }
     for item in cases:
         focus = item.get("focus") or {}
         source = (focus.get("source_span") or {}).get("text") or ""
+        display = _case_provenance.display_contract(item)
         rows.append({
             "case_id": item.get("case_id") or "—",
-            "类型": type_labels.get(item.get("case_type"), item.get("case_type") or "—"),
+            "类型": display["origin_label"],
+            "类型说明": display["origin_description"],
             "focus": source,
             "难点": item.get("difficulty_group") or "—",
             "策略": item.get("strategy_group") or "—",

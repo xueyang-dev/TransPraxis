@@ -24,6 +24,9 @@ def run_regression() -> Dict[str, Any]:
     serialized = json.dumps(fixture, ensure_ascii=False)
     approved_synthetic_is_non_historical = all(
         case.get("review_status") == "approved"
+        and case.get("case_origin") == "SYNTHETIC_BASELINE"
+        and (case.get("text_role") or {}).get("initial") == "SYNTHETIC_BASELINE"
+        and (case.get("text_role") or {}).get("target") == "CURRENT_TRANSLATION"
         and "historical_initial" not in case
         and bool(case.get("synthetic_baseline"))
         for case in synthetic
