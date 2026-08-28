@@ -118,7 +118,7 @@ artifact_id
 artifact_type
 file
 content_hash
-dependency_hash        # 即 input_hash，不再重复存两份
+dependency_hash        # 稳定哈希实际输入；可包含版本、policy 和 payload，不要求只由 IDs 组成
 input_segment_ids
 input_artifact_ids
 version
@@ -131,7 +131,7 @@ stale_reason
 
 ### 缩小 dependency hash 的输入
 
-当前 `_section_dependency_hash()` 不应继续依赖整份 `evidence["content_hash"]`、完整 argument plan 或完整 literature content hash。每个写作单元只 hash：
+`_section_dependency_hash()` 不再依赖整份 `evidence["content_hash"]`、完整 argument plan 或完整 literature content hash。每个写作单元只 hash：
 
 - 本单元的 outline plan；
 - 本单元实际引用的 claim；
@@ -210,14 +210,61 @@ section:3.3.1
 
 ### 阶段 2：Dependency-aware Invalidation（P0，4—6 天）
 
-- 扩展现有 artifact record，而不是新建状态系统；
-- 记录 `input_segment_ids / input_artifact_ids / status`；
-- 将 Case Analysis 子节改为独立缓存单元；
-- 将 section dependency hash 缩小到实际输入；
-- 在所有 translation mutation 入口执行精确 stale 传播；
-- 在报告页展示 stale chain、可复用单元和预计重建范围。
+Stage 2 按以下顺序实施，前一项通过回归后再进入后一项：
 
-验收：修改 Case 15 对应译文后，只重建 Case 15、3.3.2 及组合下游；Case 3、Case 8、2.1、3.3.1 和无关文献不调用模型、不改变 content hash。
+```text
+1. 补齐所有 translation truth mutation path
+   ↓
+2. 修 synthetic_optimized 的隐藏 dependency
+   ↓
+3. artifact record 增加精确 input ids + lifecycle status
+   ↓
+4. stale propagation
+   ↓
+5. 区分 stale / LLM rewrite / reassemble / QA
+   ↓
+6. Stage 2A regression
+   ↓
+7. 再拆 subsection writing units
+   ↓
+8. Stage 2B regression
+```
+
+#### Stage 2A：依赖与生命周期基础
+
+1. **补齐所有 translation truth mutation path**：人工编辑、恢复原译、AI 重译、接受修复候选、翻译流水线批次提交，以及断点恢复时的截断保存，都经过同一个 truth-change 入口。
+2. **修 `synthetic_optimized` 的隐藏 dependency**：把当前译文/evidence 的实际输入纳入依赖，而不是只依赖 error manifest 和 glossary。
+3. **扩展 artifact record**：增加精确的 `input_segment_ids / input_artifact_ids / status`，继续复用现有 `academic_state.artifacts`。
+4. **实现 stale propagation**：从 segment/case 变化沿现有 artifact 依赖传播，并保留可复用单元。
+5. **拆分生命周期语义**：分别表达 `stale`、`LLM rewrite`、`reassemble` 和 `QA`，尤其区分 Final Report/DOCX 的重新组装与 LLM 重写。
+6. **Stage 2A regression**：验证译文变化只影响真实下游，未受影响的 case、Chapter section 和文献不调用模型且 content hash 不变。
+
+#### Stage 2B：写作单元细化
+
+7. **再拆 subsection writing units**：在 Stage 2A 稳定后，将 Case Analysis 的 `3.3.1 / 3.3.2 / 3.3.3` 等子节改为独立缓存和重写单元；Chapter 3 与 Final Report 只负责组合。
+8. **Stage 2B regression**：验证修改 Case 15 后只重写对应 subsection，并重新组装 Chapter 3、Final Report、DOCX 和 render QA。
+
+Stage 2B 的最终验收：修改 Case 15 对应译文后，只重建 Case 15、3.3.2 及组合下游；Case 3、Case 8、2.1、3.3.1 和无关文献不调用模型、不改变 content hash。
+
+#### Stage 2 实际完成粒度
+
+Stage 2A/2B 已落在现有 `academic_state.artifacts` 上。canonical record 保存上述全部字段；旧 record 缺少新字段时按 `valid`、空 direct inputs 读取，原完整性检查通过即可复用，下次自然重建时升级。
+
+`selected_cases` 会为每个已选案例写一个轻量 `case:<case_id>` graph node。它复用 case payload，不建立第二套案例 schema，也不是单独 LLM writing artifact；其 direct edge 只指向绑定 segment。
+
+当前执行语义映射如下：
+
+```text
+case selection             deterministic_reassemble
+writing section/subsection llm_rewrite
+chapter composite          deterministic_reassemble
+final report composite     deterministic_reassemble
+DOCX validation/export     reexport
+render record              rerun_qa
+valid record               reuse
+```
+
+仍需如实区分的 LLM 行为：独立 semantic review、literature support review 和 academic quality evaluation 在 report 变化后仍会重新审阅整篇；quality repair 找到整章级问题时仍可能重写该章。它们不是 report composite 的重组动作，也不得显示成“subsection 需要 LLM 重写”。增量 truth mutation 的主链已按 subsection 复用：受影响 subsection LLM 重写，Chapter 3 和 report 重新组装，DOCX 重新导出，render QA 重跑。
 
 ### 阶段 3：Human Case Review（P0/P1，4—5 天）
 
