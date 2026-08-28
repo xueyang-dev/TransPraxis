@@ -12,6 +12,8 @@
         "target": "CURRENT_TRANSLATION"
       },
       "review_status": "unreviewed",
+      "segment_id": "seg-0003",
+      "target_subsection": "3.3.1",
       "source": "Although the field appears stable, its meaning shifts with context.",
       "historical_initial": "虽然该领域看似稳定，但其含义会随语境变化。",
       "current_translation": "尽管该领域表面稳定，其含义仍会随语境变化。"
@@ -28,7 +30,9 @@
       "source": "The image does not merely describe distance; it makes distance felt.",
       "synthetic_baseline": "这幅图不仅仅描述距离。",
       "current_translation": "这幅图不只是描述距离，更让人切身感受到距离。",
-      "review_status": "approved"
+      "review_status": "approved",
+      "segment_id": "382",
+      "target_subsection": "3.3.2"
     }
   ],
   "expected": {
@@ -36,5 +40,14 @@
     "synthetic_case_count": 1,
     "approved_synthetic_remains_non_historical": true,
     "contains_private_paper_text": false
+  },
+  "stage2": {
+    "affected_segment_id": "382",
+    "affected_case_id": "SC-0015",
+    "affected_subsection_id": "3.3.2",
+    "chapter_id": "3",
+    "unaffected_segment_id": "seg-0003",
+    "unaffected_case_id": "AR-0382",
+    "unaffected_subsection_id": "3.3.1"
   }
 }

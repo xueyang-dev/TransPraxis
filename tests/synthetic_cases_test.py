@@ -506,6 +506,44 @@ def test_synthetic_stage_staleness_is_local():
     print("  ✓ baseline-version change invalidates only synthetic downstream and writing")
 
 
+def test_synthetic_optimizer_dependency_invalidates_bound_segment(tmp_path):
+    evidence = academic_evidence.build_academic_evidence(_state(), JOB)
+    manifest = {"pipeline_status": "complete", "items": [_candidate("SC-15")]}
+    before = academic_writer._synthetic_optimizer_dependency_hash(manifest, evidence)
+    changed = copy.deepcopy(evidence)
+    changed["project_evidence"]["segments"][0]["final_target"] = "当前译文已改变"
+    after = academic_writer._synthetic_optimizer_dependency_hash(manifest, changed)
+    assert after != before
+
+    state = {"academic_state": academic_writer.default_academic_state()}
+    items = [{"case_id": "cached"}]
+    value = {"items": items, "content_hash": academic_evidence.stable_hash(items)}
+    version = academic_writer.VERSIONS["synthetic_optimizer_version"]
+    academic_writer._save_artifact(
+        state, tmp_path, "synthetic_optimized", value, before, version)
+    assert academic_writer._load_valid_artifact(
+        state, tmp_path, "synthetic_optimized", after, version) is None
+
+
+def test_synthetic_optimizer_dependency_reuses_unrelated_segment(tmp_path):
+    evidence = academic_evidence.build_academic_evidence(_state(), JOB)
+    manifest = {"pipeline_status": "complete", "items": [_candidate("SC-15")]}
+    before = academic_writer._synthetic_optimizer_dependency_hash(manifest, evidence)
+    unrelated = copy.deepcopy(evidence)
+    unrelated["project_evidence"]["segments"][2]["final_target"] = "无关段落已改变"
+    after = academic_writer._synthetic_optimizer_dependency_hash(manifest, unrelated)
+    assert after == before
+
+    state = {"academic_state": academic_writer.default_academic_state()}
+    items = [{"case_id": "cached"}]
+    value = {"items": items, "content_hash": academic_evidence.stable_hash(items)}
+    version = academic_writer.VERSIONS["synthetic_optimizer_version"]
+    academic_writer._save_artifact(
+        state, tmp_path, "synthetic_optimized", value, before, version)
+    assert academic_writer._load_valid_artifact(
+        state, tmp_path, "synthetic_optimized", after, version) == value
+
+
 def test_section_dependencies_only_follow_relevant_synthetic_cases():
     evidence = academic_evidence.build_academic_evidence(_state(), JOB)
     argument = {"content_hash": "argument"}

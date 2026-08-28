@@ -261,6 +261,36 @@ def test_review_failed_must_not_mark_segment_reviewed_or_promote_tm_or_knowledge
         core.OUTPUT_DIR, core.call_llm = old_output, old_call
 
 
+def test_translate_stage_records_current_translation_truth(tmp_path):
+    old_output, old_call = core.OUTPUT_DIR, core.call_llm
+    try:
+        core.OUTPUT_DIR = tmp_path
+
+        def llm(provider, key, model, system, user, temperature=0.1):
+            if "学术翻译专家" in system:
+                return json.dumps(["流水线译文。"])
+            return "[]"
+
+        core.call_llm = llm
+        job_id = "translationtruthpipeline"
+        state = core.new_job_state("truth.docx")
+        state["paras"] = ["The pipeline writes the current translation."]
+
+        result = core.translate_stage(
+            state, job_id, [], "DeepSeek", "k", "m", "简体中文", "",
+            enable_review=False, use_tm=False)
+
+        assert result["pairs"][0]["target"] == "流水线译文。"
+        assert result["translation_truth"]["authority"] == "CURRENT_TRANSLATION"
+        assert result["translation_truth"]["version"] == 1
+        assert result["translation_truth"]["last_change"]["action"] == \
+            "translation_batch"
+        assert result["translation_truth"]["last_change"]["segment_indexes"] == [0]
+        assert core.load_job_state(job_id)["translation_truth"]["version"] == 1
+    finally:
+        core.OUTPUT_DIR, core.call_llm = old_output, old_call
+
+
 def test_evidence_segment_id_is_global_across_later_batches():
     paragraphs = [f"source {index}" for index in range(40)]
     pairs = [{"source": source, "target": f"target {index}"}
