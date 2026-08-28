@@ -45,6 +45,474 @@ _PASSIVE = re.compile(
     re.IGNORECASE,
 )
 
+FOCUS_PREFERRED_MIN_WORDS = 40
+FOCUS_PREFERRED_MAX_WORDS = 120
+FOCUS_SOFT_MAX_WORDS = 180
+
+
+def _word_count(text: Any) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+(?:['’\-][A-Za-z0-9]+)*|[\u3400-\u9fff]", str(text or "")))
+
+
+def _bounded_span(text: str, start: int, end: int, reason: str) -> Dict[str, Any]:
+    start = max(0, min(len(text), int(start)))
+    end = max(start, min(len(text), int(end)))
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    value = text[start:end]
+    words = _word_count(value)
+    return {
+        "start": start,
+        "end": end,
+        "text": value,
+        "word_count": words,
+        "selection_reason": reason,
+        "length_status": (
+            "over_soft_max" if words > FOCUS_SOFT_MAX_WORDS else
+            "preferred" if FOCUS_PREFERRED_MIN_WORDS <= words <=
+            FOCUS_PREFERRED_MAX_WORDS else "acceptable"),
+    }
+
+
+def _sentence_spans(text: str) -> List[Tuple[int, int]]:
+    """Return deterministic sentence boundaries without changing canonical text."""
+    spans: List[Tuple[int, int]] = []
+    start = 0
+    for match in re.finditer(r"[.!?。！？]+(?:[\"'”’）)\]]*)\s*", text):
+        end = match.end()
+        if text[start:end].strip():
+            spans.append((start, end))
+        start = end
+    if text[start:].strip():
+        spans.append((start, len(text)))
+    return spans or ([(0, len(text))] if text else [])
+
+
+def _clause_spans(text: str, start: int, end: int) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    cursor = start
+    for match in re.finditer(r"[;；:：—–,，]\s*", text[start:end]):
+        boundary = start + match.end()
+        if text[cursor:boundary].strip():
+            spans.append((cursor, boundary))
+        cursor = boundary
+    if text[cursor:end].strip():
+        spans.append((cursor, end))
+    return spans or [(start, end)]
+
+
+def _minimum_sufficient_span(
+    text: str, anchor_start: int, anchor_end: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Select the smallest sentence/clause-bounded context around evidence."""
+    if not text:
+        return _bounded_span("", 0, 0, "canonical_text_missing")
+    anchor_start = max(0, min(len(text) - 1, int(anchor_start)))
+    anchor_end = max(anchor_start + 1, min(len(text), int(anchor_end or anchor_start + 1)))
+    sentences = _sentence_spans(text)
+    sentence_index = next((i for i, (start, end) in enumerate(sentences)
+                           if start <= anchor_start < end), len(sentences) - 1)
+    start, end = sentences[sentence_index]
+    reason = "evidence_anchor_sentence"
+    if _word_count(text[start:end]) > FOCUS_SOFT_MAX_WORDS:
+        clauses = _clause_spans(text, start, end)
+        clause_index = next((i for i, (left, right) in enumerate(clauses)
+                             if left <= anchor_start < right), 0)
+        left = right = clause_index
+        start, end = clauses[left]
+        while _word_count(text[start:end]) < FOCUS_PREFERRED_MIN_WORDS \
+                and (left > 0 or right + 1 < len(clauses)):
+            before = _word_count(text[clauses[left - 1][0]:start]) if left > 0 else 10**9
+            after = _word_count(text[end:clauses[right + 1][1]]) \
+                if right + 1 < len(clauses) else 10**9
+            if before <= after:
+                left -= 1
+                start = clauses[left][0]
+            else:
+                right += 1
+                end = clauses[right][1]
+        reason = "clause_context_for_long_sentence"
+    sentence_left = sentence_right = sentence_index
+    while _word_count(text[start:end]) < FOCUS_PREFERRED_MIN_WORDS \
+            and (sentence_left > 0 or sentence_right + 1 < len(sentences)):
+        before = sentences[sentence_left - 1] if sentence_left > 0 else None
+        after = sentences[sentence_right + 1] \
+            if sentence_right + 1 < len(sentences) else None
+        before_words = _word_count(text[before[0]:start]) if before else 10**9
+        after_words = _word_count(text[end:after[1]]) if after else 10**9
+        if before_words <= after_words:
+            sentence_left -= 1
+            start = before[0]  # type: ignore[index]
+        else:
+            sentence_right += 1
+            end = after[1]  # type: ignore[index]
+        reason = "evidence_anchor_with_adjacent_context"
+        if _word_count(text[start:end]) > FOCUS_SOFT_MAX_WORDS:
+            break
+    return _bounded_span(text, start, end, reason)
+
+
+def _changed_span(before: str, after: str, side: str) -> Optional[Tuple[int, int]]:
+    ranges = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+            None, before, after, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        start, end = (i1, i2) if side == "before" else (j1, j2)
+        if start == end:
+            start = max(0, start - 1)
+            end = min(len(before if side == "before" else after), end + 1)
+        ranges.append((start, end))
+    if not ranges:
+        return None
+    return min(x[0] for x in ranges), max(x[1] for x in ranges)
+
+
+def _term_anchor(
+    segment: Dict[str, Any], glossary: Iterable[Dict[str, Any]], text: str,
+    field: str = "source",
+) -> Tuple[Optional[Tuple[int, int]], Optional[Dict[str, Any]]]:
+    ids = set((segment.get("process_evidence") or {}).get(
+        "injected_glossary_entry_ids") or [])
+    matches = []
+    for item in glossary:
+        if ids and item.get("id") not in ids:
+            continue
+        values = [item.get(field)] if field == "source" else [
+            item.get("target"), item.get("preferred"), item.get("proposed_target")]
+        for value in values:
+            value = str(value or "").strip()
+            if not value:
+                continue
+            match = re.search(re.escape(value), text, re.IGNORECASE)
+            if field == "source":
+                # PDF extraction may split a glossary term at a line-ending
+                # hyphen (vol- umetric).  Search a dehyphenated view while
+                # retaining a deterministic map back to canonical offsets.
+                compact_chars: List[str] = []
+                original_indices: List[int] = []
+                index = 0
+                while index < len(text):
+                    if text[index] == "-" and index + 1 < len(text) and \
+                            text[index + 1].isspace():
+                        index += 1
+                        while index < len(text) and text[index].isspace():
+                            index += 1
+                        continue
+                    compact_chars.append(text[index])
+                    original_indices.append(index)
+                    index += 1
+                compact = "".join(compact_chars)
+                compact_match = re.search(re.escape(value), compact, re.IGNORECASE)
+                if compact_match and (match is None or
+                                      original_indices[compact_match.start()] < match.start()):
+                    start = original_indices[compact_match.start()]
+                    end_index = compact_match.end() - 1
+                    end = original_indices[end_index] + 1
+                    match = type("_MappedMatch", (), {
+                        "start": lambda self: start,
+                        "end": lambda self: end,
+                    })()
+            if match:
+                matches.append((len(value), match.start(), match.end(), item))
+    if not matches:
+        return None, None
+    _length, start, end, item = max(matches, key=lambda x: (x[0], -x[1]))
+    return (start, end), item
+
+
+def _finding_anchor(segment: Dict[str, Any], text: str) -> Optional[Tuple[int, int]]:
+    for finding in (segment.get("process_evidence") or {}).get("findings") or []:
+        raw = finding.get("source_span") or finding.get("span")
+        if isinstance(raw, dict):
+            try:
+                start, end = int(raw.get("start")), int(raw.get("end"))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= start < end <= len(text) and (not raw.get("text") or
+                                                   text[start:end] == raw.get("text")):
+                return start, end
+    return None
+
+
+def _rhetoric_anchor(text: str) -> Optional[Tuple[int, int]]:
+    match = re.search(
+        r"\b(?:metaphor|like a|as if|evok(?:e|es|ed|ing)|imaginar(?:y|ies)|"
+        r"sharpen|flatten|poisonous|fertile|toxic)\b", text, re.IGNORECASE)
+    return (match.start(), match.end()) if match else None
+
+
+def case_evidence_profile(
+    case: Dict[str, Any], segment: Dict[str, Any], glossary: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    source = str(segment.get("source") or case.get("source_text") or "")
+    if case.get("case_type") == "synthetic_contrast":
+        difficulty = case.get("difficulty") or {}
+        category = str(difficulty.get("category") or "synthetic_contrast")
+        code = {
+            "syntax_attachment": "syntax",
+            "logical_relation": "syntax",
+            "negation_scope": "syntax",
+            "information_structure": "syntax",
+            "temporal_relation": "syntax",
+            "lexical_polysemy": "terminology",
+            "idiom_misreading": "terminology",
+            "cultural_reference": "reference",
+            "proper_noun": "reference",
+            "reference_resolution": "reference",
+            "cohesion": "discourse",
+            "register": "rhetoric",
+            "narrative_voice": "rhetoric",
+            "metaphor": "rhetoric",
+            "pragmatic_implication": "rhetoric",
+            "overliteral_translation": "rhetoric",
+        }.get(category, "discourse")
+        issue = str(difficulty.get("reason") or difficulty.get("trigger") or code)
+        strategy = str(case.get("strategy_group") or {
+            "syntax": "句法重组与逻辑显化",
+            "terminology": "术语一致性与概念显化",
+            "reference": "专名、互文与文化信息补偿",
+            "rhetoric": "修辞功能与评价色彩传递",
+            "discourse": "语篇衔接与信息组织",
+        }.get(code, "模拟基线与当前译文的受控对比"))
+        return {
+            "difficulty_code": code,
+            "difficulty_group": {
+                "syntax": "长句与复杂信息结构",
+                "terminology": "学术术语与核心概念",
+                "reference": "专名、指代与文化指称",
+                "rhetoric": "修辞、语用与语域",
+                "discourse": "篇章衔接与信息组织",
+            }.get(code, "合成对比翻译难点"),
+            "strategy_group": strategy,
+            "issue": issue,
+            "synthetic_category": category,
+            "signal": "validated_synthetic_error_span",
+        }
+    findings = (segment.get("process_evidence") or {}).get("findings") or []
+    term_anchor, term = _term_anchor(segment, glossary, source)
+    rhetoric = _rhetoric_anchor(source)
+    proper_names = re.findall(r"\b[A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+)+\b", source)
+    features = case.get("features") or {}
+    if findings:
+        code, difficulty, strategy = (
+            "quality", "质量问题与译文完整性", "审校证据驱动的质量诊断")
+    elif rhetoric:
+        code, difficulty, strategy = (
+            "rhetoric", "修辞与语义张力", "修辞意义与评价色彩传递")
+    elif term_anchor and int(features.get("term_count") or 0) >= 2 \
+            and len(source) < 1400:
+        # Short, concept-dense decision cases are better terminology evidence
+        # than generic long-sentence cases.  Long clause-dense passages remain
+        # available for RQ1 below.
+        code, difficulty, strategy = (
+            "terminology", "学术术语与核心概念", "术语一致性与概念显化")
+    elif int(features.get("clause_markers") or 0) >= 4 or len(source) >= 600:
+        # Long, clause-dense decision cases should remain available for RQ1
+        # even when the same segment also contains terminology or proper names.
+        code, difficulty, strategy = (
+            "syntax", "长句与复杂信息结构", "句法重组与信息结构调整")
+    elif proper_names:
+        code, difficulty, strategy = (
+            "reference", "专名与文化指称", "专名规范与文化信息处理")
+    elif term_anchor:
+        code, difficulty, strategy = (
+            "terminology", "学术术语与核心概念", "术语一致性与概念显化")
+    else:
+        code, difficulty, strategy = (
+            "discourse", "学术语域与篇章关系", "语域保持与篇章衔接")
+    issue = (
+        str((findings[0] if findings else {}).get("reason") or "").strip()
+        or (f"{term.get('source')} → {term.get('target') or term.get('preferred')}"
+            if term else "")
+        or difficulty)
+    return {
+        "difficulty_code": code,
+        "difficulty_group": difficulty,
+        "strategy_group": strategy,
+        "issue": issue,
+        "signal": (
+            "finding_span" if _finding_anchor(segment, source) else
+            "finding" if findings else "rhetorical_trigger" if rhetoric else
+            "named_entity" if proper_names else "terminology_hit" if term_anchor else
+            "linguistic_structure"),
+    }
+
+
+def build_case_focus(
+    case: Dict[str, Any], segment: Dict[str, Any], glossary: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Separate full canonical evidence from its minimum sufficient presentation."""
+    case_type = str(case.get("case_type") or "authentic_revision")
+    source = str(segment.get("source") or case.get("source_text") or "")
+    baseline = case.get("synthetic_baseline")
+    baseline_text = baseline.get("text") if isinstance(baseline, dict) else baseline
+    optimized = case.get("optimized_translation")
+    optimized_text = optimized.get("text") if isinstance(optimized, dict) else optimized
+    initial = str(segment.get("initial_target") or baseline_text or "")
+    target = str(segment.get("final_target") or optimized_text or "")
+    profile = case_evidence_profile(case, segment, glossary)
+    synthetic_evidence = str((case.get("error") or {}).get(
+        "source_evidence_span") or (case.get("difficulty") or {}).get("trigger") or "")
+    synthetic_match = re.search(re.escape(synthetic_evidence), source, re.IGNORECASE) \
+        if synthetic_evidence else None
+    source_anchor = (synthetic_match.start(), synthetic_match.end()) \
+        if synthetic_match else _finding_anchor(segment, source)
+    term_source, term = _term_anchor(segment, glossary, source)
+    source_anchor = source_anchor or term_source or _rhetoric_anchor(source)
+    if source_anchor is None:
+        sentences = _sentence_spans(source)
+        source_anchor = max(sentences, key=lambda span: (
+            len(_SUBORDINATION.findall(source[span[0]:span[1]])),
+            _word_count(source[span[0]:span[1]]), -span[0])) if sentences else (0, len(source))
+    source_span = _minimum_sufficient_span(source, *source_anchor)
+
+    def aligned_span(text: str, *, before: bool = False) -> Optional[Dict[str, Any]]:
+        if not text:
+            return None
+        term_hit = _term_anchor(segment, glossary, text, field="target")[0]
+        changed = _changed_span(initial, target, "before" if before else "after") \
+            if case_type == "authentic_revision" and initial and target else None
+        anchor = changed or term_hit
+        if anchor is None:
+            ratio = source_span["start"] / max(1, len(source))
+            position = min(len(text) - 1, round(ratio * len(text)))
+            anchor = (position, min(len(text), position + 1))
+        return _minimum_sufficient_span(text, *anchor)
+
+    initial_span = aligned_span(initial, before=True) \
+        if case_type in {"authentic_revision", "synthetic_contrast"} else None
+    target_span = aligned_span(target)
+    source_sentences = _sentence_spans(source)
+    sentence_index = next((i for i, (start, end) in enumerate(source_sentences)
+                           if start <= source_span["start"] < end), 0)
+    context_before = source[source_sentences[sentence_index - 1][0]:
+                            source_sentences[sentence_index - 1][1]].strip() \
+        if sentence_index > 0 and source_sentences[sentence_index - 1][1] <= source_span["start"] else ""
+    context_after = source[source_sentences[sentence_index + 1][0]:
+                           source_sentences[sentence_index + 1][1]].strip() \
+        if sentence_index + 1 < len(source_sentences) and \
+        source_sentences[sentence_index + 1][0] >= source_span["end"] else ""
+    return {
+        "issue": profile["issue"],
+        "signal": profile["signal"],
+        "source_span": source_span,
+        "initial_span": initial_span,
+        "target_span": target_span,
+        "context_before": context_before,
+        "context_after": context_after,
+        "alignment": "exact_offsets_or_deterministic_sentence_clause_alignment",
+        "soft_max_words": FOCUS_SOFT_MAX_WORDS,
+        "over_soft_max_reason": (
+            "minimum evidence-bounded sentence/clause remains over soft maximum"
+            if source_span["word_count"] > FOCUS_SOFT_MAX_WORDS else ""),
+        **profile,
+    }
+
+
+def semantic_focus_alignment(
+    case: Dict[str, Any], segment: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Check local source/target focus correspondence beyond containment.
+
+    Offset containment proves provenance, not that the two excerpts translate
+    the same local unit.  This deterministic gate uses issue anchors and
+    sentence positions.  It deliberately returns ``review_required`` for
+    plausible compression/reordering, while a large local displacement with
+    an otherwise narrow focus is ``misaligned`` and cannot be a core case.
+    """
+    focus = case.get("focus") or {}
+    source_span = focus.get("source_span") or {}
+    target_span = focus.get("target_span") or {}
+    canonical_source = str((case.get("canonical_evidence") or {}).get(
+        "source") or segment.get("source") or "")
+    canonical_target = str((case.get("canonical_evidence") or {}).get(
+        "target") or segment.get("final_target") or "")
+    source_text = str(source_span.get("text") or "")
+    target_text = str(target_span.get("text") or "")
+    reasons: List[str] = []
+    status = "aligned"
+    issue = str(focus.get("issue") or "")
+    left, right = (issue.split("→", 1) + [""])[:2] if "→" in issue else ("", "")
+    left = left.strip().strip("'‘’\"“”")
+    right = right.strip().strip("'‘’\"“”")
+    normalized_source_focus = re.sub(r"-\s+", "", source_text)
+    if left and left.casefold() not in normalized_source_focus.casefold():
+        status = "review_required"
+        reasons.append("source_focus_missing_issue_anchor")
+    if right and right not in target_text:
+        status = "review_required"
+        reasons.append("target_focus_missing_issue_anchor")
+
+    def sentence_index(text: str, position: int) -> int:
+        spans = _sentence_spans(text)
+        return next((i for i, (start, end) in enumerate(spans)
+                     if start <= position < end), max(0, len(spans) - 1))
+
+    source_position = int(focus.get("canonical_source_start")
+                          if focus.get("canonical_source_start") is not None
+                          else source_span.get("start") or 0)
+    target_position = int(focus.get("canonical_target_start")
+                          if focus.get("canonical_target_start") is not None
+                          else target_span.get("start") or 0)
+    source_index = sentence_index(canonical_source, source_position)
+    target_index = sentence_index(canonical_target, target_position)
+    if canonical_source and canonical_target and abs(source_index - target_index) > 1:
+        status = "misaligned"
+        reasons.append(
+            f"canonical_sentence_displacement:{source_index}->{target_index}")
+
+    # Paragraph-level source/target evidence can have different sentence
+    # counts because of footnotes, compression, or sentence splitting.  A
+    # local focus at materially different relative positions is not a safe
+    # synthetic contrast, even when its raw sentence indices happen to match.
+    source_sentences_all = _sentence_spans(canonical_source)
+    target_sentences_all = _sentence_spans(canonical_target)
+    if canonical_source and canonical_target and source_sentences_all and target_sentences_all:
+        source_ratio = source_index / max(1, len(source_sentences_all) - 1)
+        target_ratio = target_index / max(1, len(target_sentences_all) - 1)
+        if abs(source_ratio - target_ratio) > 0.05:
+            status = "misaligned"
+            reasons.append(
+                f"canonical_relative_position_displacement:{source_index}/"
+                f"{len(source_sentences_all)}->{target_index}/"
+                f"{len(target_sentences_all)}")
+
+    source_focus_sentences = len(_sentence_spans(source_text)) if source_text else 0
+    target_focus_sentences = len(_sentence_spans(target_text)) if target_text else 0
+    if source_focus_sentences and target_focus_sentences and \
+            abs(source_focus_sentences - target_focus_sentences) > 0:
+        if status == "aligned":
+            status = "review_required"
+        reasons.append(
+            f"focus_sentence_count_diff:{source_focus_sentences}->{target_focus_sentences}")
+
+    # A discourse connector in the source without its local target counterpart
+    # is a useful warning for cases such as a focus ending before “Rather”.
+    connector_pairs = (
+        (r"\bRather\b", ("相反", "而是", "而非")),
+        (r"\bHowever\b", ("然而", "但是", "不过")),
+        (r"\bIn contrast\b", ("相比", "相较", "相反")),
+        (r"\bTherefore\b", ("因此", "所以", "因而")),
+    )
+    for source_pattern, target_markers in connector_pairs:
+        if re.search(source_pattern, source_text, re.IGNORECASE) \
+                and not any(marker in target_text for marker in target_markers):
+            if status == "aligned":
+                status = "review_required"
+            reasons.append(
+                f"local_connector_not_in_target:{'/'.join(target_markers)}")
+    return {
+        "status": status,
+        "reason": ";".join(reasons) or "issue_anchor_and_local_sentence_position_align",
+        "source_sentence_index": source_index,
+        "target_sentence_index": target_index,
+        "source_focus_sentence_count": source_focus_sentences,
+        "target_focus_sentence_count": target_focus_sentences,
+    }
+
 
 def stable_hash(value: Any) -> str:
     """Stable SHA-256 for JSON-compatible academic artifacts."""
@@ -380,9 +848,17 @@ def mine_candidate_cases(
             "segment_index": segment["segment_index"],
             "coverage_zone": segment["coverage_zone"],
             "case_type": "authentic_revision",
+            "historical": True,
+            "generated_for_analysis": False,
+            "source_provenance": "project_source",
+            "initial_provenance": "project_historical_initial_target",
+            "target_provenance": "project_historical_final_target",
             "provenance": {
                 "historical": True,
                 "generated_for_analysis": False,
+                "source_provenance": "project_source",
+                "initial_provenance": "project_historical_initial_target",
+                "target_provenance": "project_historical_final_target",
             },
             "case_role": role,
             **details,
@@ -434,7 +910,16 @@ def mine_translation_decision_cases(
             "case_type": "translation_decision",
             "case_role": "translation_decision_case",
             "academic_candidate_status": "eligible",
-            "provenance": {"historical": True, "generated_for_analysis": False},
+            "historical": False,
+            "generated_for_analysis": False,
+            "source_provenance": "project_source",
+            "target_provenance": "project_current_target",
+            "provenance": {
+                "historical": False,
+                "generated_for_analysis": False,
+                "source_provenance": "project_source",
+                "target_provenance": "project_current_target",
+            },
             "decision_evidence": {
                 "initial_equals_final": True,
                 "finding_count": len(segment["process_evidence"].get("findings") or []),

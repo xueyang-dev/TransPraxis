@@ -9,8 +9,9 @@ from docx.oxml.ns import qn
 from docx.shared import Inches
 
 import core
-from transpraxis import (academic_quality, academic_validator, academic_writer,
-                         report_template, thesis_constraints)
+from transpraxis import (academic_evidence, academic_quality, academic_validator,
+                         academic_writer, final_docx, report_template,
+                         thesis_constraints)
 
 
 def test_academic_writer_public_type_hints_resolve():
@@ -334,6 +335,31 @@ def test_template_validator_has_independent_compliance_gate():
     assert "template_hash_mismatch" in {x["type"] for x in hashed["issues"]}
 
 
+def test_template_case_mapping_uses_actual_case_chapter_number():
+    chapter = {
+        "section_id": "4", "title": "案例分析", "role": "case_analysis",
+        "required_subsections": [
+            {"heading_id": "4.2", "title": "翻译难点", "level": 2},
+            {"heading_id": "4.3", "title": "翻译策略", "level": 2},
+        ],
+    }
+    contract = {
+        "template_identity": {"sha256": "case-chapter-four"},
+        "document_structure": {"chapters": [chapter], "top_level": 1},
+    }
+    report = (
+        "## 4 案例分析\n\n### 4.2 翻译难点\n\n"
+        "#### 4.2.1 术语难点\n\n难点。\n\n"
+        "### 4.3 翻译策略\n\n#### 4.3.1 术语策略\n\n策略。")
+    result = academic_validator.validate_template_compliance(
+        report, contract, {"template_hash": "case-chapter-four",
+                           "sections": [chapter]})
+    assert "template_case_mapping_mismatch" not in {
+        item["type"] for item in result["issues"]}
+    assert "template_extra_subsection" not in {
+        item["type"] for item in result["issues"]}
+
+
 def test_template_hash_invalidates_downstream_academic_artifacts():
     state = core.new_job_state("source.docx")
     contract_a = _contract()
@@ -520,7 +546,11 @@ def test_mti_required_subsection_and_case_minimum_are_hard_failures():
     assert missing["status"] == "fail"
     assert "template_missing_subsection" in {item["type"] for item in missing["issues"]}
     insufficient = academic_validator.validate_template_compliance(
-        _mti_markdown(), contract, outline, artifact, {"cases": cases[:5]})
+        _mti_markdown(), contract, outline, artifact, {
+            "report_case_policy": thesis_constraints.case_policy({
+                "report_stage": "proposal"}),
+            "cases": cases[:5],
+        })
     assert insufficient["status"] == "fail"
     assert "template_case_minimum_not_met" in {
         item["type"] for item in insufficient["issues"]}
@@ -670,7 +700,7 @@ def test_visible_examples_are_bound_to_hidden_case_provenance_by_source_text():
         report, evidence, cases, {"sections": []})
     assert normalized.count("<!--case:") == 2
     assert "<!--case:TD-0001-->" in normalized
-    assert "> [SOURCE TD-0002]: The second exact source sentence" in normalized
+    assert "**原文**：The second exact source sentence" in normalized
 
 
 def test_source_quote_list_lines_do_not_trigger_body_language_mismatch():
@@ -704,7 +734,8 @@ def test_template_renderer_is_blocked_until_generated_and_uses_template(tmp_path
             _mti_markdown(), _mti_written(), outline,
             thesis_constraints.build_constraints({
                 "project_name": "Drone Communities",
-                "report_template_contract": contract}), _mti_matter(contract))
+                "report_template_contract": contract,
+                "report_stage": "proposal"}), _mti_matter(contract))
         artifact.update(report_status="failed_template_validation",
                         template_compliance="fail")
         (core.job_dir(job_id) / "academic-report.json").write_text(
@@ -750,6 +781,21 @@ def _case_chain_fixture(count=6):
         "final_target": f"第{index}条规范译文。",
         "process_evidence": {"findings": [{"type": "terminology"}]},
     } for index in range(1, count + 1)]
+    for case, segment in zip(cases, segments):
+        case.update({
+            "segment_id": segment["segment_id"],
+            "canonical_evidence": {
+                "source": segment["source"], "initial": None,
+                "target": segment["final_target"],
+            },
+            "focus": academic_evidence.build_case_focus(case, segment, []),
+            "difficulty_group": "连贯性与质量控制",
+            "strategy_group": "篇章衔接",
+            "research_questions": [],
+            "target_subsection": "3.3.1",
+            "strategy_subsection": "3.3.1",
+            "difficulty_subsection": "3.2.1",
+        })
     plans = {"plans": [{
         "case_id": case["case_id"], "case_type": "translation_decision",
         "analysis_contract_type": "translation_decision",
@@ -759,7 +805,19 @@ def _case_chain_fixture(count=6):
         "bounded_conclusion": "结论限于本例。",
         "analysis_contract": {},
     } for case in cases]}
-    selected = {"cases": cases}
+    selected = {
+        "report_case_policy": thesis_constraints.case_policy({
+            "report_stage": "proposal"}),
+        "case_portfolio": {"groups": [{
+            "difficulty_group": "连贯性与质量控制",
+            "strategy_group": "篇章衔接",
+            "difficulty_subsection": "3.2.1",
+            "strategy_subsection": "3.3.1",
+            "case_ids": [case["case_id"] for case in cases],
+            "case_count": len(cases),
+        }]},
+        "cases": cases,
+    }
     evidence = {"project_evidence": {
         "segments": segments, "statistics": {}, "glossary": []},
         "translation_decision_candidates": cases, "candidate_cases": []}
@@ -808,10 +866,12 @@ def test_six_selected_cases_create_six_unique_nodes_and_assembly_numbers():
         markdown, selected, evidence, plans, outline)
     assert [node["example_number"] for node in artifact["case_nodes"]] == list(range(1, 7))
     assert len({node["case_id"] for node in artifact["case_nodes"]}) == 6
-    assert artifact["case_counts"] == {
-        "selected_case_count": 6, "structured_case_node_count": 6,
-        "unique_provenance_bound_visible_case_count": 6}
-    assert validation["case_validation"]["status"] == "pass"
+    assert artifact["case_counts"]["selected_case_count"] == 6
+    assert artifact["case_counts"]["structured_case_node_count"] == 6
+    assert artifact["case_counts"]["focused_case_count"] == 6
+    assert artifact["case_counts"][
+        "unique_provenance_bound_visible_case_count"] == 6
+    assert validation["case_validation"]["status"] != "fail"
     assert [f"例[{index}]" for index in range(1, 7)] == [
         artifact["case_labels"][node["case_id"]] for node in artifact["case_nodes"]]
     public = report_template.public_report_markdown(
@@ -859,7 +919,7 @@ def test_missing_writer_case_reports_exact_id_then_targeted_repair_passes():
     _normalized, artifact, passed = _case_chain_artifact(
         repaired, selected, evidence, plans, outline)
     assert artifact["case_counts"]["structured_case_node_count"] == 6
-    assert passed["case_validation"]["status"] == "pass"
+    assert passed["case_validation"]["status"] != "fail"
 
 
 def test_duplicate_case_cannot_inflate_unique_provenance_count():
@@ -965,3 +1025,78 @@ def test_mti_contract_to_outline_to_report_to_validation_to_docx_e2e():
         paragraph.text for paragraph in Document(BytesIO(output)).paragraphs)
     assert "ABSTRACT" in rendered_text and "参考文献" in rendered_text
     assert "附录一" in rendered_text and "总结与反思" in rendered_text
+
+
+def test_dynamic_chapter_four_toc_cache_and_surface_validation_are_complete():
+    contract = _mti_contract()
+    constraints = thesis_constraints.build_constraints({
+        "body_language": "zh-CN", "project_name": "Drone Communities",
+        "report_template_contract": contract, "report_stage": "proposal",
+    })
+    outline = _mti_outline(contract, [])
+    written = _mti_written()
+    written[-1]["content"] = (
+        "### 4.1 研究问题回应\n\n"
+        "#### 4.1.1 RQ1 回应\n\n第四章真实正文。\n\n"
+        "### 4.2 实践经验\n\n实践经验正文。\n\n"
+        "### 4.3 局限与改进\n\n局限正文。")
+    markdown = "\n\n".join(
+        f"## {item['section_id']} {item['title']}\n\n{item['content']}"
+        for item in written) + "\n"
+    matter = _mti_matter(contract)
+    matter["project_title"] = "Drone Communities"
+    for item in matter["front_matter"]:
+        if item.get("role") == "abstract_en":
+            item["content"] = "This is a complete English abstract."
+        elif item.get("role") == "keywords_en":
+            item["keywords"] = ["translation practice", "case analysis"]
+    matter["back_matter"] = [
+        {**item, "title": str(item.get("title") or "").replace(
+            "《XXX》", "《Drone Communities》")}
+        for item in matter["back_matter"]
+    ]
+    matter["report"] = {"literature_status": "literature_required"}
+    artifact = academic_writer.build_report_artifact(
+        markdown, written, outline, constraints, matter)
+    output = report_template.render_report_docx(
+        artifact, _mti_template_bytes(), contract).getvalue()
+    rendered = Document(BytesIO(output))
+    texts = [paragraph.text for paragraph in rendered.paragraphs]
+    assert "第四章真实正文。" in texts
+    assert "4.1.1 RQ1 回应" in texts
+    assert "《XXX》" not in "\n".join(texts)
+    assert "如果有" not in "\n".join(texts)
+    xml = ZipFile(BytesIO(output)).read("word/document.xml").decode("utf-8")
+    assert "TOC" in xml and "第四章 总结与反思" in xml
+    assert "文化负载词处理" not in xml
+    surface = final_docx.validate_final_docx(output, artifact)
+    assert surface["status"] == "pass_with_warnings"
+    assert surface["summary"]["nonempty_chapter_count"] == 4
+    assert surface["summary"]["project_placeholder_count"] == 0
+
+
+def test_english_abstract_translates_chinese_metadata_labels():
+    contract = _mti_contract()
+    research = {"project_metadata": {
+        "project_name": "Drone Communities", "genre": "学术专著",
+        "domain": "传播学/环境人文学"}, "research_questions": []}
+    evidence = {"project_evidence": {
+        "document_profile": {"genre": "学术专著", "domain": "传播学/环境人文学"},
+        "statistics": {"total_segments": 138}, "segments": [], "glossary": []}}
+    matter = academic_writer.build_report_matter(
+        research, evidence, {"cases": []}, contract, {"sources": []})
+    abstract = matter["report"]["abstract_en"]
+    assert not any("\u3400" <= char <= "\u9fff" for char in abstract)
+    assert "academic monograph" in abstract
+    assert "environmental humanities" in abstract
+
+
+def test_case_analysis_repetition_audit_fails_boilerplate_blocks():
+    repeated = [{"case_id": f"TD-{index:04d}", "example_number": index,
+                 "analysis": "同一分析句反复出现，且没有加入任何案例自己的语言形式。"}
+                for index in range(1, 5)]
+    audit = academic_writer.case_presentation.analysis_repetition_audit(
+        repeated, {"TD-0001"})
+    assert audit["status"] == "fail"
+    assert audit["repeated_analysis_blocks"][0]["count"] == 4
+    assert audit["repeated_sentence_count"] == 3

@@ -33,6 +33,11 @@ from transpraxis import repair as _repair
 from transpraxis import translation_evidence as _translation_evidence
 from transpraxis import checkpoint as _checkpoint
 from transpraxis import snapshots as _snapshots
+from transpraxis import entity_registry as _entity_registry
+from transpraxis import model_roles as _model_roles
+from transpraxis import pdf_ingestion as _pdf_ingestion
+from transpraxis import translation_protocol as _translation_protocol
+from transpraxis import translation_target as _translation_target
 
 # ================= 常量 =================
 # 任务进度与过程文件的本地存储目录（已加入 .gitignore）
@@ -95,6 +100,11 @@ PROVIDERS = {
     "OpenAI": {
         "kind": "openai",
         "models": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
+        "capabilities": {
+            "supports_json_schema": True,
+            "supports_json_object": True,
+            "supports_response_format": True,
+        },
     },
     "Gemini": {
         "kind": "gemini",
@@ -216,64 +226,9 @@ def parse_json_array(text):
     return None
 
 
-def _translation_item_text(item):
-    """把模型返回数组项归一为译文文本：支持字符串或 {translation/target/...} 对象。"""
-    if isinstance(item, str):
-        return item
-    if isinstance(item, dict):
-        for key in ("translation", "target", "text", "译文", "翻译", "content"):
-            val = item.get(key)
-            if isinstance(val, str) and val.strip():
-                return val
-        for val in item.values():
-            if isinstance(val, str) and val.strip():
-                return val
-    return ""
-
-
 def parse_translation_array(res, expected):
-    """解析翻译响应，支持多种模型实际输出形态：
-    1. JSON 数组；2. JSON 对象 {"1": "..."}；3. 编号行（1. 译文 / 1、译文）；
-    4. 单段时接受任意非空文本。全部失败返回 None。
-    """
-    arr = parse_json_array(res)
-    if arr is not None and len(arr) == expected:
-        out = [_translation_item_text(item) for item in arr]
-        if all(t.strip() for t in out):
-            return out
-    if isinstance(res, str):
-        candidate = res.strip()
-        candidate = re.sub(r'^```(?:json)?\s*', '', candidate, flags=re.DOTALL)
-        candidate = re.sub(r'\s*```$', '', candidate, flags=re.DOTALL).strip()
-        try:
-            obj = json.loads(candidate)
-        except Exception:
-            obj = None
-        if isinstance(obj, dict):
-            out = []
-            for i in range(1, expected + 1):
-                v = obj.get(str(i))
-                if not isinstance(v, str) or not v.strip():
-                    return None
-                out.append(v.strip())
-            return out
-    if isinstance(res, str):
-        numbered = re.findall(r'^\s*(\d+)[.)、]\s*(.+?)\s*$', res, re.M)
-        if numbered:
-            numbered.sort(key=lambda x: int(x[0]))
-            texts = [t for _, t in numbered]
-            if len(texts) >= expected:
-                out = [t for t in texts[:expected] if t.strip()]
-                if len(out) == expected:
-                    return out
-    if expected == 1 and isinstance(res, str) and res.strip():
-        # 单段兜底：去掉编号前缀后按整段接受，交给确定性检查与审校把关
-        raw = res.strip()
-        if raw.startswith('[') or raw.startswith('{'):
-            return None  # 形似 JSON 的响应不允许当纯文本吞下
-        return [re.sub(r'^\s*\d+[.)、]\s*', '', raw).strip()]
-    return None
-
+    """Compatibility API backed by the canonical translation parser."""
+    return _translation_protocol.parse_translation_array(res, expected)
 
 def is_rate_limited(err):
     s = str(err)
@@ -301,92 +256,8 @@ _ABBREV_RE = re.compile(
 
 
 def extract_pdf_paragraphs(file_bytes):
-    """从 PDF 确定性重建段落列表。
-
-    规则：
-    - 行内文本按 span 拼接；行 -> 段落依据首行缩进（x0 明显大于正文 x0 即新段落）；
-    - 连字符换行修复（"word-" + 小写开头 -> 去连字符直接拼接）；
-    - 跨页/跨块延续：上一段未以终结符结尾且长度超过标题阈值 -> 合并；
-    - 小写开头的碎片段 -> 并入上一段（碎句兜底）；
-    - 剔除页眉页脚（跨 ≥20% 页重复出现的短行）与独立页码行。
-    无文本层（扫描件）时返回空列表，由调用方报错提示 OCR。
-    """
-    from collections import Counter
-
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    pages_blocks, line_freq, x0_freq = [], Counter(), Counter()
-    for page in doc:
-        page_dict = page.get_text("dict")
-        blocks, seen_norms = [], set()
-        for block in page_dict.get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            lines = []
-            for line in block.get("lines", []):
-                text = "".join(span.get("text", "") for span in line.get("spans", []))
-                if text.strip():
-                    lines.append((text, line["bbox"][0]))
-                    seen_norms.add(re.sub(r"\d+", "#", text.strip()))
-                    x0_freq[round(line["bbox"][0])] += 1
-            if lines:
-                blocks.append(lines)
-        pages_blocks.append(blocks)
-        for norm in seen_norms:
-            line_freq[norm] += 1
-    doc.close()
-
-    if not x0_freq:
-        return []
-
-    # 跨页高频重复的短行视为页眉/页脚样板文本
-    boilerplate = {t for t, n in line_freq.items()
-                   if n >= max(5, 0.2 * len(pages_blocks)) and len(t) < 80}
-    body_x0 = x0_freq.most_common(1)[0][0]  # 正文左缘 = 出现最多的 x0
-
-    paragraphs = []
-    for blocks in pages_blocks:
-        for lines in blocks:
-            lines = [(t, x) for t, x in lines
-                     if re.sub(r"\d+", "#", t.strip()) not in boilerplate
-                     and not re.fullmatch(r"\d{1,4}", t.strip())
-                     and not _ORNAMENT_RE.match(t.strip())]
-            if not lines:
-                continue
-            # 首行缩进 -> 新段落
-            groups, current = [], [lines[0][0]]
-            for text, x0 in lines[1:]:
-                if x0 >= body_x0 + 1.5:
-                    groups.append(current)
-                    current = [text]
-                else:
-                    current.append(text)
-            groups.append(current)
-            for group in groups:
-                text = group[0].strip()
-                for ln in group[1:]:
-                    ln = ln.strip()
-                    if text.endswith("-") and ln[:1].islower():
-                        text = text[:-1] + ln  # 连字符换行修复
-                    else:
-                        text = text + " " + ln
-                text = re.sub(r"\s+", " ", text).strip()
-                if not text:
-                    continue
-                # 跨页/跨块延续：上一段未完结（且不是标题级短行）-> 合并
-                if paragraphs and paragraphs[-1][-1] not in _SENTENCE_TERMINAL \
-                        and len(paragraphs[-1]) > 40:
-                    paragraphs[-1] = paragraphs[-1] + " " + text
-                else:
-                    paragraphs.append(text)
-
-    # 兜底：小写开头的碎句并入上一段
-    merged = []
-    for para in paragraphs:
-        if merged and para[:1].islower():
-            merged[-1] = merged[-1] + " " + para
-        else:
-            merged.append(para)
-    return [p for p in merged if not _ORNAMENT_RE.match(p)]
+    """Compatibility API backed by the layout-aware PDF ingestion module."""
+    return _pdf_ingestion.extract_pdf_paragraphs(file_bytes)
 
 
 def _ocr_pdf_text(file_bytes, max_pages=3):
@@ -462,7 +333,7 @@ def extract_document_paragraphs(filename, file_bytes):
 
 
 def call_llm(provider, api_key, model, system_prompt, user_prompt,
-             temperature=0.1, base_url=None):
+             temperature=0.1, base_url=None, response_format=None):
     """底层大模型统一路由（超时 150 秒，模型可配置）。
 
     支持官方接口与 OpenAI /chat/completions 兼容中转站：
@@ -485,11 +356,14 @@ def call_llm(provider, api_key, model, system_prompt, user_prompt,
                                   http_options=genai.types.HttpOptions(timeout=150_000))
         except (AttributeError, TypeError):
             client = genai.Client(api_key=api_key)
+        config_kwargs = {"temperature": temperature}
+        if response_format and cfg.get("capabilities", {}).get("supports_response_format"):
+            config_kwargs["response_mime_type"] = "application/json"
         res = client.models.generate_content(
             model=model,
             contents=user_prompt,
             system_instruction=system_prompt,
-            config=genai.types.GenerateContentConfig(temperature=temperature),
+            config=genai.types.GenerateContentConfig(**config_kwargs),
         )
         result = (res.text or "").strip()
         if runtime_job_id:
@@ -514,12 +388,16 @@ def call_llm(provider, api_key, model, system_prompt, user_prompt,
         kwargs["http_client"] = http_client
     try:
         client = OpenAI(**kwargs)
-        res = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system_prompt},
-                      {"role": "user", "content": user_prompt}],
-            temperature=temperature,
-        )
+        request = {
+            "model": model,
+            "messages": [{"role": "system", "content": system_prompt},
+                         {"role": "user", "content": user_prompt}],
+            "temperature": temperature,
+        }
+        if response_format and cfg.get("capabilities", {}).get(
+                "supports_response_format"):
+            request["response_format"] = response_format
+        res = client.chat.completions.create(**request)
         result = (res.choices[0].message.content or "").strip()
         if runtime_job_id:
             update_runtime_state(runtime_job_id, status="running", phase="running",
@@ -878,6 +756,9 @@ def check_translation_batch(sources, targets, glossary, target_lang,
     """确定性检查一批译文：空译、保留项丢失、源语残留、锁定术语合规（scope 感知）。"""
     findings = []
     for i, (src, tgt) in enumerate(zip(sources, targets)):
+        raw_src, raw_tgt = src, tgt
+        src = "" if src is None else str(src)
+        tgt = "" if tgt is None else str(tgt)
         if not tgt.strip():
             findings.append(_deterministic_finding(
                 i, "blocking", "completeness", "译文为空",
@@ -885,6 +766,17 @@ def check_translation_batch(sources, targets, glossary, target_lang,
                 "补译本段后，检查是否覆盖原文的全部句子、限制条件和专有名词。",
                 source_span=src, target_span=""))
             continue
+        target_report = _translation_target.validate_translation_target(
+            raw_src, raw_tgt, segment_index=i)
+        for issue in target_report["issues"]:
+            findings.append(_deterministic_finding(
+                i, "blocking", "format_integrity",
+                issue["message"],
+                "目标文本仍带有模型 transport 或解释包装，不能作为普通正文交付。",
+                "重新解析或重新翻译本段，只保留最终目标文本后再检查。",
+                source_span=src, target_span=tgt,
+                reason=issue["message"], kind="translation_target_invariant",
+                invariant_code=issue["code"]))
         # 完整性检查：拦截截断译文。
         # 实测根因：审校/修复环节的整段替换把长段译文换成了一句修正。
         if is_incomplete_translation(src, tgt):
@@ -953,6 +845,7 @@ def _globalize_batch_findings(findings, offset):
 # ================= 语义批次（对齐 localize-anything 的上下文批次）=================
 BATCH_SIZE = 4
 MAX_BATCH_CHARS = 1600
+TRANSLATION_MAX_BATCH_CHARS = 2400
 
 
 def make_batches(paragraphs, batch_size=BATCH_SIZE, max_chars=MAX_BATCH_CHARS,
@@ -1025,7 +918,8 @@ def tm_path():
 def _tm_eligible(source, target):
     """翻译记忆资格：源文必须有字母/数字（纯符号装饰行不入库），译文非空。"""
     return bool(re.search(r"[A-Za-z0-9\u4e00-\u9fff]", source or "")) \
-        and bool((target or "").strip())
+        and bool((target or "").strip()) \
+        and not _translation_target.is_translation_transport_wrapper(target)
 
 
 def load_tm():
@@ -1061,11 +955,40 @@ def _translator_system(glossary_text, style_rules, target_lang):
             f"引用标注（如 [12]）等保留原文；译文须与原文一一对应并保持顺序。\n"
             f"{glossary_text}\n"
             f"{style_rules}\n"
+            "翻译前请在内部检查：指代与照应关系、术语和专名、理论/非字面用法、"
+            "临时造词、长句逻辑关系与修辞功能；优先复用已提供的术语、实体和连续性选择，"
+            "人工锁定实体/术语优先于审校、TM 和生成式建议；生成式实体提示不得覆盖锁定术语。"
+            "避免明显的逐词直译和词典首义机械替换。\n"
+            "不要输出分析过程，只输出最终译文。\n"
             "请严格输出合法的 JSON 字符串数组，不要包含任何解释文字。")
 
 
+def _invoke_llm(call_fn, provider, api_key, model, system_prompt, user_prompt,
+                temperature, response_format=None):
+    """Call old and new provider/test doubles through one compatibility gate."""
+    kwargs = {"temperature": temperature}
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+    try:
+        return call_fn(provider, api_key, model, system_prompt, user_prompt, **kwargs)
+    except TypeError:
+        try:
+            return call_fn(provider, api_key, model, system_prompt, user_prompt,
+                           temperature=temperature)
+        except TypeError:
+            return call_fn(provider, api_key, model, system_prompt, user_prompt)
+
+
+def _native_translation_response_format(provider, model, expected):
+    capabilities = _model_roles.provider_capabilities(PROVIDERS, provider, model)
+    if capabilities.get("supports_json_schema") and capabilities.get(
+            "supports_response_format"):
+        return _translation_protocol.json_schema_for_translations(expected)
+    return None
+
+
 def translate_batch(segments, ctx_prev, ctx_next, glossary_text, style_rules, target_lang,
-                    provider, api_key, model, context_packet=None):
+                    provider, api_key, model, context_packet=None, call_llm_fn=None):
     """翻译一个语义批次，返回与 segments 等长的译文列表；失败抛出 RuntimeError。"""
     numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(segments))
     if context_packet is not None:
@@ -1081,31 +1004,29 @@ def translate_batch(segments, ctx_prev, ctx_next, glossary_text, style_rules, ta
         if ctx_next:
             context += "【后文上下文】：\n" + "\n".join(f"- {s}" for s in ctx_next) + "\n\n"
         user_prompt = f"{context}待翻译段落（按序号返回等长译文数组）：\n{numbered}"
-    last_err, last_res = None, None
+    call_fn = call_llm_fn or call_llm
+    response_format = _native_translation_response_format(
+        provider, model, len(segments))
+    last_err = None
     for _attempt in range(3):
         try:
-            res = call_llm(provider, api_key, model, sys_prompt, user_prompt, temperature=0.3)
-            last_res = res
-            arr = parse_translation_array(res, len(segments))
-            if arr is None:
-                raise ValueError(f"译文数量不匹配：期望 {len(segments)}，"
-                                 f"响应预览：{(res or '')[:160]!r}")
-            # 空项不直接判死：交给确定性检查与自动修复环节兜底
-            return [item.strip() if isinstance(item, str) else "" for item in arr]
+            res = _invoke_llm(
+                call_fn, provider, api_key, model, sys_prompt, user_prompt,
+                temperature=0.3, response_format=response_format)
+            return _translation_protocol.parse_translation_response(
+                res, len(segments))
         except Exception as e:
             last_err = e
             if is_rate_limited(e):
                 time.sleep(15)
-            else:
-                break
-    if len(segments) == 1 and last_res and str(last_res).strip():
-        # 单段兜底：接受模型原始输出，交由确定性检查/修复把关
-        return [re.sub(r'^\s*\d+[.)、]\s*', '', str(last_res)).strip()]
-    raise RuntimeError(f"批次翻译失败：{last_err or '模型返回格式异常或数量不匹配'}")
+    raise RuntimeError(
+        f"批次翻译失败（{len(segments)} 段）："
+        f"{last_err or '模型返回格式异常或数量不匹配'}"
+    )
 
 
 def repair_batch(sources, targets, findings, glossary_text, style_rules, target_lang,
-                 provider, api_key, model):
+                 provider, api_key, model, call_llm_fn=None):
     """根据确定性检查发现的问题自动修复一批译文；返回与 sources 等长的译文列表。"""
     numbered = "\n".join(
         f"{i + 1}. 原文：{s}\n   译文：{t}" for i, (s, t) in enumerate(zip(sources, targets)))
@@ -1114,18 +1035,20 @@ def repair_batch(sources, targets, findings, glossary_text, style_rules, target_
     sys_prompt = _translator_system(glossary_text, style_rules, target_lang)
     user_prompt = ("以下译文未通过检查，请仅修正有问题的段落，其余段落保持原样，"
                    f"返回与段落数相同的 JSON 字符串数组：\n\n{numbered}\n\n问题清单：\n{issues}")
+    call_fn = call_llm_fn or call_llm
+    response_format = _native_translation_response_format(
+        provider, model, len(sources))
     for _attempt in range(3):
         try:
-            res = call_llm(provider, api_key, model, sys_prompt, user_prompt, temperature=0.2)
-            arr = parse_json_array(res)
-            if arr is None or len(arr) != len(sources):
-                raise ValueError("修复结果数量不匹配")
-            return [clean_xml_chars(str(x)).strip() if isinstance(x, str) else "" for x in arr]
+            res = _invoke_llm(
+                call_fn, provider, api_key, model, sys_prompt, user_prompt,
+                temperature=0.2, response_format=response_format)
+            arr = _translation_protocol.parse_translation_response(
+                res, len(sources))
+            return [clean_xml_chars(item).strip() for item in arr]
         except Exception as e:
             if is_rate_limited(e):
                 time.sleep(15)
-            else:
-                break
     raise RuntimeError("自动修复失败：模型返回格式异常")
 
 
@@ -1464,7 +1387,8 @@ def annotate_stage(state, job_id, glossary, provider, api_key, model, target_lan
 
 def translate_stage(state, job_id, glossary, provider, api_key, model, target_lang,
                     style_rules, enable_review, use_tm=True, document_profile=None,
-                    on_status=None, on_caption=None):
+                    on_status=None, on_caption=None, translator_config=None,
+                    reviewer_config=None):
     """阶段二：语义批次翻译 + 确定性检查/修复 + 独立审校 + 翻译记忆。
 
     对齐 localize-anything 经验：
@@ -1484,6 +1408,14 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
         raise RuntimeError(
             "严格术语治理：仍有候选术语未审核（术语表尚未冻结），"
             "禁止开始翻译（请在术语审核面板冻结后继续）")
+    translator_config = _model_roles.normalize_role_config(
+        translator_config, fallback_provider=provider, fallback_model=model,
+        fallback_api_key=api_key)
+    reviewer_config = _model_roles.normalize_role_config(
+        reviewer_config, fallback_provider=provider, fallback_model=model,
+        fallback_api_key=api_key)
+    translator_call = _model_roles.make_role_call(call_llm, translator_config)
+    reviewer_call = _model_roles.make_role_call(call_llm, reviewer_config)
     tm = load_tm() if use_tm else {}
     if use_tm:
         recovered, pending_events = _checkpoint.reconcile_translation_memory(
@@ -1495,8 +1427,10 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
     paras = state["paras"]
     pairs = state["pairs"]
     batches = make_batches(
-        paras, semantic_units=state.get("semantic_units")
+        paras, max_chars=TRANSLATION_MAX_BATCH_CHARS,
+        semantic_units=state.get("semantic_units")
         or state.get("section_digests") or None)
+    registry = _entity_registry.EntityRegistry(state.get("entity_registry") or [])
 
     # 断点：从第一个未完成批次继续；若中间批次不完整则截断重译
     cum_end, start_batch = 0, 0
@@ -1574,9 +1508,12 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
         section_profile = _batch_section_profile(document_profile, offset, len(batch))
         selected, injected_ids = _select_glossary(
             texts, glossary + _knowledge.provisional_hints(
-                state.get("knowledge_candidates") or []),
+                state.get("knowledge_candidates") or [],
+                authoritative_entries=glossary),
             document_profile, section_profile)
         glossary_text = _glossary_block(selected)
+        entity_hints = registry.hints_for(
+            texts, glossary_entries=glossary, limit=12)
         context_packet = _context.compile_context_packet(
             document_profile=document_profile,
             document_synopsis=document_synopsis,
@@ -1587,6 +1524,7 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
             next_source=ctx_next,
             current_batch=texts,
             style_rules=style_rules,
+            entity_hints=entity_hints,
         )
         state.setdefault("context_packet_log", []).append({
             "batch": bi,
@@ -1599,26 +1537,53 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
             "entry_ids": injected_ids,
             "glossary_version": (state.get("glossary_frozen") or {}).get("version"),
             "glossary_hash": (state.get("glossary_frozen") or {}).get("glossary_hash"),
+            "entity_hint_count": len(entity_hints),
+            "document_synopsis_summary": (document_synopsis or {}).get("summary", ""),
+            "section_digest_summary": (section_digest or {}).get("summary", ""),
         })
 
         # 2) 未命中段落批次翻译
         if to_translate:
             try:
                 targets = translate_batch(texts, ctx_prev, ctx_next, glossary_text, style_rules,
-                                          target_lang, provider, api_key, model,
-                                          context_packet=context_packet)
-            except RuntimeError:
+                                          target_lang, translator_config["provider"],
+                                          translator_config["api_key"],
+                                          translator_config["model"],
+                                          context_packet=context_packet,
+                                          call_llm_fn=translator_call)
+            except RuntimeError as batch_error:
+                if "任务已请求取消" in str(batch_error):
+                    raise
+                failure = {
+                    "batch": bi, "offset": offset, "segment_count": len(texts),
+                    "reason": str(batch_error)[:500], "recovered": False,
+                }
+                state.setdefault("translation_failures", []).append(failure)
+                _checkpoint.append_event(job_dir(job_id), {
+                    "batch": bi, "offset": offset,
+                    "phase": "translation_protocol_failed",
+                    "reason": str(batch_error)[:240],
+                })
                 # 批次解析失败时降级为逐段翻译，保证进度不中断
                 if len(texts) == 1:
+                    save_job_state(job_id, state)
                     raise
                 if on_caption:
                     on_caption("⚠️ 批次翻译返回格式异常，降级为逐段翻译...")
                 targets = []
-                for t in texts:
-                    single_packet = dict(context_packet, current_batch=[t])
-                    targets.append(translate_batch(
-                        [t], ctx_prev, ctx_next, glossary_text, style_rules, target_lang,
-                        provider, api_key, model, context_packet=single_packet)[0])
+                try:
+                    for t in texts:
+                        single_packet = dict(context_packet, current_batch=[t])
+                        targets.append(translate_batch(
+                            [t], ctx_prev, ctx_next, glossary_text, style_rules, target_lang,
+                            translator_config["provider"], translator_config["api_key"],
+                            translator_config["model"], context_packet=single_packet,
+                            call_llm_fn=translator_call)[0])
+                except Exception as single_error:
+                    failure["reason"] = str(single_error)[:500]
+                    save_job_state(job_id, state)
+                    raise
+                failure["recovered"] = True
             for (i, src), tgt in zip(to_translate, targets):
                 cleaned_tgt = clean_xml_chars(tgt).replace('\n', ' ')
                 batch_pairs[i] = {"source": src, "target": cleaned_tgt,
@@ -1646,7 +1611,11 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                 on_caption(f"🔧 发现 {len(fixable)} 个确定性问题，正在自动修复...")
             try:
                 repaired = repair_batch(batch_sources, batch_targets, fixable, glossary_text,
-                                        style_rules, target_lang, provider, api_key, model)
+                                        style_rules, target_lang,
+                                        translator_config["provider"],
+                                        translator_config["api_key"],
+                                        translator_config["model"],
+                                        call_llm_fn=translator_call)
                 if repaired and len(repaired) == len(batch_pairs):
                     formal_targets = list(batch_targets)
                     shadow_targets = list(formal_targets)
@@ -1679,8 +1648,9 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                         blind_findings, blind_failed, blind_trace = \
                             _translation_evidence.review_translation_batch_with_evidence(
                                 batch_sources, shadow_targets, glossary_text, style_rules,
-                                target_lang, provider, api_key, model, shadow_index,
-                                call_llm=call_llm, blind=True,
+                                target_lang, reviewer_config["provider"],
+                                reviewer_config["api_key"], reviewer_config["model"],
+                                shadow_index, call_llm=reviewer_call, blind=True,
                                 segment_ids=list(range(offset, offset + len(batch_pairs))),
                                 review_identity={
                                     "input_hash": overlay["input_hash"],
@@ -1725,7 +1695,8 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
             rfindings, failed, review_trace = \
                 _translation_evidence.review_translation_batch_with_evidence(
                     batch_sources, batch_targets, glossary_text, style_rules, target_lang,
-                    provider, api_key, model, evidence_index, call_llm=call_llm,
+                    reviewer_config["provider"], reviewer_config["api_key"],
+                    reviewer_config["model"], evidence_index, call_llm=reviewer_call,
                     segment_ids=list(range(offset, offset + len(batch_pairs))))
             review_event_id = (
                 f"translation-review-{job_id}-{bi}-formal-"
@@ -1795,8 +1766,11 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                                 blind_findings, blind_failed, blind_trace = \
                                     _translation_evidence.review_translation_batch_with_evidence(
                                         [batch_sources[idx]], [suggested], glossary_text,
-                                        style_rules, target_lang, provider, api_key, model,
-                                        blind_index, call_llm=call_llm, blind=True,
+                                        style_rules, target_lang,
+                                        reviewer_config["provider"],
+                                        reviewer_config["api_key"],
+                                        reviewer_config["model"], blind_index,
+                                        call_llm=reviewer_call, blind=True,
                                         segment_ids=[segment_id], review_identity={
                                             "input_hash": overlay["input_hash"],
                                             "candidate_hash": overlay["candidate_hash"],
@@ -1864,6 +1838,22 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                 ]
                 if not segment_findings:
                     accepted_for_knowledge.append(j)
+        # Standard mode also records low-authority continuity observations.
+        accepted_for_knowledge = []
+        review_bad_segments = {
+            finding.get("segment_id")
+            for finding in (rfindings if enable_review and review_succeeded else [])
+            if finding.get("severity") in ("blocking", "actionable")
+        }
+        for j, pair in enumerate(batch_pairs):
+            local_findings = [
+                finding for finding in findings
+                if finding.get("segment_index") == j
+                and finding.get("severity") in ("blocking", "actionable")
+            ]
+            if (not pair.get("from_tm") and not local_findings
+                    and offset + j not in review_bad_segments):
+                accepted_for_knowledge.append(j)
         if accepted_for_knowledge:
             knowledge_segment_ids = [offset + j for j in accepted_for_knowledge]
             knowledge_candidates, knowledge_events, knowledge_warning = \
@@ -1873,7 +1863,10 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                     paras, pairs,
                     glossary, offset, provider, api_key, model,
                     existing_candidates=state.get("knowledge_candidates") or [],
-                    call_llm=call_llm, segment_ids=knowledge_segment_ids)
+                    call_llm=translator_call, segment_ids=knowledge_segment_ids,
+                    observation_provenance=(
+                        "reviewed" if review_succeeded else "generated_continuity"
+                    ))
         else:
             # Review failure or any finding leaves no trustworthy observation.
             knowledge_candidates, knowledge_events, knowledge_warning = \
@@ -1881,6 +1874,15 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
         for event in knowledge_events:
             event["batch"] = bi
             state.setdefault("knowledge_events", []).append(event)
+            if event.get("type") == "entity_observation":
+                registry.observe(
+                    event.get("source"), event.get("observed_target"),
+                    entity_type=_entity_registry.entity_type_from_kind(
+                        event.get("kind")),
+                    segment_id=event.get("segment_id"),
+                    provenance=event.get("provenance") or "generated_observation",
+                    confidence=0.7 if event.get("provenance") == "reviewed" else 0.35,
+                )
             if event.get("type") == "target_conflict":
                 segment_id = event.get("segment_id", offset)
                 findings_all.append({
@@ -1901,6 +1903,8 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
                     "preferred_target": event.get("preferred_target"),
                 })
         state["knowledge_candidates"] = knowledge_candidates
+        state["translation_continuity"] = list(knowledge_candidates)
+        state["entity_registry"] = registry.to_list()
         if knowledge_warning:
             state["knowledge_feedback_failures"] = \
                 state.get("knowledge_feedback_failures", 0) + 1
@@ -1970,6 +1974,17 @@ def translate_stage(state, job_id, glossary, provider, api_key, model, target_la
         key = (cf.get("type"), cf.get("entry_id"), cf.get("segment_index"), True)
         if key not in batch_conflict_keys:
             findings_all.append(cf)
+    state["entity_registry"] = registry.to_list()
+    existing_entity_conflicts = {
+        (item.get("type"), item.get("segment_index"), item.get("source"))
+        for item in findings_all
+    }
+    for conflict in registry.consistency_findings():
+        key = (conflict.get("type"), conflict.get("segment_index"),
+               conflict.get("source"))
+        if key not in existing_entity_conflicts:
+            findings_all.append(conflict)
+            existing_entity_conflicts.add(key)
 
     stats["blocking"] = sum(1 for f in findings_all if f["severity"] == "blocking")
     stats["actionable"] = sum(1 for f in findings_all if f["severity"] == "actionable")
@@ -2390,7 +2405,7 @@ def provider_config_path():
     return OUTPUT_DIR / "provider_config.json"
 
 
-def save_provider_config(provider, model, api_key, base_url=None):
+def save_provider_config(provider, model, api_key, base_url=None, reviewer=None):
     """把 AI 引擎配置落盘（本地单机工具，0600 权限），重启后自动加载。"""
     _ensure_output_dir()
     cfg = {
@@ -2399,6 +2414,13 @@ def save_provider_config(provider, model, api_key, base_url=None):
         "api_key": api_key or "",
         "base_url": base_url or "",
     }
+    if isinstance(reviewer, dict) and reviewer.get("provider") and reviewer.get("model"):
+        cfg["reviewer"] = {
+            "provider": reviewer.get("provider", ""),
+            "model": reviewer.get("model", ""),
+            "api_key": reviewer.get("api_key", ""),
+            "base_url": reviewer.get("base_url", ""),
+        }
     path = provider_config_path()
     path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
                     encoding="utf-8")
@@ -2418,12 +2440,21 @@ def load_provider_config():
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or not data.get("provider"):
             return None
-        return {
+        result = {
             "provider": str(data.get("provider", "")),
             "model": str(data.get("model", "") or ""),
             "api_key": str(data.get("api_key", "") or ""),
             "base_url": str(data.get("base_url", "") or ""),
         }
+        reviewer = data.get("reviewer")
+        if isinstance(reviewer, dict) and reviewer.get("provider"):
+            result["reviewer"] = {
+                "provider": str(reviewer.get("provider", "")),
+                "model": str(reviewer.get("model", "") or ""),
+                "api_key": str(reviewer.get("api_key", "") or ""),
+                "base_url": str(reviewer.get("base_url", "") or ""),
+            }
+        return result
     except Exception:  # noqa: BLE001 - 配置文件损坏时按未保存处理
         return None
 
@@ -3270,7 +3301,10 @@ def retry_job_step(job_id):
     state = load_job_state(job_id)
     if state and (runtime.get("stage") == "academic_writing" or
                   operation in scopes):
-        scope = scopes.get(operation, "writer")
+        error_message = str((runtime.get("error") or {}).get("message") or "")
+        scope = "case_analysis" if operation == "section_rewrite" and \
+            "missing case target subsection" in error_message else \
+            scopes.get(operation, "writer")
         invalidate_academic_report(job_id, scope, runtime.get("section_id"))
     update_runtime_state(
         job_id, status="idle_incomplete", phase="retry_ready", phase_label="等待重试",
@@ -3637,20 +3671,139 @@ def report_docx_bytes(job_id, state=None, frozen_assets=None):
         return None
     template = load_report_template(job_id)
     if template:
-        from transpraxis import report_template
+        from transpraxis import final_docx, report_template
         artifact = load_academic_artifact(job_id, "report")
         if not artifact:
             raise report_template.TemplateParseError(
                 "模板化报告缺少结构化 report artifact，请重新生成报告。")
-        if artifact.get("report_status") != "generated" or artifact.get(
+        if artifact.get("report_status") not in {
+                "generated", "review_required", "literature_required"} or artifact.get(
                 "template_compliance") not in {"pass", "pass_with_warnings"}:
             return None
-        return _bytes(report_template.render_report_docx(
+        rendered = _bytes(report_template.render_report_docx(
             artifact, template["bytes"], template["contract"]))
+        final_validation = final_docx.validate_final_docx(rendered, artifact)
+        (job_dir(job_id) / "final-docx-validation.json").write_text(
+            json.dumps(final_validation, ensure_ascii=False, indent=2), encoding="utf-8")
+        if final_validation.get("status") == "fail":
+            return None
+        return rendered
     if state.get("report_status") in {
             "incomplete", "failed_template_validation", "review_required"}:
         return None
     return _bytes(markdown_to_word(report, state.get("theory") or ""))
+
+
+def validate_translation_target(source, target, *, segment_index=None,
+                                allow_json=False):
+    """Public target invariant entry point used by runtime and delivery."""
+    return _translation_target.validate_translation_target(
+        source, target, segment_index=segment_index, allow_json=allow_json)
+
+
+def validate_translation_pairs(pairs, glossary=None, target_lang=""):
+    """Validate pairs independently of the model response parser."""
+    pairs = list(pairs or [])
+    target_report = _translation_target.validate_translation_pairs(pairs)
+    qa_findings = check_translation_batch(
+        [str(pair.get("source") or "") for pair in pairs if isinstance(pair, dict)],
+        [str(pair.get("target") or "") for pair in pairs if isinstance(pair, dict)],
+        glossary or [], target_lang or "简体中文")
+    return {
+        **target_report,
+        "qa_findings": qa_findings,
+        "blocking_findings": [
+            finding for finding in qa_findings
+            if finding.get("severity") == "blocking"
+        ],
+    }
+
+
+def validate_delivery_translation_state(state):
+    """Run the final, state-level translation gate before any delivery asset."""
+    state = state if isinstance(state, dict) else {}
+    pairs = state.get("pairs") or []
+    report = validate_translation_pairs(
+        pairs, state.get("glossary") or [], state.get("target_lang") or "简体中文")
+    issues = list(report.get("issues") or [])
+    if state.get("p2_done") and len(pairs) != len(state.get("paras") or []):
+        issues.append({
+            "code": "pair_count_mismatch",
+            "message": "双语 pairs 数量与源文段落数量不一致，不能生成完整交付物",
+            "severity": "blocking",
+        })
+    entity_findings = _entity_registry.EntityRegistry(
+        state.get("entity_registry") or []
+    ).consistency_findings()
+    return {
+        **report,
+        "issues": issues,
+        "entity_findings": entity_findings,
+        "blocking": bool(issues or report.get("blocking_findings")),
+        "status": "fail" if issues or report.get("blocking_findings") else (
+            "review_required" if entity_findings else "pass"),
+    }
+
+
+def _record_delivery_validation_findings(state, report):
+    """Persist only new invariant/entity findings for the review queue."""
+    state["delivery_validation"] = {
+        "status": report.get("status"),
+        "blocking": bool(report.get("blocking")),
+        "checked_pairs": report.get("checked_pairs", 0),
+        "issues": list(report.get("issues") or []),
+        "entity_conflicts": [
+            {
+                "source": item.get("source"),
+                "preferred_target": item.get("preferred_target"),
+                "observed_targets": item.get("observed_targets"),
+            }
+            for item in report.get("entity_findings") or []
+        ],
+    }
+    existing = {
+        (item.get("type"), item.get("segment_index"), item.get("invariant_code"),
+         item.get("reason"))
+        for item in state.setdefault("findings", [])
+        if isinstance(item, dict)
+    }
+    findings = _translation_target.target_invariant_findings(report)
+    for item in report.get("entity_findings") or []:
+        findings.append({
+            **item,
+            "segment_index": item.get("segment_index"),
+            "segment_id": item.get("segment_id"),
+            "summary": item.get("reason"),
+            "explanation": item.get("reason"),
+            "recommendation": "核对全文同一实体的译名，并在人工作区确认一个一致形式。",
+            "confidence": None,
+            "diagnostic_version": 1,
+        })
+    for finding in findings:
+        key = (finding.get("type"), finding.get("segment_index"),
+               finding.get("invariant_code"), finding.get("reason"))
+        if key not in existing:
+            state["findings"].append(finding)
+            existing.add(key)
+    stats = state.setdefault("review_stats", {})
+    stats["blocking"] = sum(
+        1 for item in state["findings"]
+        if item.get("severity") == "blocking" and not item.get("resolved")
+    )
+    stats["actionable"] = sum(
+        1 for item in state["findings"]
+        if item.get("severity") == "actionable" and not item.get("resolved")
+    )
+    stats["informational"] = sum(
+        1 for item in state["findings"]
+        if item.get("severity") == "informational" and not item.get("resolved")
+    )
+    state["has_blocking"] = stats["blocking"] > 0
+    if report.get("blocking") and state.get("delivery_status") in ("approved", "final"):
+        # A state-level mutation (for example a manually injected target) must
+        # invalidate the mutable approval even when no snapshot exists yet.
+        _invalidate_final_delivery_state(state)
+    return state
 
 
 def _academic_workspace_archive(job_id):
@@ -3674,6 +3827,19 @@ def _delivery_asset_bundle(job_id, state, target_lang, provider, model):
     """Build the configured delivery set used by both preview and snapshots."""
     from transpraxis import assets as _assets
     from transpraxis import report_evidence as _report_evidence
+
+    validation = validate_delivery_translation_state(state)
+    _record_delivery_validation_findings(state, validation)
+    if validation["blocking"]:
+        save_job_state(job_id, state)
+        reasons = "；".join(
+            issue.get("message", "目标文本未通过交付检查")
+            for issue in validation.get("issues") or []
+        )
+        raise RuntimeError(
+            "交付被 Translation Target Invariant 阻止"
+            + (f"：{reasons}" if reasons else "")
+        )
 
     source = load_source(job_id)
     snapshot_state = dict(state)
@@ -3733,7 +3899,9 @@ def _delivery_asset_bundle(job_id, state, target_lang, provider, model):
         generated_assets = sorted([*bundle, "delivery_manifest.json"])
         manifest = _assets.build_delivery_manifest(
             snapshot_state, job_id, target_lang, provider, model,
-            generated_assets=generated_assets, source_filename=filename)
+            generated_assets=generated_assets, source_filename=filename,
+            translator_config=state.get("translator_config"),
+            reviewer_config=state.get("reviewer_config"))
         bundle["delivery_manifest.json"] = (
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         return bundle
@@ -3761,7 +3929,9 @@ def _delivery_asset_bundle(job_id, state, target_lang, provider, model):
             bundle["review_report.md"] = findings_report_md(state).encode("utf-8")
     manifest = _assets.build_delivery_manifest(
         snapshot_state, job_id, target_lang, provider, model,
-        generated_assets=sorted(bundle), source_filename=filename)
+        generated_assets=sorted(bundle), source_filename=filename,
+        translator_config=state.get("translator_config"),
+        reviewer_config=state.get("reviewer_config"))
     bundle["delivery_manifest.json"] = (
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     return bundle
@@ -3776,6 +3946,11 @@ def build_delivery_assets(job_id, state=None, target_lang="", provider="", model
 
 
 def create_delivery_snapshot(job_id, state, target_lang="", provider="", model=""):
+    validation = validate_delivery_translation_state(state)
+    _record_delivery_validation_findings(state, validation)
+    if validation["blocking"]:
+        save_job_state(job_id, state)
+        raise RuntimeError("最终交付未通过 Translation Target Invariant")
     source = load_source(job_id)
     frozen = state.get("glossary_frozen") or {}
     source_hash = hashlib.sha256(source).hexdigest() if source else \
@@ -3954,6 +4129,7 @@ def _apply_glossary_staleness(state):
 
     state["knowledge_candidates"] = _knowledge.discard_candidates_for_segments(
         state.get("knowledge_candidates") or [], stale)
+    state["translation_continuity"] = list(state["knowledge_candidates"])
 
     fg = state.get("glossary_frozen") or {}
     for i in stale:
@@ -4052,6 +4228,10 @@ def review_knowledge_candidate(job_id, candidate_id, decision, actor="user"):
             "task_only": "accepted_task",
             "rejected": "rejected",
         }[decision]
+        state["translation_continuity"] = [
+            dict(item) for item in state.get("knowledge_candidates") or []
+            if isinstance(item, dict)
+        ]
         state.setdefault("knowledge_events", []).append({
             "type": "human_candidate_decision",
             "candidate_id": context["candidate_id"],
@@ -4213,6 +4393,30 @@ def save_document_profile(job_id, profile):
     return state
 
 
+def set_entity_translation(job_id, source_form, target, *, entity_type="other_proper_noun",
+                           locked=True, actor="user", note=""):
+    """Persist a human entity choice; it outranks generated continuity hints."""
+    state = load_job_state(job_id)
+    if state is None:
+        return None
+    registry = _entity_registry.EntityRegistry(state.get("entity_registry") or [])
+    record = (registry.lock if locked else registry.accept)(
+        source_form, target, entity_type=entity_type, note=note)
+    state["entity_registry"] = registry.to_list()
+    state.setdefault("human_actions", []).append({
+        "finding_id": f"entity:{record.get('id') or source_form}",
+        "action": "entity_locked" if locked else "entity_accepted",
+        "note": note or f"人工确认实体译名：{source_form} -> {target}",
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "actor": actor,
+    })
+    if (state.get("delivery_status") in ("approved", "final")
+            or state.get("delivery_approved_by_human")):
+        _invalidate_final_delivery_state(state)
+    save_job_state(job_id, state)
+    return state
+
+
 def write_profile_artifacts(job_id, document_profile, style_profile):
     """把 Step 01 的画像产物落盘为版本化 artifact：
     document_profile.json / style_profile.json（含 style_profile_id 哈希）。
@@ -4271,6 +4475,13 @@ def approve_delivery(job_id, note="", accept_blocking=False, actor="user",
     state = load_job_state(job_id)
     if state is None:
         return None, False, ["任务不存在"]
+    validation = validate_delivery_translation_state(state)
+    if validation["blocking"]:
+        _record_delivery_validation_findings(state, validation)
+        save_job_state(job_id, state)
+        reasons = [issue.get("message", "译文未通过交付检查")
+                   for issue in validation.get("issues") or []]
+        return state, False, reasons or ["译文未通过最终交付检查"]
     state, ok, errors = _delivery.approve_delivery(state, note, actor, accept_blocking)
     if not ok:
         save_job_state(job_id, state)
@@ -4418,7 +4629,9 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
                      strict_terminology_governance=False, mode=None,
                      research_settings=None, literature_sources=None,
                      delivery_config=None,
-                     enable_understanding=None,
+                     enable_understanding=None, reviewer_provider=None,
+                     reviewer_api_key=None, reviewer_model=None,
+                     reviewer_base_url=None, translator_base_url=None,
                      on_status=None, on_caption=None):
     """执行单个文档的完整流程；每个里程碑实时落盘，刷新/重启后均可继续。
 
@@ -4431,8 +4644,22 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
     state = load_job_state(job_id) or base
     state = {**base, **state}  # 兼容旧版本状态缺字段
     state = _state_migration.migrate_state(state)
+    saved_understanding = (state.get("pipeline_config") or {}).get(
+        "enable_understanding")
     if mode is not None:
         strict_terminology_governance = mode == "quality"
+    translator_config = _model_roles.normalize_role_config(
+        None, fallback_provider=provider, fallback_model=model,
+        fallback_api_key=api_key, fallback_base_url=translator_base_url)
+    reviewer_config = _model_roles.normalize_role_config(
+        {
+            "provider": reviewer_provider,
+            "model": reviewer_model,
+            "api_key": reviewer_api_key,
+            "base_url": reviewer_base_url,
+        },
+        fallback_provider=provider, fallback_model=model,
+        fallback_api_key=api_key)
     pipeline_config = {
         "target_lang": target_lang,
         "auto_term": bool(auto_term),
@@ -4443,6 +4670,9 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
         "enable_annotate": bool(enable_annotate),
         "use_tm": bool(use_tm),
         "strict_terminology_governance": bool(strict_terminology_governance),
+        "enable_understanding": enable_understanding,
+        "translator": _model_roles.public_role_config(translator_config),
+        "reviewer": _model_roles.public_role_config(reviewer_config),
     }
     state["pipeline_config"] = pipeline_config
     state.update(
@@ -4451,6 +4681,8 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
         style_rules=style_rules, enable_review=bool(enable_review),
         enable_annotate=bool(enable_annotate), use_tm=bool(use_tm),
         provider=provider, model=model,
+        translator_config=_model_roles.public_role_config(translator_config),
+        reviewer_config=_model_roles.public_role_config(reviewer_config),
     )
     if delivery_config is not None:
         state["delivery_config"] = normalize_delivery_config(
@@ -4461,9 +4693,21 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
             state["delivery_config"], enable_report=enable_report,
             enable_annotate=enable_annotate)
     if enable_understanding is None:
-        # Quality mode pays the one-time semantic understanding cost; quick
-        # mode still receives rolling target context without extra LLM calls.
-        enable_understanding = bool(strict_terminology_governance)
+        if isinstance(saved_understanding, bool):
+            # A resumed task keeps the decision it was created with.  This is
+            # important for old Quick jobs whose legacy state has no new flag.
+            enable_understanding = saved_understanding
+        elif state.get("p1_done") or state.get("p2_done"):
+            # Legacy in-progress jobs had no understanding pass outside strict
+            # terminology governance; do not unexpectedly add API cost on resume.
+            enable_understanding = bool(
+                state.get("profile_done") or state.get("understanding_done")
+                or state.get("quality_mode"))
+        else:
+            # New tasks: Quick skips it; Standard and Academic keep it enabled.
+            enable_understanding = mode != "quick"
+    pipeline_config["enable_understanding"] = bool(enable_understanding)
+    state["pipeline_config"] = pipeline_config
     state["quality_mode"] = bool(strict_terminology_governance)
     warnings = state.setdefault("warnings", [])
 
@@ -4516,8 +4760,8 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
         save_source(job_id, file_bytes)  # 留存源文件，刷新后无需重新上传
         save_job_state(job_id, state)
 
-    # ---------------- 阶段 1.2：文档画像（严格术语治理；失败仅警告，不阻断） ----------------
-    if strict_terminology_governance and not state.get("profile_done"):
+    # ---------------- 阶段 1.2：文档画像（长文理解；失败仅警告，不阻断） ----------------
+    if enable_understanding and not state.get("profile_done"):
         if on_status:
             on_status("【阶段1.2】文档画像（分布式采样 + 结构化校验）...")
         from transpraxis.document_profile import profile_document
@@ -4649,6 +4893,8 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
         translate_stage(state, job_id, glossary, provider, api_key, model, target_lang,
                         style_rules, enable_review, use_tm=use_tm,
                         document_profile=state.get("document_profile"),
+                        translator_config=translator_config,
+                        reviewer_config=reviewer_config,
                         on_status=on_status, on_caption=on_caption)
         state["p2_done"] = True
         state["delivery_status"] = "review_required" if state.get("has_blocking") \
@@ -4672,6 +4918,10 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
                                         research_settings=research_settings,
                                         literature_sources=literature_sources)
         if not report_md.strip():
+            if state.get("report_status") == "blocked_final_case_policy":
+                state["stage"] = _state_migration.derive_stage(state)
+                save_job_state(job_id, state)
+                return state
             raise RuntimeError("报告内容为空，请点击“继续处理”重试")
         state["p3_md"] = report_md
         state["theory"] = translation_theory

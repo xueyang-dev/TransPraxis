@@ -10,7 +10,7 @@ import json
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import models, terminology
+from . import models, terminology, translation_target
 
 
 def _parse_array(text: Any) -> Optional[List[Any]]:
@@ -202,6 +202,7 @@ def _make_candidate(
     paragraphs: Sequence[str],
     pairs: Sequence[Dict[str, Any]],
     segment_id: int,
+    provenance: str = "generated_continuity",
 ) -> Dict[str, Any]:
     source = observation["source_expression"]
     occurrences = terminology.find_occurrences(source, list(paragraphs))
@@ -215,8 +216,10 @@ def _make_candidate(
         "observed_segments": [segment_id],
         "status": "emergent_candidate",
         "origin": "translation_observation",
+        "provenance": provenance,
+        "scope": "document",
         "kind": observation.get("kind") or "term",
-        "confidence": 0.5,
+        "confidence": 0.35 if provenance == "generated_continuity" else 0.7,
     }
 
 
@@ -233,25 +236,65 @@ def observe_batch(
     existing_candidates: Optional[Sequence[Dict[str, Any]]] = None,
     call_llm: Optional[Callable] = None,
     segment_ids: Optional[Sequence[int]] = None,
+    observation_provenance: str = "generated_continuity",
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
     """Return updated candidate queue, auditable events, and a non-fatal warning."""
     segment_ids = list(segment_ids) if segment_ids is not None \
         else [batch_offset + index for index in range(len(sources))]
+    if len(segment_ids) != len(sources) or len(targets) != len(sources):
+        existing = [dict(item) for item in (existing_candidates or [])
+                    if isinstance(item, dict)]
+        return existing, [], "知识反馈 source、target、segment_ids 长度不一致"
+    valid = []
+    invalid_count = 0
+    for source, target, segment_id in zip(sources, targets, segment_ids):
+        if translation_target.validate_translation_target(
+                source, target, segment_index=segment_id)["ok"]:
+            valid.append((source, target, segment_id))
+        else:
+            invalid_count += 1
+    if not valid:
+        existing = [dict(item) for item in (existing_candidates or [])
+                    if isinstance(item, dict)]
+        warning = "知识反馈跳过：批次没有通过 Translation Target Invariant 的译文"
+        return existing, [], warning
+    valid_sources = [item[0] for item in valid]
+    valid_targets = [item[1] for item in valid]
+    valid_segment_ids = [item[2] for item in valid]
     observations, warning = extract_observations(
-        sources, targets, provider, api_key, model, call_llm=call_llm,
-        segment_ids=segment_ids)
+        valid_sources, valid_targets, provider, api_key, model, call_llm=call_llm,
+        segment_ids=valid_segment_ids)
+    if invalid_count:
+        invalid_warning = f"知识反馈跳过 {invalid_count} 个不合格译文段"
+        warning = f"{warning}；{invalid_warning}" if warning else invalid_warning
     candidates = [dict(item) for item in (existing_candidates or [])
                   if isinstance(item, dict)]
     by_source = {_candidate_key(item): item for item in candidates if _candidate_key(item)}
     events: List[Dict[str, Any]] = []
     all_pairs = list(pairs_before_batch)
-    for segment_id, source, target in zip(segment_ids, sources, targets):
+    for segment_id, source, target in zip(valid_segment_ids, valid_sources, valid_targets):
         while len(all_pairs) <= segment_id:
             all_pairs.append({})
         all_pairs[segment_id] = {"source": source, "target": target}
     for observation in observations:
         source = observation["source_expression"]
         segment_id = observation["segment_id"]
+        kind = str(observation.get("kind") or "term").strip().lower()
+        if kind in {
+            "name", "person", "place", "organization", "artwork", "book",
+            "article", "film", "project", "named_concept", "named_object",
+        }:
+            events.append({
+                "type": "entity_observation",
+                "source": source,
+                "observed_target": observation["observed_target"],
+                "kind": kind,
+                "segment_id": segment_id,
+                "provenance": observation_provenance,
+                "scope": "document",
+                "confidence": 0.7 if observation_provenance == "reviewed" else 0.35,
+            })
+            continue
         existing = _existing_entry(source, glossary)
         first, first_target = _first_alignment(source, paragraphs, all_pairs)
         candidate_target = observation["observed_target"] or first_target
@@ -277,7 +320,8 @@ def observe_batch(
                 })
             continue
         candidate = _make_candidate(
-            observation, paragraphs, all_pairs, segment_id)
+            observation, paragraphs, all_pairs, segment_id,
+            provenance=observation_provenance)
         key = _candidate_key(candidate)
         old = by_source.get(key)
         if old is not None:
@@ -287,6 +331,11 @@ def observe_batch(
                                                 {segment_id})
             if not old.get("observed_target"):
                 old["observed_target"] = candidate["observed_target"]
+            if observation_provenance != old.get("provenance") \
+                    and observation_provenance == "reviewed":
+                old["observed_target"] = candidate["observed_target"]
+                old["provenance"] = observation_provenance
+                old["confidence"] = max(old.get("confidence") or 0, 0.7)
             candidate = old
         else:
             candidates.append(candidate)
@@ -299,6 +348,9 @@ def observe_batch(
             "occurrences": list(candidate["occurrences"]),
             "segment_id": segment_id,
             "origin": "translation_observation",
+            "provenance": candidate.get("provenance") or observation_provenance,
+            "scope": candidate.get("scope") or "document",
+            "confidence": candidate.get("confidence", 0.35),
         })
     return candidates, events, warning
 
@@ -306,15 +358,28 @@ def observe_batch(
 def provisional_hints(
     candidates: Sequence[Dict[str, Any]],
     limit: int = 12,
+    authoritative_entries: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Expose observations as non-governing suggestions for later batches."""
     hints = []
     for candidate in list(candidates or [])[-max(0, limit):]:
-        if candidate.get("decision") in {"project_term", "rejected"}:
+        if candidate.get("decision") in {"project_term", "rejected"} \
+                or candidate.get("kind") in {
+                    "name", "person", "place", "organization", "artwork",
+                    "book", "article", "film", "project", "named_concept",
+                    "named_object",
+                }:
             continue
         source = str(candidate.get("source") or "").strip()
         target = str(candidate.get("observed_target") or "").strip()
         if not source or not target:
+            continue
+        if any(
+            isinstance(entry, dict)
+            and entry.get("status") == "locked"
+            and str(entry.get("source") or "").casefold() == source.casefold()
+            for entry in authoritative_entries or []
+        ):
             continue
         entry = models.normalize_glossary_entry({
             "source": source,
@@ -329,6 +394,8 @@ def provisional_hints(
         if entry is not None:
             entry["origin"] = "translation_observation"
             entry["observed_target"] = target
+            entry["provenance"] = candidate.get("provenance") or "generated_continuity"
+            entry["confidence"] = candidate.get("confidence", 0.35)
             hints.append(entry)
     return hints
 

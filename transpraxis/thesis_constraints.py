@@ -4,7 +4,38 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping
 
 
-SCHEMA_VERSION = "transpraxis-report-constraints-v2"
+SCHEMA_VERSION = "transpraxis-report-constraints-v4"
+
+CASE_POLICIES = {
+    "proposal": {
+        "minimum_cases": 6,
+        "recommended_cases": 8,
+        "target_cases": 8,
+        "candidate_pool_target": 10,
+    },
+    "final_report": {
+        "minimum_cases": 20,
+        "recommended_cases": 24,
+        "target_cases": 24,
+        "candidate_pool_target": 26,
+        "final_case_types": ["authentic_revision", "synthetic_contrast"],
+        "contrast_required": True,
+        "translation_decision_role": "candidate_evidence_only",
+        "translation_decision_final_allowed": False,
+        "research_question_minimum_contrasts": 2,
+        "synthetic_gate_count": 4,
+    },
+}
+
+
+def report_stage(settings: Mapping[str, Any] | None = None) -> str:
+    value = str((settings or {}).get("report_stage") or "final_report").strip()
+    return value if value in CASE_POLICIES else "final_report"
+
+
+def case_policy(settings: Mapping[str, Any] | None = None) -> Dict[str, Any]:
+    stage = report_stage(settings)
+    return {"report_stage": stage, **CASE_POLICIES[stage]}
 
 
 def _sections(settings: Mapping[str, Any], raw=None) -> list[Dict[str, Any]]:
@@ -106,9 +137,12 @@ def build_constraints(settings: Mapping[str, Any] | None = None) -> Dict[str, An
     language = str(settings.get("body_language") or "").strip()
     identity = (contract or {}).get("template_identity") or {}
     structure = (contract or {}).get("document_structure") or {}
+    policy = case_policy(settings)
     return {
         "schema_version": SCHEMA_VERSION,
         "report_type": "translation_practice_report",
+        "report_stage": policy["report_stage"],
+        "case_policy": policy,
         "template": {
             "configured": bool(contract),
             "status": "parsed" if contract else "template_not_configured",
@@ -162,3 +196,29 @@ def build_constraints(settings: Mapping[str, Any] | None = None) -> Dict[str, An
 def chapter_index(constraints: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
     return {str(x["section_id"]): dict(x)
             for x in constraints.get("chapters") or []}
+
+
+def case_subsection_roots(chapter: Mapping[str, Any]) -> tuple[str, str]:
+    """Return the difficulty/strategy roots for one case-analysis chapter."""
+    required = list(chapter.get("required_subsections") or [])
+
+    def find(side: str, hints: tuple[str, ...]) -> str:
+        def first(candidates: list[str]) -> str:
+            return min((value for value in candidates if value),
+                       key=lambda value: (value.count("."), len(value)), default="")
+
+        mapped = first([
+            str(item.get("heading_id") or "") for item in required
+            if item.get("mapping_side") == side])
+        if mapped:
+            return mapped
+        return first([
+            str(item.get("heading_id") or "") for item in required
+            if any(hint in str(item.get("title") or "").casefold() for hint in hints)
+        ])
+
+    section_id = str(chapter.get("section_id") or "3")
+    problem = find("problem", ("难点", "翻译问题", "difficult", "translation problem",
+                               "challenge"))
+    solution = find("solution", ("策略", "解决", "strategy", "solution"))
+    return problem or f"{section_id}.2", solution or f"{section_id}.3"

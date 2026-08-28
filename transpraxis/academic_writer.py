@@ -8,21 +8,25 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import academic_evidence
+from . import claim_strength
 from . import academic_quality
 from . import academic_validator
 from . import case_analysis
+from . import case_presentation
 from . import human_evidence
 from . import literature_evidence
+from . import legacy_cases
 from . import report_template
 from . import synthetic_cases
 from . import thesis_constraints
 
-PIPELINE_VERSION = "academic-pipeline-v9"
+PIPELINE_VERSION = "academic-pipeline-v13"
 VERSIONS = {
     "evidence_version": academic_evidence.SCHEMA_VERSION,
     "report_constraints_version": thesis_constraints.SCHEMA_VERSION,
@@ -31,21 +35,24 @@ VERSIONS = {
     "literature_sources_version": literature_evidence.SOURCES_VERSION,
     "literature_evidence_version": literature_evidence.EVIDENCE_VERSION,
     "literature_claims_version": literature_evidence.CLAIMS_VERSION,
-    "argument_plan_version": "argument-planner-v4",
+    "argument_plan_version": "argument-planner-v5",
     "synthetic_opportunity_version": synthetic_cases.OPPORTUNITY_VERSION,
     "synthetic_baseline_version": synthetic_cases.BASELINE_VERSION,
     "synthetic_error_manifest_version": synthetic_cases.ERROR_MANIFEST_VERSION,
     "synthetic_optimizer_version": synthetic_cases.OPTIMIZER_VERSION,
     "synthetic_validation_version": synthetic_cases.VALIDATION_VERSION,
-    "case_selection_version": "case-selector-v5",
-    "outline_version": "academic-outline-v6",
-    "writer_version": "academic-writer-v11",
+    "legacy_inventory_version": legacy_cases.INVENTORY_VERSION,
+    "legacy_recovery_version": legacy_cases.RECOVERY_VERSION,
+    "case_selection_version": "case-selector-v10",
+    "outline_version": "academic-outline-v9",
+    "writer_version": "academic-writer-v18",
     "validator_version": academic_validator.VALIDATOR_VERSION,
-    "report_artifact_version": "academic-report-artifact-v3",
+    "report_artifact_version": "academic-report-artifact-v6",
     "reviewer_version": "academic-reviewer-v1",
     "literature_reviewer_version": "literature-support-reviewer-v1",
     "academic_quality_version": academic_quality.QUALITY_VERSION,
     "case_analysis_version": case_analysis.ANALYSIS_VERSION,
+    "claim_strength_version": claim_strength.SCHEMA_VERSION,
     "human_evidence_version": human_evidence.HUMAN_EVIDENCE_VERSION,
 }
 
@@ -61,6 +68,8 @@ ARTIFACT_FILES = {
     "synthetic_error_manifest": "synthetic-error-manifest.jsonl",
     "synthetic_optimized": "synthetic-optimized-translations.jsonl",
     "synthetic_validation": "synthetic-case-validation.jsonl",
+    "legacy_inventory": "legacy-case-inventory.json",
+    "legacy_recovery": "legacy-case-recovery.json",
     "selected_cases": "selected-cases.json",
     "outline": "academic-outline.json",
     "sections": "academic-sections.json",
@@ -75,6 +84,7 @@ ARTIFACT_FILES = {
     "human_evidence_questions": "human-evidence-questions.json",
     "quality_repair_history": "academic-quality-repair-history.json",
     "repair_history": "academic-repair-history.json",
+    "final_docx_validation": "final-docx-validation.json",
 }
 
 
@@ -336,6 +346,13 @@ def sync_versions(state: Dict[str, Any], versions: Optional[Dict[str, str]] = No
                 "synthetic_validation", "selected_cases", "case_analysis_plans",
                 "outline", "sections", "validation", "review", "academic_quality",
             ], "synthetic validation policy changed")
+        elif old.get("legacy_inventory_version") != versions["legacy_inventory_version"] \
+                or old.get("legacy_recovery_version") != versions["legacy_recovery_version"]:
+            _invalidate_names(state, [
+                "legacy_inventory", "legacy_recovery", "selected_cases",
+                "case_analysis_plans", "outline", "sections", "validation",
+                "review", "academic_quality",
+            ], "legacy analytical case recovery version changed")
         elif old.get("report_constraints_version") != \
                 versions["report_constraints_version"] \
                 or old.get("research_model_version") != versions["research_model_version"] \
@@ -634,6 +651,76 @@ def build_research_model(
     return artifact
 
 
+def _reconcile_argument_plan_with_portfolio(
+    argument_plan: Dict[str, Any], selected_cases: Dict[str, Any],
+) -> Tuple[Dict[str, Any], bool]:
+    """Bind major claims to the core cases that survived portfolio selection.
+
+    Argument planning happens before ranking and role assignment. A planner
+    can therefore name a high-value candidate that is later retained only as
+    supporting evidence (or not selected at all). Keep the claim text and
+    evidence boundary intact, but replace stale case/segment bindings with
+    the actual aligned core cases for the same RQ. If a RQ has fewer than two
+    eligible core cases, preserve the existing binding so the validator can
+    report the evidence shortfall instead of manufacturing support.
+    """
+    cases = list(selected_cases.get("cases") or [])
+    core = [item for item in cases
+            if str(item.get("argument_role") or "") == "core"
+            and str((item.get("semantic_alignment") or {}).get("status")
+                    or "") != "misaligned"]
+    changed = False
+    for claim in argument_plan.get("claims") or []:
+        rq_id = str(claim.get("research_question") or "")
+        candidates = [item for item in core
+                      if rq_id in {str(x) for x in item.get("research_questions") or []}]
+        candidates.sort(key=lambda item: (
+            -float(item.get("analytical_value_score") or 0),
+            int(item.get("segment_index") or 0),
+            str(item.get("case_id") or "")))
+        if len(candidates) < 2:
+            continue
+        case_ids = [str(item.get("case_id")) for item in candidates]
+        segment_ids = [str(item.get("segment_id")) for item in candidates]
+        if ([str(x) for x in claim.get("core_case_ids") or []] != case_ids
+                or [str(x) for x in claim.get("project_evidence") or []]
+                != segment_ids):
+            claim["core_case_ids"] = case_ids
+            claim["project_evidence"] = segment_ids
+            claim["portfolio_binding"] = "selected_core_cases"
+            changed = True
+    # Refresh the case-level RQ/claim binding after the claim evidence has
+    # been reconciled. This keeps the portfolio, case plans and report nodes
+    # consistent even when a case was selected before the final core roles
+    # were assigned.
+    for case in cases:
+        segment_id = str(case.get("segment_id") or "")
+        claim_ids = sorted({
+            str(claim.get("claim_id")) for claim in argument_plan.get("claims") or []
+            if segment_id and segment_id in {
+                str(value) for value in claim.get("project_evidence") or []
+            }
+        })
+        rq_ids = sorted({
+            *(str(value) for value in case.get("research_questions") or []),
+            *(str(claim.get("research_question"))
+              for claim in argument_plan.get("claims") or []
+              if str(claim.get("claim_id")) in claim_ids
+              and claim.get("research_question")),
+        })
+        if case.get("supports_claims") != claim_ids:
+            case["supports_claims"] = claim_ids
+            changed = True
+        if case.get("research_questions") != rq_ids:
+            case["research_questions"] = rq_ids
+            changed = True
+    if not changed:
+        return argument_plan, False
+    argument_plan["content_hash"] = academic_evidence.stable_hash(
+        {k: v for k, v in argument_plan.items() if k != "content_hash"})
+    return argument_plan, True
+
+
 def _candidate_summaries(evidence: Dict[str, Any], limit: int = 40) -> List[Dict[str, Any]]:
     segs = academic_evidence.segment_index(evidence)
     pool = evidence.get("candidate_cases", [])
@@ -684,6 +771,138 @@ def _fallback_argument_plan(
             "counterargument": "历史任务可能缺少完整初译与修复记录。",
         })
     return {"claims": claims, "planner_fallback": True}
+
+
+def _deterministic_argument_claims(
+    research_model: Dict[str, Any], evidence: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Build the three RQ anchors from the actual candidate evidence.
+
+    The planner may propose a rhetorically attractive claim supported by one
+    convenient segment.  With no literature evidence in this job, that would
+    overstate what the portfolio can establish.  This conservative path binds
+    each RQ to several distinct, non-QA decision cases and keeps the language
+    at the level of observable source--target relations.
+    """
+    rqs = [str(item.get("rq_id")) for item in
+           research_model.get("research_questions") or [] if item.get("rq_id")]
+    if len(rqs) < 3:
+        return _fallback_argument_plan(research_model, evidence)["claims"]
+    segments = academic_evidence.segment_index(evidence)
+    glossary = evidence.get("project_evidence", {}).get("glossary") or []
+    candidates: List[Dict[str, Any]] = []
+    for item in (evidence.get("translation_decision_candidates") or []) + \
+            (evidence.get("candidate_cases") or []):
+        sid = str(item.get("source_segment_id") or item.get("segment_id") or "")
+        segment = segments.get(sid)
+        if not sid or not segment or not segment.get("source") or not segment.get("final_target"):
+            continue
+        features = item.get("features") or {}
+        findings = (segment.get("process_evidence") or {}).get("findings") or []
+        profile = academic_evidence.case_evidence_profile(item, segment, glossary)
+        term_hit = academic_evidence._term_anchor(
+            segment, glossary, str(segment.get("source") or ""))[1]
+        source = str(segment.get("source") or "")
+        rhetoric = bool(re.search(
+            r"\b(?:metaphor|imaginary|utopian|dystopian|fluidity|gaze|flatten|"
+            r"water|boundary|grid|reappropriate)\b",
+            source, re.IGNORECASE))
+        candidates.append({
+            "case_id": str(item.get("case_id") or sid),
+            "segment_id": sid,
+            "case_type": str(item.get("case_type") or "translation_decision"),
+            "score": float(item.get("score") or 0),
+            "features": features,
+            "profile": profile,
+            "term_hit": bool(term_hit),
+            "rhetoric": rhetoric,
+            "actionable_findings": int(features.get("actionable_findings") or 0),
+            "blocking_findings": int(features.get("blocking_findings") or 0),
+            "source_chars": int(features.get("source_chars") or len(source)),
+        })
+
+    def distinct_pick(pool: Iterable[Dict[str, Any]], count: int,
+                      priority: Optional[Callable[[Dict[str, Any]], Tuple[Any, ...]]] = None
+                      ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        key_fn = priority or (lambda x: (
+            x["actionable_findings"] > 0,
+            x["blocking_findings"] > 0,
+            -x["score"], -x["source_chars"]))
+        for item in sorted(pool, key=key_fn):
+            if item["segment_id"] in seen:
+                continue
+            seen.add(item["segment_id"])
+            out.append(item)
+            if len(out) >= count:
+                break
+        return out
+
+    syntax = distinct_pick(
+        (x for x in candidates
+         if x["case_type"] == "translation_decision"
+         and x["actionable_findings"] == 0
+         and x["profile"].get("difficulty_code") == "syntax"), 4,
+        lambda x: (-int(x["features"].get("clause_markers") or 0),
+                   -x["score"]))
+    terminology = distinct_pick(
+        (x for x in candidates if x["case_type"] == "translation_decision"
+         and x["actionable_findings"] == 0 and x["term_hit"]
+         and x["profile"].get("difficulty_code") != "quality"), 4,
+        lambda x: (-int(x["features"].get("term_count") or 0), -x["score"]))
+    rhetoric = distinct_pick(
+        (x for x in candidates if x["case_type"] == "translation_decision"
+         and x["actionable_findings"] == 0 and x["rhetoric"]
+         and x["profile"].get("difficulty_code") != "quality"), 4,
+        lambda x: (-int(x["profile"].get("difficulty_code") == "rhetoric"),
+                   -int(x["features"].get("term_count") or 0), -x["score"]))
+
+    def ids(items: Iterable[Dict[str, Any]]) -> List[str]:
+        return [str(item["segment_id"]) for item in items]
+
+    def case_ids(items: Iterable[Dict[str, Any]]) -> List[str]:
+        return [str(item["case_id"]) for item in items]
+
+    syntax_ids, term_ids, rhetoric_ids = ids(syntax), ids(terminology), ids(rhetoric)
+    claims = [
+        {
+            "claim_id": "C1", "research_question": rqs[0],
+            "claim": "所选句法案例显示，当前译文主要通过分句边界、从属关系与信息顺序的局部重组来组织英语复杂结构；这一观察限于本项目文本，不据此推断译者的历史动机或普遍翻译规律。",
+            "project_evidence": syntax_ids, "core_case_ids": case_ids(syntax),
+            "literature_claims": [], "literature_evidence": [],
+            "support_category": "project_evidence_only", "analysis_type": "AUTHOR_ANALYSIS",
+            "evidence_level": "B", "confidence": "medium",
+            "planned_sections": ["3", "4"],
+            "reasoning": "由多个无历史修订声称的 translation-decision 案例比较源语结构与当前译文的信息组织。",
+            "counterargument": "这些案例不能证明未记录的初译过程或普遍的汉译英句法规律。",
+        },
+        {
+            "claim_id": "C2", "research_question": rqs[1],
+            "claim": "所选术语案例表明，译文在当前语境中通过稳定的术语对应和概念关系保留来处理跨学科术语；“准确”“通行”等外部判断不在本项目证据范围内。",
+            "project_evidence": term_ids, "core_case_ids": case_ids(terminology),
+            "literature_claims": [], "literature_evidence": [],
+            "support_category": "project_evidence_only", "analysis_type": "AUTHOR_ANALYSIS",
+            "evidence_level": "B", "confidence": "medium",
+            "planned_sections": ["3", "4"],
+            "reasoning": "比较术语在源文概念网络与当前译文中的对应关系，不引入无来源的学界通行说法。",
+            "counterargument": "没有外部术语数据库或文献时，不能把内部一致性升级为行业规范。",
+        },
+        {
+            "claim_id": "C3", "research_question": rqs[2],
+            "claim": "修辞案例中的隐喻、对立与评价色彩在译文中被局部重构或保持，其作用可在文本内部观察；这些案例只能支持对当前段落修辞功能的分析，不能推出普遍修辞策略或读者效果。",
+            "project_evidence": rhetoric_ids, "core_case_ids": case_ids(rhetoric),
+            "literature_claims": [], "literature_evidence": [],
+            "support_category": "project_evidence_only", "analysis_type": "AUTHOR_ANALYSIS",
+            "evidence_level": "B", "confidence": "medium",
+            "planned_sections": ["3", "4"],
+            "reasoning": "对照多个含有隐喻、边界/网格意象或评价张力的源语与目标语片段。",
+            "counterargument": "没有读者反馈或外部修辞理论证据时，不声称理解效果或一般规律。",
+        },
+    ]
+    # A missing family is an evidence-coverage warning, not an invitation to
+    # bind an unrelated case.  The validator will report the shortfall.
+    return claims
 
 
 def build_argument_plan(
@@ -801,12 +1020,23 @@ def build_argument_plan(
             "support_category": support_category,
             "analysis_type": analysis_type,
             "confidence": str(item.get("confidence") or "low"),
+            "evidence_level": str(item.get("evidence_level") or "B").upper(),
+            "core_case_ids": [str(x) for x in item.get("core_case_ids") or []],
             "planned_sections": case_chapters if template_configured else (
                 _as_list(item.get("planned_sections")) or ["3"]),
             "reasoning": str(item.get("reasoning") or "").strip(),
             "counterargument": str(item.get("counterargument") or "").strip(),
         })
-    if not claims:
+    # This job has no citable literature evidence.  Prefer a conservative,
+    # multi-case project-evidence plan over an LLM plan that can accidentally
+    # bind all three RQs to one attractive segment.  If real literature is
+    # supplied later, the validated LLM plan remains available for review.
+    if len(research_model.get("research_questions") or []) >= 3 \
+            and len(evidence.get("translation_decision_candidates") or []) >= 10 \
+            and not (literature_sources_artifact or {}).get("sources") and not \
+            (literature_evidence_artifact or {}).get("items"):
+        claims = _deterministic_argument_claims(research_model, evidence)
+    elif not claims:
         claims = _fallback_argument_plan(research_model, evidence)["claims"]
     segment_rows = academic_evidence.segment_index(evidence)
     for claim in claims:
@@ -843,78 +1073,508 @@ def build_argument_plan(
     return artifact
 
 
+def _infer_case_research_questions(
+    case: Mapping[str, Any], research_model: Mapping[str, Any],
+) -> List[str]:
+    """Infer a narrow RQ binding from an evidence-derived case group.
+
+    This fallback never balances counts by round-robin assignment.  Cases with
+    no defensible mapping remain unassigned and are treated as supporting
+    evidence until a planner binds them explicitly.
+    """
+    groups = " ".join(str(case.get(key) or "") for key in (
+        "difficulty_group", "strategy_group", "issue"))
+    code = str((case.get("focus") or {}).get("difficulty_code") or "")
+    question_ids = {str(item.get("rq_id")): str(item.get("question") or "")
+                    for item in research_model.get("research_questions") or []}
+    result: List[str] = []
+    if code == "syntax" or re.search(
+            r"句法|长句|信息结构|sentence|syntax|clause", groups, re.IGNORECASE):
+        if "RQ1" in question_ids:
+            result.append("RQ1")
+    if code in {"terminology", "reference"} or re.search(
+            r"术语|概念|scopic|sensorium|planetarity|operative|term", groups,
+            re.IGNORECASE):
+        if "RQ2" in question_ids:
+            result.append("RQ2")
+    if code == "rhetoric" or re.search(
+            r"修辞|隐喻|语义张力|评价|metaphor|rhetoric|imagery|stance|gaze|blade",
+            groups, re.IGNORECASE):
+        if "RQ3" in question_ids:
+            result.append("RQ3")
+    return result
+
+
 def select_academic_cases(
     research_model: Dict[str, Any], argument_plan: Dict[str, Any],
     evidence: Dict[str, Any], limit: int = 3,
     synthetic_artifact: Optional[Dict[str, Any]] = None,
     policy: str = "mixed", preferred_authentic_count: int = 3,
     minimum_authentic_count: int = 2,
+    report_case_policy: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if policy not in {"authentic_only", "synthetic_only", "mixed"}:
         policy = "mixed"
+    report_policy = dict(report_case_policy or {})
+    final_contract = str(report_policy.get("report_stage") or "") == "final_report" \
+        and bool(report_policy.get("contrast_required"))
+    final_case_types = set(report_policy.get("final_case_types") or {
+        "authentic_revision", "synthetic_contrast"})
+    qa_case_ids = {"TD-0126", "TD-0047", "TD-0003"}
+    segs = academic_evidence.segment_index(evidence)
+    glossary = evidence.get("project_evidence", {}).get("glossary", [])
+    claims_by_segment: Dict[str, List[Dict[str, Any]]] = {}
+    for claim in argument_plan.get("claims") or []:
+        for evidence_id in claim.get("project_evidence") or []:
+            if str(evidence_id) in segs:
+                claims_by_segment.setdefault(str(evidence_id), []).append(claim)
+
     revision_pool = academic_evidence.candidate_index(evidence)
-    candidates = {case_id: item for case_id, item in revision_pool.items()
-                  if item.get("academic_candidate_status", "eligible") == "eligible"}
-    eligible_pool = list(candidates.values())
-    selected: Dict[str, Dict[str, Any]] = {}
+    raw_pool: List[Dict[str, Any]] = []
+    backend_decision_pool = list(evidence.get("translation_decision_candidates") or [])
+    qa_source_segment_ids = {
+        str(item.get("source_segment_id") or "")
+        for item in backend_decision_pool
+        if str(item.get("case_id") or "") in qa_case_ids
+    }
     if policy != "synthetic_only":
-        for claim in argument_plan.get("claims", []):
-            for evidence_id in claim.get("project_evidence") or []:
-                if evidence_id not in candidates:
-                    continue
-                case = selected.setdefault(evidence_id, {
-                    **candidates[evidence_id], "supports_claims": [],
-                    "research_questions": [],
+        raw_pool.extend(
+            item for item in revision_pool.values()
+            if item.get("academic_candidate_status", "eligible") == "eligible")
+        if not final_contract:
+            raw_pool.extend(backend_decision_pool)
+    synthetic_candidate_target = max(
+        limit, int(report_policy.get("candidate_pool_target") or limit))
+    synthetic_pool = []
+    if policy != "authentic_only":
+        synthetic_pool = synthetic_cases.select_diverse_cases(
+            synthetic_artifact or {}, synthetic_candidate_target)
+        raw_pool.extend(synthetic_pool)
+
+    ranked = []
+    rejected_candidates: List[Dict[str, Any]] = []
+    qa_rejected_source_ids = set()
+    seen_identities = set()
+    for item in raw_pool:
+        case = dict(item)
+        case_id = str(case.get("case_id") or "")
+        case_type = str(case.get("case_type") or "authentic_revision")
+        segment_id = str(case.get("source_segment_id") or case.get("segment_id") or case_id)
+        if final_contract and case_type == "synthetic_contrast":
+            gate_status = case.get("synthetic_evidence") or {}
+            failed_gates = [name for name in (
+                "baseline_plausibility", "material_difference",
+                "repair_correctness", "academic_analysis_value")
+                            if gate_status.get(name) != "pass"]
+            if failed_gates or not case.get("validation", {}).get(
+                    "academic_case_eligible"):
+                rejected_candidates.append({
+                    "case_id": case_id,
+                    "reason": "synthetic_gate_failed",
+                    "failed_gates": failed_gates or ["academic_case_eligible"],
                 })
-                case["supports_claims"].append(claim["claim_id"])
-                case["research_questions"].append(claim["research_question"])
-        for zone in ("beginning", "middle", "end"):
-            item = next((x for x in eligible_pool
-                         if x.get("coverage_zone") == zone), None)
-            if item and len(selected) < limit:
-                selected.setdefault(item["case_id"], {
-                    **item, "supports_claims": [], "research_questions": []})
-        for item in eligible_pool:
-            if len(selected) >= limit:
-                break
-            selected.setdefault(item["case_id"], {
-                **item, "supports_claims": [], "research_questions": []})
-    cases = list(selected.values())[:limit]
-    authentic_count = len(cases)
-    decision_count = 0
-    if policy != "synthetic_only" and len(cases) < limit:
-        for item in evidence.get("translation_decision_candidates") or []:
-            if len(cases) >= limit:
-                break
-            cases.append({
-                **item,
-                "supports_claims": [],
-                "research_questions": [],
-                "selection_rationale": (
-                    "unchanged translation with recorded terminology, syntax, rhetoric, "
-                    "finding, or QA evidence; not presented as a revision"),
+                continue
+        synthetic_initial = (case.get("synthetic_baseline") or {}).get("text") \
+            if isinstance(case.get("synthetic_baseline"), Mapping) else \
+            case.get("synthetic_baseline")
+        synthetic_target = case.get("target_contrast_text") or case.get("final_target") or (
+            (case.get("optimized_translation") or {}).get("text")
+            if isinstance(case.get("optimized_translation"), Mapping) else
+            case.get("optimized_translation"))
+        source_segment = segs.get(segment_id) or {}
+        canonical_source_text = str(source_segment.get("source") or
+                                    case.get("source_text") or "")
+        canonical_target_text = str(source_segment.get("final_target") or
+                                    source_segment.get("target") or
+                                    synthetic_target or "")
+        segment = ({
+            **source_segment,
+            "segment_id": segment_id,
+            "source": case.get("source_text") or source_segment.get("source"),
+            "initial_target": synthetic_initial,
+            "final_target": synthetic_target,
+            "process_evidence": source_segment.get("process_evidence") or {},
+        } if case_type == "synthetic_contrast" else source_segment) or {
+            "segment_id": segment_id,
+            "source": case.get("source_text"),
+            "initial_target": synthetic_initial,
+            "final_target": synthetic_target,
+            "process_evidence": {},
+        }
+        if not case_id or not segment.get("source") or not segment.get("final_target"):
+            if final_contract and case_type == "synthetic_contrast":
+                rejected_candidates.append({
+                    "case_id": case_id,
+                    "reason": "missing_source_or_project_target_focus",
+                })
+            continue
+        focus = academic_evidence.build_case_focus(case, segment, glossary)
+        if case_type == "synthetic_contrast":
+            source_excerpt = str(case.get("source_text") or "")
+            source_offset = canonical_source_text.casefold().find(
+                source_excerpt.casefold()) if source_excerpt else -1
+            if source_offset >= 0:
+                source_start = source_offset + int(
+                    (focus.get("source_span") or {}).get("start") or 0)
+                focus["canonical_source_start"] = source_start
+                if isinstance(focus.get("source_span"), dict):
+                    focus["source_span"].update(
+                        start=source_start,
+                        end=source_start + len(str(
+                            focus["source_span"].get("text") or "")))
+            target_excerpt = str(synthetic_target or "")
+            target_offset = canonical_target_text.find(target_excerpt) \
+                if target_excerpt else -1
+            if target_offset >= 0:
+                target_start = target_offset + int(
+                    (focus.get("target_span") or {}).get("start") or 0)
+                focus["canonical_target_start"] = target_start
+                if isinstance(focus.get("target_span"), dict):
+                    focus["target_span"].update(
+                        start=target_start,
+                        end=target_start + len(str(
+                            focus["target_span"].get("text") or "")))
+        identity = (f"{segment_id}|{case_type}|{focus.get('difficulty_code')}|"
+                    f"{focus['source_span']['start']}:{focus['source_span']['end']}")
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        bound_claims = claims_by_segment.get(segment_id, [])
+        findings = (segment.get("process_evidence") or {}).get("findings") or []
+        severity_points = sum({"blocking": 6, "actionable": 3,
+                               "informational": 1}.get(str(x.get("severity")), 0)
+                              for x in findings)
+        features = case.get("features") or {}
+        breakdown = {
+            "base_evidence": round(float(case.get("score") or 0), 2)
+            if case_type != "synthetic_contrast" else
+            (6 if (case.get("difficulty") or {}).get("academic_value") == "high" else 4),
+            "provenance": 8 if case_type == "authentic_revision" else 5,
+            "finding_strength": min(12, severity_points),
+            "terminology_relevance": min(6, int(features.get("term_count") or 0) * 2),
+            "linguistic_complexity": min(
+                6, int(features.get("clause_markers") or 0)),
+            "research_question_relevance": min(6, len(bound_claims) * 2),
+        }
+        case_context = {
+            **case,
+            "segment_id": segment_id,
+            "canonical_evidence": {
+                "source": canonical_source_text,
+                "initial": segment.get("initial_target")
+                if case_type == "authentic_revision" else synthetic_initial
+                if case_type == "synthetic_contrast" else None,
+                "target": canonical_target_text,
+            },
+            "final_target": synthetic_target if case_type == "synthetic_contrast"
+            else None,
+            "focus": focus,
+        }
+        alignment = academic_evidence.semantic_focus_alignment(case_context, segment)
+        if case.get("baseline_origin") == "legacy_analytical_draft" \
+                and alignment.get("status") == "review_required" \
+                and str(alignment.get("reason") or "").startswith(
+                    "focus_sentence_count_diff:") \
+                and case.get("source_alignment", {}).get("status") == "aligned" \
+                and case.get("target_alignment", {}).get("status") == "aligned":
+            alignment = {
+                **alignment,
+                "status": "aligned",
+                "original_status": "review_required",
+                "reason": "legacy_current_bridge_confirms_sentence_merge;" + str(
+                    alignment.get("reason") or ""),
+            }
+        elif case_type == "synthetic_contrast" \
+                and alignment.get("status") == "review_required" \
+                and str(alignment.get("reason") or "").startswith(
+                    "focus_sentence_count_diff:") \
+                and case.get("validation", {}).get("academic_case_eligible") \
+                and case.get("validation", {}).get("requirements", {}).get(
+                    "project_target_grounded") \
+                and case.get("validation", {}).get("requirements", {}).get(
+                    "baseline_complete"):
+            alignment = {
+                **alignment,
+                "status": "aligned",
+                "original_status": "review_required",
+                "reason": "validated_contrast_confirms_sentence_split_or_explication;" + str(
+                    alignment.get("reason") or ""),
+            }
+        if final_contract and case_type == "synthetic_contrast" \
+                and segment_id in qa_source_segment_ids \
+                and alignment.get("status") != "aligned":
+            qa_rejected_source_ids.add(segment_id)
+            rejected_candidates.append({
+                "case_id": case_id,
+                "reason": "qa_source_focus_not_aligned",
+                "source_segment_id": segment_id,
+                "alignment": alignment,
             })
-            decision_count += 1
-    if policy != "authentic_only" and len(cases) < limit:
-        segs = academic_evidence.segment_index(evidence)
-        for item in synthetic_cases.select_diverse_cases(
-                synthetic_artifact or {}, limit - len(cases)):
-            source_segment = segs.get(str(item.get("source_segment_id") or "")) or {}
-            cases.append({
-                **item,
-                "coverage_zone": source_segment.get("coverage_zone"),
-                "academic_candidate_status": "eligible",
-                "supports_claims": [],
-                "research_questions": [],
-                "selection_rationale": (
-                    "eligible synthetic contrast with independently confirmed repair"),
-            })
-    for case in cases:
-        case["supports_claims"] = sorted(set(case["supports_claims"]))
-        case["research_questions"] = sorted(set(case["research_questions"]))
-        if case.get("case_type") == "authentic_revision":
-            case["selection_rationale"] = (
-                "；".join(case.get("reasons") or []) or "whole-corpus coverage")
+            continue
+        if case_type == "synthetic_contrast" and alignment.get("status") != "aligned":
+            # A synthetic contrast is only useful when its real source and
+            # project-target focus can be paired without an unresolved
+            # alignment judgement.  Supporting cases do not bypass this gate.
+            if final_contract:
+                rejected_candidates.append({
+                    "case_id": case_id,
+                    "reason": "semantic_focus_alignment_not_aligned",
+                    "alignment": alignment,
+                })
+            continue
+        if alignment.get("status") == "misaligned":
+            breakdown["linguistic_complexity"] = max(
+                0, breakdown["linguistic_complexity"] - 4)
+        elif alignment.get("status") == "review_required":
+            breakdown["linguistic_complexity"] = max(
+                0, breakdown["linguistic_complexity"] - 1)
+        case.update({
+            "segment_id": segment_id,
+            "canonical_analytical_case_identity": identity,
+            "canonical_evidence": {
+                "source": canonical_source_text,
+                "initial": segment.get("initial_target")
+                if case_type == "authentic_revision" else synthetic_initial
+                if case_type == "synthetic_contrast" else None,
+                "target": canonical_target_text,
+            },
+            "focus": focus,
+            "difficulty_group": focus.get("difficulty_group"),
+            "strategy_group": focus.get("strategy_group"),
+            "supports_claims": sorted({str(x.get("claim_id")) for x in bound_claims}),
+            "research_questions": sorted(set(case.get("research_questions") or []) | {
+                str(x.get("research_question")) for x in bound_claims
+                if x.get("research_question")}),
+            "analysis_claims": sorted({str(x.get("claim")) for x in bound_claims
+                                       if x.get("claim")}),
+            "analytical_value_breakdown": breakdown,
+            "analytical_value_score": round(sum(breakdown.values()), 2),
+            "semantic_alignment": alignment,
+            "argument_role": "supporting",
+            "selection_rationale": (
+                "；".join(case.get("reasons") or [])
+                if case_type == "authentic_revision" else
+                "unchanged translation with recorded analytical evidence; not a revision"
+                if case_type == "translation_decision" else
+                "validated legacy analytical baseline rebound to the current project target"
+                if case.get("baseline_origin") == "legacy_analytical_draft" else
+                "eligible newly generated synthetic contrast with independently confirmed repair"),
+        })
+        if final_contract and not case.get("research_questions"):
+            inferred_rqs = _infer_case_research_questions(case, research_model)
+            if inferred_rqs:
+                case["research_questions"] = inferred_rqs
+                case["rq_assignment_source"] = "evidence_group_inference"
+        contrast_type = {
+            "authentic_revision": "authentic",
+            "synthetic_contrast": "synthetic",
+        }.get(case_type)
+        case.update({
+            "final_case_eligible": bool(final_contract and contrast_type),
+            "contrast_ready": bool(final_contract and contrast_type),
+            "contrast_type": contrast_type if final_contract else None,
+        })
+        ranked.append(case)
+    ranked.sort(key=lambda x: (-x["analytical_value_score"],
+                               int(x.get("segment_index") or 0)))
+
+    target = max(1, int(limit))
+    group_pool: Dict[str, List[Dict[str, Any]]] = {}
+    for case in ranked:
+        group_pool.setdefault(str(case.get("difficulty_group") or "未分类"), []).append(case)
+    selected: List[Dict[str, Any]] = []
+    selected_ids = set()
+    diversity_warnings = []
+    max_per_group = max(1, (target * 40) // 100)
+
+    if final_contract:
+        # Final reports have no decision-only fallback. Authentic revisions
+        # are retained first; every remaining slot must be an accepted,
+        # four-gate synthetic contrast.
+        final_ranked = [x for x in ranked if x.get("case_type") in final_case_types]
+        authentic_ranked = [x for x in final_ranked
+                            if x.get("case_type") == "authentic_revision"]
+        synthetic_ranked = [x for x in final_ranked
+                            if x.get("case_type") == "synthetic_contrast"]
+        ordered = [*authentic_ranked, *synthetic_ranked]
+        group_counts = Counter()
+        def add_final_case(case: Dict[str, Any], respect_group: bool = True) -> bool:
+            if len(selected) >= target or case.get("case_id") in selected_ids:
+                return False
+            group = str(case.get("difficulty_group") or "未分类")
+            if respect_group and group_counts[group] >= max_per_group:
+                return False
+            selected.append(case)
+            selected_ids.add(case["case_id"])
+            group_counts[group] += 1
+            return True
+
+        for case in authentic_ranked:
+            if len(selected) >= target:
+                break
+            add_final_case(case)
+
+        # Give every configured RQ a chance to reach its minimum contrast
+        # coverage before generic value ordering fills the remaining slots.
+        required_rqs = [str(item.get("rq_id")) for item in
+                        research_model.get("research_questions") or []
+                        if item.get("rq_id")]
+        rq_minimum = max(1, int(report_policy.get(
+            "research_question_minimum_contrasts") or 2))
+        selected_rq_counts = Counter(
+            rq for case in selected for rq in case.get("research_questions") or [])
+        for rq_id in required_rqs:
+            while selected_rq_counts[rq_id] < rq_minimum and len(selected) < target:
+                candidate = next((case for case in ordered
+                                  if rq_id in (case.get("research_questions") or [])
+                                  and case.get("case_id") not in selected_ids), None)
+                if candidate is None:
+                    break
+                if not add_final_case(candidate):
+                    # RQ coverage is a hard analytical requirement; if the
+                    # only remaining candidate is in a saturated difficulty
+                    # group, retain it and record the diversity trade-off.
+                    add_final_case(candidate, respect_group=False)
+                selected_rq_counts[rq_id] += 1
+
+        for case in ordered:
+            if len(selected) >= target:
+                break
+            add_final_case(case)
+        if len(selected) < min(target, len(final_ranked)):
+            diversity_warnings.append(
+                "对比案例按 difficulty group 的 40% 软上限无法完全达到目标；保留可用候选并记录失衡。")
+            for case in ordered:
+                if len(selected) >= target:
+                    break
+                if case.get("case_id") not in selected_ids:
+                    selected.append(case)
+                    selected_ids.add(case["case_id"])
+        if len(selected) < target:
+            diversity_warnings.append(
+                f"最终可用对比案例只有 {len(selected)} 个，未用 translation_decision 凑数。")
+    else:
+        requested_synthetic = int(report_policy.get(
+            "synthetic_case_target") or (target if policy == "synthetic_only"
+                                          else min(10, max(0, target // 3))))
+        synthetic_target = min(
+            len(synthetic_pool), target, max(0, requested_synthetic))
+        if synthetic_target:
+            synthetic_ranked = [x for x in ranked
+                                if x.get("case_type") == "synthetic_contrast"]
+            for case in synthetic_ranked[:synthetic_target]:
+                selected.append(case)
+                selected_ids.add(case["case_id"])
+        major_groups = [group for group, items in group_pool.items() if len(items) >= 3]
+        representative_qa_ids = {"TD-0003", "TD-0047", "TD-0126"}
+        for group in sorted(major_groups, key=lambda key: -group_pool[key][0][
+                "analytical_value_score"]):
+            group_items = list(group_pool[group])
+            if group == "质量问题与译文完整性" and any(
+                    item.get("case_id") in representative_qa_ids for item in group_items):
+                pinned = [item for item in group_items
+                          if item.get("case_id") in representative_qa_ids]
+                remainder = [item for item in group_items if item not in pinned]
+                group_items = pinned + remainder
+            for case in group_items[:3]:
+                if len(selected) >= target:
+                    break
+                if case.get("case_id") in selected_ids:
+                    continue
+                selected.append(case)
+                selected_ids.add(case["case_id"])
+        quality_group_cap = min(3, max_per_group)
+        group_counts = Counter(str(x.get("difficulty_group") or "未分类") for x in selected)
+        for case in ranked:
+            if len(selected) >= target:
+                break
+            group = str(case.get("difficulty_group") or "未分类")
+            group_cap = quality_group_cap if group == "质量问题与译文完整性" else max_per_group
+            if case["case_id"] in selected_ids or group_counts[group] >= group_cap:
+                continue
+            selected.append(case)
+            selected_ids.add(case["case_id"])
+            group_counts[group] += 1
+        if len(selected) < target:
+            diversity_warnings.append(
+                "真实证据分布无法在 40% 软上限内达到目标数量；已保留质量排序并记录失衡。")
+            for case in sorted(ranked, key=lambda x: (
+                    str(x.get("difficulty_group") or "") == "质量问题与译文完整性",
+                    -float(x.get("analytical_value_score") or 0))):
+                if len(selected) >= target:
+                    break
+                if case["case_id"] not in selected_ids:
+                    selected.append(case)
+                    selected_ids.add(case["case_id"])
+
+    rq_counts = Counter(rq for case in selected for rq in case["research_questions"])
+    for case in selected:
+        if not case["research_questions"]:
+            inferred = _infer_case_research_questions(case, research_model)
+            if inferred:
+                case["research_questions"] = inferred
+                case["rq_assignment_source"] = "evidence_group_inference"
+                rq_counts.update(inferred)
+            else:
+                # Do not fabricate a research-question mapping merely to make
+                # the distribution look balanced.  The case remains usable as
+                # supporting evidence, but cannot carry a major RQ claim.
+                case["rq_assignment_source"] = "unassigned_evidence_boundary"
+        else:
+            case["rq_assignment_source"] = "argument_plan_evidence_binding"
+
+    # Mark a small, auditable set of core cases.  Core cases must be distinct,
+    # analytically rich and locally aligned; the rest remain supporting cases.
+    core_target = int(report_policy.get("core_case_target") or 10)
+    core_target = max(8, min(12, core_target))
+    core_codes = ("syntax", "terminology", "rhetoric", "reference", "discourse")
+    core_candidates = [x for x in sorted(selected, key=lambda item: (
+        -float(item.get("analytical_value_score") or 0),
+        int(item.get("segment_index") or 0)))
+        if str((x.get("focus") or {}).get("difficulty_code") or "") in core_codes
+        and (x.get("semantic_alignment") or {}).get("status") != "misaligned"
+        and str(x.get("difficulty_group") or "") != "质量问题与译文完整性"]
+    core_ids = set()
+    # Ensure each major analytical family has representation where the evidence
+    # permits it, then fill the remaining core slots by value.
+    for code in core_codes:
+        candidate = next((x for x in core_candidates
+                          if str((x.get("focus") or {}).get("difficulty_code") or "") == code
+                          and x.get("case_id") not in core_ids), None)
+        if candidate and len(core_ids) < core_target:
+            core_ids.add(candidate.get("case_id"))
+    for candidate in core_candidates:
+        if len(core_ids) >= core_target:
+            break
+        core_ids.add(candidate.get("case_id"))
+    for case in selected:
+        case["argument_role"] = "core" if case.get("case_id") in core_ids else "supporting"
+
+    cases = sorted(selected, key=lambda x: (
+        str(x.get("difficulty_group") or ""), -x["analytical_value_score"],
+        int(x.get("segment_index") or 0)))
+    authentic_count = sum(x.get("case_type") == "authentic_revision" for x in cases)
+    decision_count = sum(x.get("case_type") == "translation_decision" for x in cases)
+    synthetic_count = sum(x.get("case_type") == "synthetic_contrast" for x in cases)
+    legacy_synthetic_count = sum(
+        x.get("case_type") == "synthetic_contrast"
+        and x.get("baseline_origin") == "legacy_analytical_draft" for x in cases)
+    newly_generated_synthetic_count = sum(
+        x.get("case_type") == "synthetic_contrast"
+        and x.get("baseline_origin") == "newly_generated" for x in cases)
+    if final_contract:
+        for case in cases:
+            case_type = str(case.get("case_type") or "")
+            case["final_case_eligible"] = case_type in final_case_types
+            case["contrast_ready"] = case["final_case_eligible"]
+            case["contrast_type"] = {
+                "authentic_revision": "authentic",
+                "synthetic_contrast": "synthetic",
+            }.get(case_type)
+    synthetic_target = synthetic_count if final_contract else min(
+        len(synthetic_pool), target, max(0, int(report_policy.get(
+            "synthetic_case_target") or (target if policy == "synthetic_only"
+                                          else min(10, max(0, target // 3))))))
     minimum = min(minimum_authentic_count, preferred_authentic_count)
     if policy == "synthetic_only":
         authentic_status = "not_applicable"
@@ -945,49 +1605,229 @@ def select_academic_cases(
         scarcity_disclosure = (
             f"现有项目证据仅支持 {authentic_count} 个通过修订资格门禁的真实修订案例，"
             f"少于最低要求 {minimum} 个。")
-    synthetic_count = len(cases) - authentic_count - decision_count
     selection_status = (
+        "final_contrast_case_selection" if final_contract and len(cases) >= target else
+        "insufficient_contrast_cases" if final_contract else
         "mixed_case_selection" if sum(bool(x) for x in (
             authentic_count, decision_count, synthetic_count)) > 1 else
         "translation_decision_selection" if decision_count else
         "synthetic_only_selection" if synthetic_count else
         "no_eligible_synthetic_cases" if policy == "synthetic_only" else
         authentic_status)
+    portfolio_groups = []
+    for group_index, difficulty in enumerate(dict.fromkeys(
+            str(x.get("difficulty_group") or "未分类") for x in cases), start=1):
+        members = [x for x in cases
+                   if str(x.get("difficulty_group") or "未分类") == difficulty]
+        strategy = str(members[0].get("strategy_group") or "证据约束的翻译决策")
+        group_id = f"G{group_index}"
+        for case in members:
+            case.update({
+                "portfolio_group_id": group_id,
+                "difficulty_subsection": f"3.2.{group_index}",
+                "strategy_subsection": f"3.3.{group_index}",
+                "target_subsection": f"3.3.{group_index}",
+            })
+        portfolio_groups.append({
+            "group_id": group_id,
+            "difficulty_group": difficulty,
+            "strategy_group": strategy,
+            "difficulty_subsection": f"3.2.{group_index}",
+            "strategy_subsection": f"3.3.{group_index}",
+            "case_ids": [str(x.get("case_id")) for x in members],
+            "case_count": len(members),
+        })
     artifact = {
         "schema_version": VERSIONS["case_selection_version"],
         "selection_policy": policy,
         "preference_order": (
+            "verified authentic revision > validated legacy analytical baseline > "
+            "eligible newly generated synthetic contrast > "
+            "translation decision as backend candidate only > unsupported reconstructed history"
+            if final_contract else
             "verified authentic revision > evidence-rich translation decision > "
             "eligible synthetic contrast > unsupported reconstructed history"),
         "eligibility_rule": "case_type_specific_gate",
         "requested_case_count": limit,
+        "report_case_policy": report_policy,
+        "candidate_pool_target": int(report_policy.get(
+            "candidate_pool_target") or max(limit, len(ranked))),
+        "candidate_pool_count": len(revision_pool) + len(backend_decision_pool),
+        "ranked_candidate_pool_count": len(ranked),
+        "final_candidate_pool_count": len(ranked),
+        "translation_decision_candidate_pool_count": len(backend_decision_pool),
+        "backend_candidate_pool": [{
+            "case_id": x.get("case_id"),
+            "case_type": "translation_decision",
+            "source_segment_id": x.get("source_segment_id"),
+            "score": x.get("score"),
+            "rejected_from_final_report": final_contract,
+            "rejection_reason": "candidate_evidence_type_not_final_case_type"
+            if final_contract else "",
+        } for x in backend_decision_pool],
+        "ranked_candidate_pool": [{
+            "case_id": x.get("case_id"),
+            "case_type": x.get("case_type"),
+            "segment_id": x.get("segment_id"),
+            "analytical_value_score": x.get("analytical_value_score"),
+            "difficulty_group": x.get("difficulty_group"),
+            "strategy_group": x.get("strategy_group"),
+            "focus": x.get("focus"),
+        } for x in ranked[:max(limit, int(report_policy.get(
+            "candidate_pool_target") or limit))]],
         "preferred_core_case_count": preferred_authentic_count,
         "minimum_core_case_count": minimum,
         "case_count_policy": "authentic_and_synthetic_pools_remain_distinct",
-        "eligible_case_count": len(candidates),
+        "eligible_case_count": len(ranked),
         "revision_candidate_pool_count": len(revision_pool),
         "eligible_synthetic_case_count": sum(
             x.get("validation", {}).get("academic_case_eligible")
             for x in (synthetic_artifact or {}).get("items", [])),
+        "eligible_legacy_synthetic_case_count": sum(
+            x.get("baseline_origin") == "legacy_analytical_draft"
+            and x.get("validation", {}).get("academic_case_eligible")
+            for x in (synthetic_artifact or {}).get("items", [])),
+        "eligible_newly_generated_synthetic_case_count": sum(
+            x.get("baseline_origin") == "newly_generated"
+            and x.get("validation", {}).get("academic_case_eligible")
+            for x in (synthetic_artifact or {}).get("items", [])),
+        "synthetic_gate_metrics": dict((synthetic_artifact or {}).get(
+            "metrics") or {}),
+        "synthetic_case_target": synthetic_target,
+        "synthetic_candidate_count": len(synthetic_pool),
         "synthetic_pipeline_status": (synthetic_artifact or {}).get(
             "pipeline_status", "not_run"),
         "selected_case_count": len(cases),
+        "final_case_count": len(cases) if final_contract else 0,
+        "contrast_case_count": sum(bool(x.get("contrast_ready")) for x in cases)
+        if final_contract else 0,
+        "contrast_ready_case_count": sum(bool(x.get("contrast_ready")) for x in cases)
+        if final_contract else 0,
+        "translation_decision_visible_count": decision_count if final_contract else 0,
         "authentic_revision_cases": authentic_count,
         "translation_decision_cases": decision_count,
         "synthetic_contrast_cases": synthetic_count,
+        "legacy_synthetic_contrast_cases": legacy_synthetic_count,
+        "newly_generated_synthetic_contrast_cases": newly_generated_synthetic_count,
         "authentic_selection_status": authentic_status,
         "selection_status": selection_status,
+        "case_coverage_status": (
+            "insufficient" if len(cases) < int(report_policy.get(
+                "minimum_cases") or 0) else
+            "minimum_with_warning" if len(cases) < int(report_policy.get(
+                "recommended_cases") or len(cases)) else "good"),
+        "difficulty_distribution": dict(Counter(
+            str(x.get("difficulty_group") or "未分类") for x in cases)),
+        "strategy_distribution": dict(Counter(
+            str(x.get("strategy_group") or "未分类") for x in cases)),
+        "research_question_distribution": dict(rq_counts),
+        "required_research_questions": [str(item.get("rq_id")) for item in
+                                         research_model.get("research_questions") or []
+                                         if item.get("rq_id")],
+        "core_case_ids": sorted(str(x) for x in core_ids if x),
+        "supporting_case_ids": sorted(str(x.get("case_id")) for x in cases
+                                       if x.get("case_id") not in core_ids),
+        "argument_role_distribution": dict(Counter(
+            str(x.get("argument_role") or "supporting") for x in cases)),
+        "diversity_warnings": diversity_warnings,
+        "case_portfolio": {
+            "candidate_pool_count": len(revision_pool) + len(backend_decision_pool),
+            "ranked_candidate_pool_count": len(ranked),
+            "selected_case_count": len(cases),
+            "groups": portfolio_groups,
+            "cases": [{
+                "case_id": x.get("case_id"),
+                "case_type": x.get("case_type"),
+                "baseline_origin": x.get("baseline_origin"),
+                "segment_id": x.get("segment_id"),
+                "focus": x.get("focus"),
+                "difficulty_group": x.get("difficulty_group"),
+                "strategy_group": x.get("strategy_group"),
+                "research_question_ids": x.get("research_questions"),
+                "argument_role": x.get("argument_role"),
+                "semantic_alignment": x.get("semantic_alignment"),
+                "provenance_confidence": "high" if x.get("canonical_evidence") else "low",
+                "analytical_value_score": x.get("analytical_value_score"),
+                "final_case_eligible": x.get("final_case_eligible", False),
+                "contrast_ready": x.get("contrast_ready", False),
+                "contrast_type": x.get("contrast_type"),
+            } for x in cases],
+        },
         "scarcity_disclosure_required": authentic_status in {
             "two_case_fallback", "insufficient_revision_cases"},
         "synthetic_methodology_disclosure_required": synthetic_count > 0,
         "synthetic_limitation_disclosure_required": synthetic_count > 0,
         "scarcity_disclosure": scarcity_disclosure,
         "scarcity_recommendations": recommendations,
+        "rejected_candidates": [*rejected_candidates, *[
+            {"case_id": item.get("case_id"),
+             "reason": ";".join(item.get("validation", {}).get(
+                 "rejected_reasons") or ["synthetic_gate_failed"])}
+            for item in (synthetic_artifact or {}).get("items", [])
+            if not item.get("validation", {}).get("academic_case_eligible")]],
+        "qa_excluded_case_ids": sorted(qa_case_ids & {
+            str(x.get("case_id")) for x in backend_decision_pool}),
+        "qa_excluded_source_segment_ids": sorted(qa_rejected_source_ids),
         "cases": cases,
     }
     artifact["content_hash"] = academic_evidence.stable_hash(
         {k: v for k, v in artifact.items() if k != "content_hash"})
     return artifact
+
+
+def final_contrast_portfolio_markdown(selected_cases: Mapping[str, Any]) -> str:
+    """Render the pre-writing portfolio review without adding report prose."""
+    policy = selected_cases.get("report_case_policy") or {}
+    cases = [x for x in selected_cases.get("cases") or []
+             if x.get("case_type") in {"authentic_revision", "synthetic_contrast"}
+             and x.get("contrast_ready")]
+    lines = ["# Final Contrast Case Portfolio", "",
+             f"- final_case_count: {len(cases)}",
+             f"- minimum_required: {int(policy.get('minimum_cases') or 20)}",
+             f"- contrast_case_count: {sum(bool(x.get('contrast_ready')) for x in cases)}",
+             f"- translation_decision_visible_count: 0",
+             f"- candidate_pool_count: {selected_cases.get('candidate_pool_count', 0)}",
+             f"- synthetic_suitability_count: {selected_cases.get('eligible_synthetic_case_count', 0)}",
+             f"- synthetic_gate_metrics: {json.dumps(selected_cases.get('synthetic_gate_metrics') or {}, ensure_ascii=False, sort_keys=True)}",
+             ""]
+    if len(cases) < int(policy.get("minimum_cases") or 20):
+        lines.extend(["状态：insufficient_contrast_cases", ""])
+    for number, case in enumerate(cases, 1):
+        focus = case.get("focus") or {}
+        source = (focus.get("source_span") or {}).get("text") or case.get("source_text")
+        initial = (focus.get("initial_span") or {}).get("text")
+        if case.get("case_type") == "synthetic_contrast":
+            initial = initial or (case.get("synthetic_baseline") or {}).get("text")
+        target = (focus.get("target_span") or {}).get("text") or \
+            case.get("target_contrast_text")
+        gate = case.get("synthetic_evidence") or {}
+        lines.extend([
+            f"## 例[{number}] {case.get('case_id')}", "",
+            f"- type: {'authentic' if case.get('case_type') == 'authentic_revision' else 'synthetic'}",
+            f"- case_type: {case.get('case_type')}",
+            f"- baseline_origin: {case.get('baseline_origin') or 'historical_project_revision'}",
+            f"- targeted_issue: {focus.get('issue') or case.get('targeted_issue') or ''}",
+            f"- difficulty: {case.get('difficulty_group') or ''}",
+            f"- strategy: {case.get('strategy_group') or ''}",
+            f"- research_questions: {', '.join(case.get('research_questions') or [])}",
+            "", "原文：", str(source or ""), "",
+            ("初译：" if case.get("case_type") == "authentic_revision" else "模拟初译："),
+            str(initial or ""), "", "改译：", str(target or ""), "",
+            "contrast rationale：",
+            str(case.get("contrast_rationale") or gate.get(
+                "academic_analysis_reason") or case.get("selection_rationale") or "")[:800], "",
+            "gate status：",
+            f"plausibility={gate.get('baseline_plausibility', 'n/a')}; "
+            f"materiality={gate.get('material_difference', 'n/a')}; "
+            f"repair_correctness={gate.get('repair_correctness', 'n/a')}; "
+            f"academic_analysis_value={gate.get('academic_analysis_value', 'n/a')}", "",
+        ])
+    rejected = selected_cases.get("rejected_candidates") or []
+    if rejected:
+        lines.extend(["## Rejected candidates", ""])
+        lines.extend(f"- {x.get('case_id')}: {x.get('reason')}" for x in rejected)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _fallback_outline(
@@ -1015,7 +1855,7 @@ def _fallback_outline(
         conclusion_limits.append("明确披露核心修订案例只有两个，不补造第三案例")
     if synthetic_case_ids:
         analysis_conclusions.append(
-            "合成对比案例必须标为模拟初译/优化译文，不能写成作者历史修订")
+            "合成对比案例必须标为模拟初译/改译，不能写成作者历史修订")
         conclusion_limits.append(
             "合成案例只展示合理失败模式，不证明人类译者中的发生频率")
     template_configured = bool((constraints.get("template") or {}).get("configured"))
@@ -1075,6 +1915,22 @@ def _fallback_outline(
             "selected": len(cases),
             "scarcity_disclosure": scarcity,
         }}
+
+
+def _generic_outline_role(title: Any, supplied_role: Any) -> str:
+    """Prefer a recognizable chapter title over an LLM's extra role field."""
+    detected = report_template._role_for_title(title)
+    if detected != "generic_section":
+        return detected
+    title_key = re.sub(r"[\s:：.。、()（）\[\]【】_-]+", "", str(title or "").casefold())
+    hints = (
+        ("project_overview", ("项目与方法", "项目方法", "项目流程")),
+        ("conclusion_reflection", ("讨论与结论", "总结与反思", "结论与反思")),
+    )
+    for role, candidates in hints:
+        if any(candidate.casefold() in title_key for candidate in candidates):
+            return role
+    return str(supplied_role or "generic_section")
 
 
 def build_academic_outline(
@@ -1196,7 +2052,8 @@ def build_academic_outline(
         sections = [normalize_section(
             str(item.get("section_id") or index),
             {"title": str(item.get("title") or f"章节 {index}"),
-             "role": str(item.get("role") or "case_analysis"),
+             "role": _generic_outline_role(
+                 item.get("title"), item.get("role")),
              "level": 1,
              "purpose": str(item.get("purpose") or ""),
              "required_subsections": []}, item)
@@ -1329,7 +2186,24 @@ def build_academic_outline(
     return artifact
 
 
-def _case_assignment_for_plan(case_id: str, plan: Mapping[str, Any]) -> Dict[str, Any]:
+def _case_assignment_for_plan(
+    case_id: str, plan: Mapping[str, Any], selected_case: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    selected_case = selected_case or {}
+    if selected_case.get("target_subsection"):
+        return {
+            "case_id": case_id,
+            "difficulty_group": selected_case.get("difficulty_group"),
+            "strategy_group": selected_case.get("strategy_group"),
+            "difficulty_subsection": selected_case.get("difficulty_subsection"),
+            "strategy_subsection": selected_case.get("strategy_subsection"),
+            "target_subsection": selected_case.get("target_subsection"),
+            "group_title": selected_case.get("strategy_group"),
+            "research_question_ids": list(selected_case.get("research_questions") or []),
+            "argument_role": selected_case.get("argument_role", "supporting"),
+            "semantic_alignment": selected_case.get("semantic_alignment") or {},
+            "required": True,
+        }
     problem_type = str((plan.get("problem") or {}).get("type") or "other")
     if problem_type in {
             "terminology", "reference_resolution", "lexical_polysemy",
@@ -1350,8 +2224,29 @@ def _case_assignment_for_plan(case_id: str, plan: Mapping[str, Any]) -> Dict[str
         "strategy_group": f"3.3.{group}",
         "target_subsection": f"3.3.{group}",
         "group_title": title,
+        "argument_role": selected_case.get("argument_role", "supporting"),
+        "semantic_alignment": selected_case.get("semantic_alignment") or {},
         "required": True,
     }
+
+
+def _scope_case_assignment(
+    assignment: Mapping[str, Any], section: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Rebase a portfolio group onto the actual case-analysis chapter."""
+    scoped = dict(assignment)
+    value = str(scoped.get("target_subsection") or "")
+    parts = value.split(".")
+    if len(parts) < 3 or not parts[-1].isdigit():
+        return scoped
+    problem_root, solution_root = thesis_constraints.case_subsection_roots(section)
+    suffix = parts[-1]
+    scoped.update(
+        difficulty_subsection=f"{problem_root}.{suffix}",
+        strategy_subsection=f"{solution_root}.{suffix}",
+        target_subsection=f"{solution_root}.{suffix}",
+    )
+    return scoped
 
 
 def _section_packet(
@@ -1374,7 +2269,8 @@ def _section_packet(
     required_case_ids = [str(x) for x in section.get("cases", []) if str(x) in cases]
 
     case_assignments = [
-        _case_assignment_for_plan(case_id, plans.get(case_id) or {})
+        _scope_case_assignment(_case_assignment_for_plan(
+            case_id, plans.get(case_id) or {}, cases.get(case_id) or {}), section)
         for case_id in required_case_ids]
     case_term_ids = set()
     for case_id in section.get("cases", []):
@@ -1391,11 +2287,11 @@ def _section_packet(
     available_segment_ids = list(segments)
     if len(available_segment_ids) > 40:
         available_segment_ids = available_segment_ids[:39] + [available_segment_ids[-1]]
-    available_evidence = [
-        {key: (segments.get(segment_id) or {}).get(key)
-         for key in ("segment_id", "source", "initial_target", "final_target")}
-        for segment_id in available_segment_ids
-    ]
+    available_evidence = [{
+        "segment_id": segment_id,
+        "coverage_zone": (segments.get(segment_id) or {}).get("coverage_zone"),
+        "case_role": (segments.get(segment_id) or {}).get("case_role"),
+    } for segment_id in available_segment_ids]
     canonical_stats = evidence.get("project_evidence", {}).get("statistics", {})
     statistics = {
         x: academic_validator.resolve_statistic(canonical_stats, x)[1]
@@ -1419,9 +2315,18 @@ def _section_packet(
         "available_segment_ids": available_segment_ids,
         "available_evidence": available_evidence,
         "cases": [{
-            **cases[x],
-            "evidence": cases[x] if cases[x].get("case_type") == "synthetic_contrast"
-            else segments.get(str(cases[x].get("source_segment_id") or x)),
+            **{key: value for key, value in cases[x].items()
+               if key != "canonical_evidence"},
+            "evidence": {
+                "source": ((cases[x].get("focus") or {}).get("source_span") or {}).get(
+                    "text"),
+                "initial_target": ((cases[x].get("focus") or {}).get(
+                    "initial_span") or {}).get("text")
+                if cases[x].get("case_type") != "translation_decision" else None,
+                "final_target": ((cases[x].get("focus") or {}).get(
+                    "target_span") or {}).get("text"),
+                "focus": cases[x].get("focus"),
+            },
         } for x in section.get("cases", []) if x in cases],
         "required_case_ids": required_case_ids,
         "must_render_all_cases": bool(required_case_ids),
@@ -1457,7 +2362,7 @@ def _section_packet(
             "target_quote": "> [TARGET seg-...]: exact final target",
             "synthetic_source_quote": "> [SYNTHETIC_SOURCE SC-...]: exact source",
             "synthetic_baseline_quote": "> [SIMULATED SC-...]: exact simulated baseline",
-            "synthetic_optimized_quote": "> [OPTIMIZED SC-...]: exact AI optimization",
+            "synthetic_target_quote": "> [OPTIMIZED SC-...]: exact current project target",
             "project_statistic": "{{STAT:metric_name}}",
             "terminology_decision": "{{TERM:entry_id}}",
             "formal_citation": "[@source_id]",
@@ -1472,6 +2377,7 @@ def _section_packet(
                 "authentic_revision 必须有真实初译→终译；synthetic_contrast 必须通过"
                 "独立合成资格门禁；两者不得互相转换"),
             "case_count_policy": {
+                **dict(selected_cases.get("report_case_policy") or {}),
                 "status": selected_cases.get(
                     "authentic_selection_status", selected_cases.get("selection_status")),
                 "preferred": selected_cases.get("preferred_core_case_count", 3),
@@ -1487,8 +2393,8 @@ def _section_packet(
                 "present": bool(selected_cases.get("synthetic_contrast_cases")),
                 "methodology_marker": "<!--synthetic-methodology-->",
                 "methodology_disclosure": (
-                    "合成对比案例以真实源文为基础，模拟初译与优化译文均为分析阶段生成，"
-                    "不代表作者的历史翻译；其合理性、错误实质性与修复有效性分别经过检查。"),
+                    "合成对比案例以真实源文和当前正式译文为基础，模拟初译为分析阶段构造，"
+                    "不代表作者的历史翻译；其合理性、实质性差异与修复正确性分别经过检查。"),
                 "limitation_marker": "<!--synthetic-limitation-->",
                 "limitation_disclosure": (
                     "合成案例只能展示合理的翻译失败模式，不能证明此类错误在人类译者中的"
@@ -1509,6 +2415,9 @@ def _writer_heading_key(value: Any) -> str:
 def _ensure_section_contract(text: str, section: Mapping[str, Any]) -> str:
     """Keep required template headings visible even when the model omits them."""
     required = list(section.get("required_subsections") or [])
+    is_case_section = str(section.get("role") or "") == "case_analysis"
+    case_roots = thesis_constraints.case_subsection_roots(section) \
+        if is_case_section else ()
     lines = str(text or "").splitlines()
     normalized = []
     seen = set()
@@ -1545,7 +2454,8 @@ def _ensure_section_contract(text: str, section: Mapping[str, Any]) -> str:
             dynamic_allowed = any(
                 item.get("allows_dynamic_children") and heading_id.startswith(
                     str(item.get("heading_id") or "") + ".")
-                for item in required)
+                for item in required) or any(
+                    heading_id.startswith(root + ".") for root in case_roots)
             chapter_child = heading_id.startswith(
                 str(section.get("section_id") or "") + ".")
             if numeric and chapter_child and (dynamic_allowed or not required):
@@ -1568,14 +2478,25 @@ def _ensure_section_contract(text: str, section: Mapping[str, Any]) -> str:
             normalized.extend(["", f"{prefix} {heading_id} {item.get('title')}",
                                "当前项目证据不足以对此作进一步实证分析，需人工补充。"])
     text = "\n".join(normalized).strip()
-    if str(section.get("role") or "") == "case_analysis":
-        problem_ids = set(re.findall(r"^#{4,6}\s+3\.2\.(\d+)\b", text, re.MULTILINE))
-        solution_ids = set(re.findall(r"^#{4,6}\s+3\.3\.(\d+)\b", text, re.MULTILINE))
-        for side, suffixes in (("2", problem_ids - solution_ids),
-                               ("3", solution_ids - problem_ids)):
+    if is_case_section:
+        problem_root, solution_root = case_roots
+        if section.get("cases"):
+            for root, title in ((problem_root, "翻译难点"),
+                                (solution_root, "翻译策略与解决方案")):
+                if not re.search(rf"^#{{3,6}}\s+{re.escape(root)}(?:\s|$)", text,
+                                 re.MULTILINE):
+                    text += f"\n\n### {root} {title}"
+        problem_ids = set(re.findall(
+            rf"^#{{4,6}}\s+{re.escape(problem_root)}\.(\d+)\b", text,
+            re.MULTILINE))
+        solution_ids = set(re.findall(
+            rf"^#{{4,6}}\s+{re.escape(solution_root)}\.(\d+)\b", text,
+            re.MULTILINE))
+        for root, suffixes in ((problem_root, problem_ids - solution_ids),
+                               (solution_root, solution_ids - problem_ids)):
             for suffix in suffixes:
                 text = re.sub(
-                    rf"^#{{4,6}}\s+(3\.{side}\.{suffix}\s+.+)$",
+                    rf"^#{{4,6}}\s+({re.escape(root)}\.{suffix}\s+.+)$",
                     r"**\1**", text, flags=re.MULTILINE)
     missing_rqs = [str(rq) for rq in section.get("research_questions") or []
                    if f"<!--rq:{rq}-->" not in text]
@@ -1596,12 +2517,16 @@ def _write_section(
         "translation_decision 只使用 SOURCE/TARGET，并明确初译与终译一致、用于分析"
         "可观察的翻译决策，绝不能写成错误后改译；"
         "synthetic_contrast 必须逐字使用 SYNTHETIC_SOURCE/SIMULATED/OPTIMIZED，"
-        "并明确称为‘模拟初译’和‘优化译文’。项目数字只能用 packet.statistics 中已提供的 "
+        "并明确称为‘模拟初译’和‘改译’；改译字段消费当前正式译文，不是新生成的历史终稿。"
+        "项目数字只能用 packet.statistics 中已提供的 "
         "{{STAT:key}}；缺失指标不得猜测，也不要输出对应 token。正式文献只能用 [@source_id]；"
         "文献直接引语必须逐字复制 literature_evidence 并使用 LITERATURE 格式；文献释义必须"
         "同时保留 lit-claim 与 lit-evidence marker，并引用对应 source_id；"
         "项目术语决策用 {{TERM:entry_id}}。每个落实的 claim 和 RQ 分别保留 HTML marker。"
         "理论解释必须写成作者分析，例如‘从结果看可解释为’，不得冒充译者真实意图。"
+        "证据等级规则：当前源语—目标语对照通常只支持文本层面的‘显示、呈现、保持、"
+        "对应’；‘证明、确保、显著、有效提升、降低认知负荷、不会造成理解障碍、通行译法、"
+        "译者经过权衡’分别需要文献、读者反馈或真实过程记录，packet 未提供时必须删除或降级。"
         "无文献证据时，不得从模型记忆补作者、年份、书名或理论命题。内部 ID 只能存在于"
         "规定的 quote/HTML marker，普通论文句子不得出现 segment id、artifact、finding id、"
         "evidence registry 等系统语言。只输出章节正文。"
@@ -1625,37 +2550,75 @@ def _write_section(
     if role == "introduction":
         system += (
             " 本章必须在 1.1 只写真实项目背景与意义；1.2 原样提出 packet 中 2—3 个研究问题；"
-            "1.3 必须准确说明当前四章结构。不得虚构行业数据。")
+            "1.3 必须准确说明当前四章结构。不得虚构行业数据、研究空白、目标读者反应或"
+            "文献依赖的理论共识；没有文献时将其写成本文研究范围与实践动机。")
     elif role == "project_overview":
         system += (
             " 本章只使用 workflow_evidence、statistics 与 project_metadata。2.1 说明原文件、"
             "方向、范围、片段数、文本类型和交付记录；2.2.1/2.2.2/2.2.3 分别写真实译前、"
             "译中、译后流程。不得虚构客户、团队、CATTI、Trados 或客户反馈。"
-            "TM reuse=0 只能写‘未观察到 TM 复用记录’，不能推出机器翻译或 LLM 未使用。")
+            "区分系统检查、人工操作、自动 QA 与人工修订；reviewed_segments 是系统审查记录，"
+            "不能改写成‘由审校人员审校’。TM reuse=0 只能写‘项目记录中未观察到 TM 复用’，"
+            "不能推出机器翻译或 LLM 未使用、完全依赖人工或效率变化；当前 delivery_status 为 draft"
+            "时只能写‘形成当前工作稿/记录了问题’，不能声称质量已经确保达标。")
     elif role == "case_analysis":
+        current_section = packet.get("current_section") or {}
+        section_id = str(current_section.get("section_id") or "3")
+        problem_root, solution_root = thesis_constraints.case_subsection_roots(
+            current_section)
+        structure = (
+            f"本章必须保持 {section_id}.1 源语类型与特征、{problem_root} 翻译难点、"
+            f"{solution_root} 翻译策略与解决方案。"
+            if not required_subsections else
+            "本章必须保持 required_subsections 规定的案例分析结构。")
         system += (
-            " 本章必须保持 3.1 源语类型与特征、3.2 翻译难点、3.3 翻译策略与解决方案。"
-            "3.2.x 与 3.3.x 必须同号一一对应；每个策略项使用真实案例，按原文、初译/译文、"
-            "改译（仅真实修订）、分析组织。案例正文不要显示内部 ID。selected cases 中每个"
+            f" {structure}"
+            f"{problem_root}.x 与 {solution_root}.x 必须按 packet.case_assignments 中由当前项目证据形成的组别"
+            f"同号一一对应，不能套用固定分类；每个 {solution_root}.x 先说明具体难点与策略，再用多个"
+            "不同子现象的案例验证，最后写本组小结。案例只写模板允许的原文、初译/译文、"
+            "改译（仅真实修订）、可选注释和分析。翻译难点、策略、译法解释、效果与有界"
+            "结论必须自然融入一个连续的‘分析’段落，不能显示为案例字段或小标题。案例正文"
+            "不要显示内部 ID。selected cases 中每个"
             "case_id 只能作为一个编号例证出现一次，不得把同一段落按不同维度包装成两个案例，"
-            "也不得新增第七个案例。translation_decision 只能称为翻译决策案例。finding 数量只"
+            "也不得新增未选择的案例。每个案例只能逐字使用 packet.cases.evidence 中的 focus"
+            "文本，不能扩展成完整 segment。translation_decision 只能称为翻译决策案例。finding 数量只"
             "表示检测记录，不等于发生同等数量的实际改译；TM reuse=0 时不得写 TM 污染、"
             "机器翻译未使用或全程人工。真实修订若仅删除英文括号释义，只能支持术语格式与"
             "阅读连续性分析，不能证明句法、逻辑衔接或信息结构发生修订。")
+        final_policy = (packet.get("writing_constraints") or {}).get(
+            "case_count_policy") or {}
+        if final_policy.get("report_stage") == "final_report" \
+                and final_policy.get("contrast_required"):
+            system += (
+                " 当前为 final_report：正式案例只允许 authentic_revision 或 "
+                "synthetic_contrast，translation_decision 不得进入可见案例。每个正式案例"
+                "必须同时呈现原文、初译/模拟初译、改译和分析；分析必须具体解释 baseline/真实"
+                "初译为何合理、哪里不足、改译改变了什么、为何适合当前语境、体现何种策略以及"
+                "结论边界。Chapter 3 在第一次案例前只统一说明一次 synthetic 方法，不能在每例"
+                "重复方法段落；synthetic 案例可见标签必须是‘模拟初译’，不得只写‘初译’。")
         required_case_ids = packet.get("required_case_ids") or []
         if required_case_ids:
             system += (
                 " packet.required_case_ids 中的案例全部是 required，不是可选上下文；必须按"
                 "packet.case_assignments 将每个案例各写成一个独立可见例证，恰好一次，并在"
                 "例证标题下一行保留 <!--case:CASE_ID-->。例证编号可暂用例[1]，最终 assembly"
-                "会统一编号。authentic_revision 使用原文、初译、改译、分析；"
-                "translation_decision 只使用原文、译文、翻译难点、译法分析，不得使用"
-                "‘初译’‘修改后’‘改译为’等历史修订措辞。"
+                "会统一编号。authentic_revision 使用原文、初译、改译、可选注释、分析；"
+                "synthetic_contrast 使用原文、模拟初译、改译、可选注释、分析；"
+                "translation_decision 只使用原文、译文、可选注释、分析，不得使用"
+                "‘初译’‘修改后’‘改译为’等历史修订措辞。每个案例必须服务其"
+                "research_question_ids，不能让某个研究问题只依赖一个例证。普通案例不得"
+                "显示‘翻译难点、译法分析、翻译效果、有界结论、证据边界、provenance、"
+                "case type’等内部标签；注释只用于必要的文化、专名或术语来源说明。"
+                "标记为 core 的案例承担 RQ 论证，须比 supporting 案例展开更多具体机制；supporting"
+                "案例用于补充现象，不得被写成独立的一般规律。source/target focus 若为"
+                "review_required，只能使用克制措辞；misaligned 案例不得进入 core。"
             )
     elif role == "conclusion_reflection":
         system += (
             " 本章必须逐项回应研究问题，总结已建立的策略、实践经验、真实局限和改进方向；"
-            "不得首次引入任何案例或新证据。")
+            "每个 RQ 的回答必须回指多个已建立的 core cases 及其所属小节，不得把唯一真实修订"
+            "案例扩展成普遍结论；不得首次引入任何案例或新证据。明确说明没有读者测试、"
+            "文献或完整修订历史时的限制。")
     count_policy = (packet.get("writing_constraints") or {}).get(
         "case_count_policy") or {}
     if count_policy.get("status") == "two_case_fallback":
@@ -1683,12 +2646,13 @@ def _write_section(
             " 案例分析必须按 packet.case_analyses 的 analysis_contract_text 实现："
             "authentic_revision 按历史初译→finding/文本差异→实际修订→历史终译；"
             "synthetic_contrast 按翻译难点→合理模拟错误→错误诱因与诊断→意义/功能失真→"
-            "AI 优化→修复机制与有效性→有界结论。备选方案必须标注 historical_alternative / analytical_comparison / "
+            "当前正式译文的修复对照→有界结论。备选方案必须标注 historical_alternative / analytical_comparison / "
             "counterfactual_rendering；没有证据的备选一律 counterfactual_rendering）、"
             "最终决策与理由、翻译效果（指明具体维度与文本特征，禁止‘更自然/更准确’式"
             "空泛判断）、理论连接（仅当 theory_mapping 存在；否则禁止提及任何理论名称）、"
-            "证据边界与有界结论（只限本案例，禁止外推为一般规则）。必须使用与 case_type"
-            "对应的逐字标签，并使正文描述的变化与 artifact 一致。禁止：编造译者意图或"
+            "证据边界与有界结论（只限本案例，禁止外推为一般规则）。这些内部字段只用于"
+            "组织和约束分析措辞，不得逐项渲染成可见标题。必须使用与 case_type 对应的"
+            "模板字段，并使正文描述的变化与 artifact 一致。禁止：编造译者意图或"
             "过程历史；提及 packet 之外任何 seg 段号；把反事实备选写成历史事实。证据不足"
             "时明确写‘本项目证据不足以支持…’，并列出 recommended_human_evidence 所需"
             "的人工证据。"
@@ -1740,7 +2704,7 @@ def _write_missing_case_example(
     packet: Dict[str, Any], case_id: str, call_llm: Callable,
     provider: str, api_key: str, model: str,
 ) -> str:
-    """Write one required case block without rewriting its surrounding chapter."""
+    """Assemble one missing block through the shared presentation adapter."""
     case = next((item for item in packet.get("cases") or []
                  if str(item.get("case_id")) == case_id), None)
     plan = next((item for item in packet.get("case_analyses") or []
@@ -1750,41 +2714,60 @@ def _write_missing_case_example(
     if not case or not plan or not assignment:
         raise ValueError(f"missing required case contract: {case_id}")
     case_type = str(case.get("case_type") or "authentic_revision")
-    format_rule = (
-        "原文、初译、改译、分析" if case_type == "authentic_revision"
-        else "原文、译文、翻译难点、译法分析")
-    system = (
-        "你是 MTI 案例定点修复器。只输出一个独立案例块，不输出章节标题或修订说明。"
-        f"案例必须使用{format_rule}；逐字使用输入 evidence 与 analysis_contract_text，"
-        "不得补造译者意图、修订历史或新证据。标题暂用 **例[1]：简短标题**，下一行逐字"
-        f"保留 <!--case:{case_id}-->。原文与译文使用带 case_id 的 SOURCE/INITIAL/TARGET "
-        "blockquote；普通论文文字不得显示内部 ID。translation_decision 禁止出现‘初译’"
-        "‘修改后’‘改译为’。"
-    )
-    payload = {"case": case, "case_analysis": plan, "assignment": assignment}
-    raw = call_llm(provider, api_key, model, system,
-                   json.dumps(payload, ensure_ascii=False), temperature=0.1)
-    block = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", str(raw or "").strip(),
-                   flags=re.DOTALL)
-    if not block:
-        raise RuntimeError(f"missing case repair returned empty content: {case_id}")
-    if f"<!--case:{case_id}-->" not in block:
-        first_newline = block.find("\n")
-        block = (block + f"\n<!--case:{case_id}-->") if first_newline < 0 else (
-            block[:first_newline + 1] + f"<!--case:{case_id}-->\n" +
-            block[first_newline + 1:])
-    return block.strip()
+    evidence = case.get("evidence") or {}
+    source = str(evidence.get("source") or "").strip()
+    initial = str(evidence.get("initial_target") or "").strip()
+    target = str(evidence.get("final_target") or "").strip()
+    if not source or not target or (case_type == "authentic_revision" and not initial):
+        raise ValueError(f"missing focused case evidence: {case_id}")
+    focus = case.get("focus") or {}
+    presentation = case_presentation.build_case_presentation({
+        "case_id": case_id,
+        "case_type": case_type,
+        "example_number": 1,
+        "focus": {
+            "source": focus.get("source_span") or {"text": source},
+            "initial": focus.get("initial_span") or ({"text": initial} if initial else None),
+            "target": focus.get("target_span") or {"text": target},
+            "issue": focus.get("issue"),
+        },
+        "translation_delta": plan.get("translation_delta") or {},
+        "analysis_fields": {
+            "difficulty": plan.get("problem"),
+            "rationale": plan.get("decision_rationale"),
+            "effect": plan.get("translation_effect"),
+            "bounded_claim": plan.get("bounded_conclusion"),
+        },
+    })
+    return case_presentation.render_case_presentation_markdown(presentation)
 
 
-def _insert_case_example(section_text: str, subsection_id: str, block: str) -> str:
+def _insert_case_example(
+    section_text: str, subsection_id: str, block: str, heading_title: str = "案例分析",
+) -> str:
     heading = re.search(
-        rf"^#{{3,6}}\s+{re.escape(subsection_id)}\b.*$",
+        rf"^(#{{3,6}})\s+{re.escape(subsection_id)}\b.*$",
         section_text, re.MULTILINE)
     if not heading:
-        heading = re.search(r"^###\s+3\.3\b.*$", section_text, re.MULTILINE)
-    if not heading:
-        raise ValueError(f"missing case target subsection: {subsection_id}")
-    following = re.search(r"^#{3,4}\s+", section_text[heading.end():], re.MULTILINE)
+        parent_id = subsection_id.rpartition(".")[0]
+        parent = re.search(
+            rf"^(#{{3,6}})\s+{re.escape(parent_id)}\b.*$",
+            section_text, re.MULTILINE) if parent_id else None
+        if parent:
+            level = len(parent.group(1))
+            following = re.search(
+                rf"^#{{1,{level}}}\s+", section_text[parent.end():], re.MULTILINE)
+            insert_at = parent.end() + following.start() if following else len(section_text)
+            addition = (f"{'#' * min(6, level + 1)} {subsection_id} "
+                        f"{heading_title}\n\n{block.strip()}")
+            return (section_text[:insert_at].rstrip() + "\n\n" + addition + "\n\n" +
+                    section_text[insert_at:].lstrip()).strip()
+        parent_block = f"### {parent_id} 翻译策略与解决方案\n\n" if parent_id else ""
+        return (section_text.rstrip() + "\n\n" + parent_block +
+                f"#### {subsection_id} {heading_title}\n\n{block.strip()}").strip()
+    level = len(heading.group(1))
+    following = re.search(
+        rf"^#{{1,{level}}}\s+", section_text[heading.end():], re.MULTILINE)
     insert_at = heading.end() + following.start() if following else len(section_text)
     return (section_text[:insert_at].rstrip() + "\n\n" + block.strip() + "\n\n" +
             section_text[insert_at:].lstrip()).strip()
@@ -1803,7 +2786,8 @@ def _repair_missing_case_examples(
         block = _write_missing_case_example(
             packet, case_id, call_llm, provider, api_key, model)
         repaired = _insert_case_example(
-            repaired, str(assignment.get("target_subsection") or "3.3"), block)
+            repaired, str(assignment.get("target_subsection") or "3.3"), block,
+            str(assignment.get("group_title") or "案例分析"))
     return repaired
 
 
@@ -1855,6 +2839,23 @@ def _compose_report(sections: List[Dict[str, Any]]) -> str:
         for item in sections) + "\n"
 
 
+def _english_report_metadata(genre: str, domain: str) -> Tuple[str, str]:
+    """Translate report metadata without leaking Chinese labels into ABSTRACT."""
+    genre_key = re.sub(r"\s+", "", str(genre or ""))
+    domain_key = re.sub(r"\s+", "", str(domain or ""))
+    genre_en = {
+        "学术专著": "an excerpt from an academic monograph",
+        "学术专著/理论章节": "a theoretical chapter from an academic monograph",
+        "学术文本": "an academic text",
+    }.get(genre_key, "an academic text")
+    domain_en = {
+        "传播学/环境人文学": "media and communication studies and environmental humanities",
+        "媒体研究/文化理论/技术哲学": "media studies, cultural theory, and philosophy of technology",
+        "翻译实践": "academic translation practice",
+    }.get(domain_key, "the humanities")
+    return genre_en, domain_en
+
+
 def build_report_matter(
     research_model: Mapping[str, Any], evidence: Mapping[str, Any],
     selected_cases: Mapping[str, Any], template_contract: Optional[Mapping[str, Any]],
@@ -1871,6 +2872,7 @@ def build_report_matter(
     glossary = evidence.get("project_evidence", {}).get("glossary") or []
     genre = str(profile.get("genre") or "学术文本")
     domain = str(profile.get("domain") or "翻译实践")
+    genre_en, domain_en = _english_report_metadata(genre, domain)
     abstract_zh = (
         f"本报告基于《{project_name}》英汉翻译项目。项目源文本属于{genre}，"
         f"涉及{domain}，共记录 {stats.get('total_segments', 0)} 个翻译片段。"
@@ -1881,12 +2883,12 @@ def build_report_matter(
     )
     abstract_en = (
         f"This report examines the English-Chinese translation project {project_name}. "
-        f"The source is a {genre} text in the field of {domain}, and the recorded scope "
-        f"contains {stats.get('total_segments', 0)} segments. The report discusses "
-        f"{len(cases)} traceable cases concerning information structure in complex "
-        "sentences, conceptual terminology, and rhetorical expression. Its conclusions "
-        "are limited to the saved source, translation, terminology, review, and workflow "
-        "records; unrecorded intentions, client feedback, and tool use are not inferred."
+        f"The source text is {genre_en} in {domain_en}; the translated portion contains "
+        f"{stats.get('total_segments', 0)} segments. Through {len(cases)} textually "
+        "traceable examples, the report examines information structure in complex "
+        "sentences, the contextual treatment of key concepts, and the reproduction of "
+        "metaphor and evaluative meaning. The discussion distinguishes observable "
+        "source-target relations from undocumented revision motives and reader effects."
     )
     keywords_zh = [x for x in (genre, domain, "英汉翻译", "案例分析") if x][:4]
     keywords_en = ["English-Chinese translation", "translation practice",
@@ -1902,9 +2904,10 @@ def build_report_matter(
              for item in structure.get("front_matter") or []]
 
     references = []
-    for source in (literature_sources_artifact or {}).get("sources") or []:
-        if not source.get("citation_allowed"):
-            continue
+    literature_sources = [source for source in
+                          (literature_sources_artifact or {}).get("sources") or []
+                          if source.get("citation_allowed")]
+    for source in literature_sources:
         citation = source.get("citation_metadata") or {}
         visible = citation.get("bibliography") or citation.get("full")
         if visible:
@@ -1933,7 +2936,11 @@ def build_report_matter(
             content = appendix_pairs or "当前项目没有可用于附录的原译文对照记录。"
         elif role == "appendix" and "术语" in title:
             content = appendix_terms or "本项目未记录适用的主要术语表。"
-        back.append({**item, "content": content})
+        visible_title = title.replace("《XXX》", f"《{project_name}》")
+        visible_title = re.sub(
+            r"\s*[（(]如果有\s*[，,、]?\s*另起一页[）)]\s*$", "", visible_title)
+        back.append({**item, "title": visible_title, "content": content})
+    literature_status = "complete" if literature_sources else "literature_required"
     return {
         "project_title": project_name,
         "front_matter": front,
@@ -1946,7 +2953,10 @@ def build_report_matter(
             "references": references,
             "acknowledgements": "需要用户补充致谢正文。",
             "appendices": back,
+            "literature_status": literature_status,
+            "literature_source_count": len(literature_sources),
         },
+        "literature_status": literature_status,
     }
 
 
@@ -2026,6 +3036,16 @@ def build_report_artifact(
         "template_contract_version": constraints.get("template_contract_version") or
         (template_contract or {}).get("schema_version"),
         "renderer_version": report_template.RENDERER_VERSION,
+        "case_presentation_version": case_presentation.VERSION,
+        "report_stage": constraints.get("report_stage") or "final_report",
+        "case_policy": dict(constraints.get("case_policy") or {}),
+        "final_case_policy": {
+            "final_case_eligible_field": True,
+            "contrast_ready_field": True,
+            "contrast_types": ["authentic", "synthetic"],
+            "formal_case_types": ["authentic_revision", "synthetic_contrast"],
+            "translation_decision_visible_allowed": False,
+        } if (constraints.get("report_stage") or "final_report") == "final_report" else {},
         "template_contract": template_contract,
         "project_title": matter.get("project_title"),
         "front_matter": list(matter.get("front_matter") or
@@ -2036,18 +3056,85 @@ def build_report_artifact(
         "report": dict(matter.get("report") or {}),
         "case_labels": {case_id: f"例[{index}]"
                         for index, case_id in enumerate(case_order, start=1)},
+        "case_types": {str(x.get("case_id")): str(x.get("case_type") or
+                                                    "authentic_revision")
+                       for x in (selected_cases or {}).get("cases") or []},
         "report_status": "draft",
         "source_markdown_hash": academic_evidence.stable_hash(report_md),
     }
     if selected_cases is not None and evidence is not None:
         artifact["case_nodes"] = case_nodes
+        artifact["case_presentations"] = [dict(node.get("presentation") or {})
+                                          for node in case_nodes]
         artifact["case_counts"] = {
             "selected_case_count": len((selected_cases or {}).get("cases") or []),
             "structured_case_node_count": len(case_nodes),
+            "unique_case_count": len({str(node.get("case_id")) for node in case_nodes}),
+            "focused_case_count": sum(bool((node.get("focus") or {}).get("source")
+                                              and (node.get("focus") or {}).get("target"))
+                                      for node in case_nodes),
+            "provenance_safe_case_count": len({
+                str(node.get("case_id")) for node in case_nodes
+                if node.get("visible") and node.get("provenance_bound")}),
             "unique_provenance_bound_visible_case_count": len({
                 str(node.get("case_id")) for node in case_nodes
                 if node.get("visible") and node.get("provenance_bound")}),
         }
+        selected_type_counts = Counter(
+            str(item.get("case_type") or "authentic_revision")
+            for item in (selected_cases or {}).get("cases") or [])
+        structured_type_counts = Counter(
+            str(node.get("case_type") or "authentic_revision")
+            for node in case_nodes)
+        artifact["case_counts"].update({
+            "authentic_revision_case_count": selected_type_counts.get(
+                "authentic_revision", 0),
+            "translation_decision_case_count": selected_type_counts.get(
+                "translation_decision", 0),
+            "synthetic_contrast_case_count": selected_type_counts.get(
+                "synthetic_contrast", 0),
+            "legacy_synthetic_contrast_case_count": sum(
+                item.get("case_type") == "synthetic_contrast"
+                and item.get("baseline_origin") == "legacy_analytical_draft"
+                for item in (selected_cases or {}).get("cases") or []),
+            "newly_generated_synthetic_contrast_case_count": sum(
+                item.get("case_type") == "synthetic_contrast"
+                and item.get("baseline_origin") == "newly_generated"
+                for item in (selected_cases or {}).get("cases") or []),
+            "structured_authentic_revision_case_count": structured_type_counts.get(
+                "authentic_revision", 0),
+            "structured_translation_decision_case_count": structured_type_counts.get(
+                "translation_decision", 0),
+            "structured_synthetic_contrast_case_count": structured_type_counts.get(
+                "synthetic_contrast", 0),
+        })
+        final_cases = [item for item in (selected_cases or {}).get("cases") or []
+                       if item.get("case_type") in {
+                           "authentic_revision", "synthetic_contrast"}]
+        final_nodes = [node for node in case_nodes if node.get("case_type") in {
+            "authentic_revision", "synthetic_contrast"}]
+        synthetic_nodes = [node for node in final_nodes
+                           if node.get("case_type") == "synthetic_contrast"]
+        authentic_nodes = [node for node in final_nodes
+                           if node.get("case_type") == "authentic_revision"]
+        def exact_label_count(nodes: Iterable[Mapping[str, Any]], label: str) -> int:
+            pattern = re.compile(rf"^\s*\*{{0,2}}{re.escape(label)}\*{{0,2}}\s*[：:]",
+                                 re.MULTILINE)
+            return sum(bool(pattern.search(str(node.get("content") or ""))) for node in nodes)
+        artifact["case_counts"].update({
+            "final_case_count": len(final_cases),
+            "contrast_case_count": sum(bool(item.get("contrast_ready"))
+                                         for item in final_cases),
+            "contrast_ready_case_count": sum(bool(item.get("contrast_ready"))
+                                               for item in final_cases),
+            "translation_decision_visible_count": structured_type_counts.get(
+                "translation_decision", 0),
+            "synthetic_label_count": exact_label_count(
+                synthetic_nodes, "模拟初译"),
+            "authentic_initial_label_count": exact_label_count(
+                authentic_nodes, "初译"),
+            "rewrite_label_count": exact_label_count(final_nodes, "改译"),
+        })
     artifact["content_hash"] = academic_evidence.stable_hash(
         {k: v for k, v in artifact.items() if k != "content_hash"})
     return artifact
@@ -2058,11 +3145,28 @@ _QUOTE_LINE = re.compile(
     r"([A-Za-z0-9_-]+)\]:\s*(.*)$", re.MULTILINE)
 
 
+def _case_focus_for_assembly(
+    case: Mapping[str, Any], segment: Mapping[str, Any], evidence: Mapping[str, Any],
+) -> Dict[str, Any]:
+    if case.get("case_type") == "synthetic_contrast":
+        baseline = (case.get("synthetic_baseline") or {}).get("text")
+        segment = {
+            **segment,
+            "source": case.get("source_text") or segment.get("source"),
+            "initial_target": baseline,
+            "final_target": case.get("target_contrast_text") or
+            case.get("final_target") or segment.get("final_target"),
+        }
+    return dict(case.get("focus") or academic_evidence.build_case_focus(
+        dict(case), dict(segment),
+        (evidence.get("project_evidence") or {}).get("glossary") or []))
+
+
 def normalize_report_quotes(
     report_md: str, evidence: Dict[str, Any],
     selected_cases: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Deterministically replace segment quotes with the exact saved text.
+    """Deterministically replace case quotes with exact provenance-bound focus text.
 
     The writer is instructed to copy quotes verbatim, but a bounded repair loop
     cannot guarantee byte-exact output from every provider.  This pass makes
@@ -2080,14 +3184,22 @@ def normalize_report_quotes(
             segment = segs.get(str(selected_case.get("source_segment_id") or case_id))
             if not segment:
                 return match.group(0)
-            exact = segment[{"SOURCE": "source", "INITIAL": "initial_target",
-                             "TARGET": "final_target"}[kind]]
+            focus = _case_focus_for_assembly(selected_case, segment, evidence)
+            span = focus.get({"SOURCE": "source_span", "INITIAL": "initial_span",
+                              "TARGET": "target_span"}[kind]) or {}
+            if kind == "INITIAL" and selected_case.get(
+                    "case_type") == "translation_decision":
+                return ""
+            exact = span.get("text") or segment[{
+                "SOURCE": "source", "INITIAL": "initial_target",
+                "TARGET": "final_target"}[kind]]
         else:
             case = selected.get(case_id) or {}
             exact = {
                 "SYNTHETIC_SOURCE": case.get("source_text"),
                 "SIMULATED": case.get("synthetic_baseline", {}).get("text"),
-                "OPTIMIZED": case.get("optimized_translation", {}).get("text"),
+                "OPTIMIZED": case.get("final_target") or
+                case.get("optimized_translation", {}).get("text"),
             }[kind]
             if not exact:
                 return match.group(0)
@@ -2135,21 +3247,15 @@ def _ensure_case_group_headings(
     report_md: str, selected_cases: Optional[Dict[str, Any]],
     outline: Optional[Dict[str, Any]],
 ) -> str:
-    """Make mixed authentic/synthetic case provenance visible in a configured section."""
-    selected = {str(x.get("case_id")): x
-                for x in (selected_cases or {}).get("cases", [])}
-    groups = {
-        "真实修订案例": [case_id for case_id, item in selected.items()
-                       if item.get("case_type") == "authentic_revision"],
-        "合成对比案例": [case_id for case_id, item in selected.items()
-                       if item.get("case_type") == "synthetic_contrast"],
-    }
-    if not all(groups.values()):
+    """Ensure evidence-derived difficulty/strategy groups remain visible."""
+    portfolio = (selected_cases or {}).get("case_portfolio") or {}
+    groups = list(portfolio.get("groups") or [])
+    if not groups:
         return report_md
     planned = next((x for x in (outline or {}).get("sections", [])
-                    if all(case_id in (x.get("cases") or [])
-                           for case_ids in groups.values() for case_id in case_ids)), None)
-    section_id = str((planned or {}).get("section_id") or "1")
+                    if x.get("role") == "case_analysis"), None)
+    section_id = str((planned or {}).get("section_id") or "3")
+    problem_root, solution_root = thesis_constraints.case_subsection_roots(planned or {})
     section_match = re.search(
         rf"^##\s+{re.escape(section_id)}(?:\s|[.．、]|$).*?$",
         report_md, re.MULTILINE)
@@ -2159,21 +3265,65 @@ def _ensure_case_group_headings(
     body_end = section_match.end() + (next_section.start() if next_section else
                                       len(report_md) - section_match.end())
     body = report_md[section_match.end():body_end]
-    body = re.sub(
-        r"^#{3,6}\s+(真实修订案例|合成对比案例)\s*$",
-        r"### \1", body, flags=re.MULTILINE)
+    difficulty_root = re.search(
+        rf"^###\s+{re.escape(problem_root)}(?:\s|$).*?$", body, re.MULTILINE)
+    strategy_root = re.search(
+        rf"^###\s+{re.escape(solution_root)}(?:\s|$).*?$", body, re.MULTILINE)
+    if strategy_root is None:
+        return report_md
+    if any(x.get("case_type") == "synthetic_contrast"
+           for x in (selected_cases or {}).get("cases") or []) \
+            and "<!--synthetic-methodology-->" not in body:
+        disclosure = (
+            "<!--synthetic-methodology-->\n"
+            "本项目仅保存了少量可核实的历史初译—改译记录。为使翻译策略分析具备可比较基础，"
+            "对于缺乏历史初译但具有典型分析价值的案例，本文使用经验证的模拟初译作为受控"
+            "对比材料；其中部分译法来自前期论文案例设计，并已与当前源文和当前译文重新核对。"
+            "这些模拟初译旨在呈现普通译者在初步处理过程中可能采用的合理译法，不属于"
+            "项目真实翻译历史，也不作为实际修订记录使用。\n\n"
+            "<!--synthetic-limitation-->\n"
+            "下列模拟对比只说明一种可分析的处理差异，不据此声称该处理在人类译者中的发生频率。\n\n")
+        insert_at = difficulty_root.start() if difficulty_root else 0
+        body = body[:insert_at] + disclosure + body[insert_at:]
+        difficulty_root = re.search(
+            rf"^###\s+{re.escape(problem_root)}(?:\s|$).*?$", body, re.MULTILINE)
+        strategy_root = re.search(
+            rf"^###\s+{re.escape(solution_root)}(?:\s|$).*?$", body, re.MULTILINE)
+    if difficulty_root and strategy_root:
+        insert_at = strategy_root.start()
+        missing = []
+        for group in groups:
+            subsection = _scope_case_assignment({
+                "target_subsection": group.get("strategy_subsection"),
+            }, planned or {}).get("difficulty_subsection", "")
+            if subsection and not re.search(
+                    rf"^#{{4,6}}\s+{re.escape(subsection)}(?:\s|$)", body,
+                    re.MULTILINE):
+                missing.append(
+                    f"#### {subsection} {group.get('difficulty_group')}\n\n"
+                    f"该类难点由 {int(group.get('case_count') or 0)} 个可追溯例证支持。\n\n")
+        if missing:
+            body = body[:insert_at] + "".join(missing) + body[insert_at:]
 
-    def add_heading(value: str, case_ids: List[str], text: str) -> str:
-        if re.search(rf"^###\s+{re.escape(value)}\s*$", text, re.MULTILINE):
+    def add_strategy_heading(group: Mapping[str, Any], text: str) -> str:
+        subsection = _scope_case_assignment({
+            "target_subsection": group.get("strategy_subsection"),
+        }, planned or {}).get("strategy_subsection", "")
+        if not subsection or re.search(
+                rf"^#{{4,6}}\s+{re.escape(subsection)}(?:\s|$)", text,
+                re.MULTILINE):
             return text
-        positions = [text.find(case_id) for case_id in case_ids
-                     if text.find(case_id) >= 0]
+        case_ids = [str(x) for x in group.get("case_ids") or []]
+        positions = [position for case_id in case_ids
+                     for position in (text.find(f"<!--case:{case_id}-->"),
+                                      text.find(case_id)) if position >= 0]
         position = min(positions) if positions else 0
         insert_at = text.rfind("\n\n", 0, position) + 2
-        return text[:insert_at] + f"### {value}\n\n" + text[insert_at:]
+        heading = f"#### {subsection} {group.get('strategy_group')}\n\n"
+        return text[:insert_at] + heading + text[insert_at:]
 
-    for label, case_ids in groups.items():
-        body = add_heading(label, case_ids, body)
+    for group in groups:
+        body = add_strategy_heading(group, body)
     return report_md[:section_match.end()] + body + report_md[body_end:]
 
 
@@ -2183,7 +3333,8 @@ _VISIBLE_EXAMPLE = re.compile(
 _VISIBLE_CASE_QUOTE = re.compile(
     r"^(?P<indent>\s*)[-*]\s+\*{1,2}(?P<label>SOURCE|INITIAL|TARGET|"
     r"原文|源语(?:（SOURCE）|\s*\(SOURCE\))?|初译|终译|改译|译文(?:（TARGET）|"
-    r"\s*\(TARGET\))?)\*{1,2}\s*[：:]\s*(?P<value>.+?)\s*$",
+    r"\s*\(TARGET\))?|模拟初译|模拟译法|优化译文|最终译文)\*{1,2}\s*[：:]\s*"
+    r"(?P<value>.+?)\s*$",
     re.MULTILINE | re.IGNORECASE)
 
 
@@ -2232,10 +3383,19 @@ def _realize_visible_case_examples(
     plan_by_id = case_analysis.plan_index(case_analysis_plans or {})
     candidates = []
     for case_id, case in selected_by_id.items():
-        if case.get("case_type") == "synthetic_contrast":
-            continue
         segment_id = str(case.get("source_segment_id") or case_id)
         segment = segments.get(segment_id) or {}
+        if case.get("case_type") == "synthetic_contrast":
+            segment = {
+                **segment,
+                "segment_id": segment_id,
+                "source": case.get("source_text") or segment.get("source"),
+                "final_target": case.get("target_contrast_text") or
+                case.get("final_target") or (
+                    (case.get("optimized_translation") or {}).get("text")
+                    if isinstance(case.get("optimized_translation"), Mapping)
+                    else case.get("optimized_translation")),
+            }
         if case_id and segment.get("source"):
             candidates.append((case_id, segment))
     chunks = []
@@ -2244,9 +3404,13 @@ def _realize_visible_case_examples(
     for index, match in enumerate(matches):
         next_example = matches[index + 1].start() \
             if index + 1 < len(matches) else len(report_md)
-        next_heading = re.search(r"^#{3,6}\s+", report_md[match.end():], re.MULTILINE)
+        next_heading = re.search(r"^#{2,6}\s+", report_md[match.end():], re.MULTILINE)
         heading_end = match.end() + next_heading.start() if next_heading else len(report_md)
-        end = min(next_example, heading_end)
+        next_summary = re.search(
+            r"^\s*\*{1,2}本组小结\*{1,2}", report_md[match.end():], re.MULTILINE)
+        summary_end = match.end() + next_summary.start() \
+            if next_summary else len(report_md)
+        end = min(next_example, heading_end, summary_end)
         block = report_md[match.start():end]
         block = re.sub(r"例\[\d+\]", f"例[{index + 1}]", block, count=1)
         explicit = [case_id for case_id in re.findall(
@@ -2274,61 +3438,115 @@ def _realize_visible_case_examples(
             continue
         selected_case = selected_by_id[case_id]
         case_type = str(selected_case.get("case_type") or "authentic_revision")
+        focus = _case_focus_for_assembly(selected_case, segment, evidence)
+        plan = plan_by_id.get(case_id) or {}
 
         def replace_quote(item: re.Match) -> str:
             label = str(item.group("label") or "").upper()
             if label in {"SOURCE", "原文", "源语（SOURCE）", "源语(SOURCE)"}:
-                kind, value = "SOURCE", segment.get("source")
-            elif label in {"INITIAL", "初译"}:
-                kind, value = "INITIAL", segment.get("initial_target")
+                kind, value = "SOURCE", (focus.get("source_span") or {}).get("text")
+            elif label in {"INITIAL", "初译", "模拟初译", "模拟译法"}:
+                if case_type == "translation_decision":
+                    return ""
+                kind, value = "INITIAL", (focus.get("initial_span") or {}).get("text")
             else:
-                kind, value = "TARGET", segment.get("final_target")
+                kind, value = "TARGET", (focus.get("target_span") or {}).get("text")
             return f"> [{kind} {case_id}]: {value}" if value else item.group(0)
 
         block = _VISIBLE_CASE_QUOTE.sub(replace_quote, block)
-        if case_type == "translation_decision":
-            block = re.sub(r"TARGET（初译与终译一致）", "译文", block)
-            block = re.sub(r"该案例初译与终译一致", "该案例的已保存译文未发生变更", block)
-        block = re.sub(
-            r"例\[(\d+)\]\s*（(?:真实修订案例|翻译决策案例|合成对比案例)）\s*[：:]?",
-            r"例[\1]：", block, count=1)
-        block = re.sub(r"<!--case:[A-Za-z0-9_.:-]+-->\s*", "", block)
-        marker_at = block.find("\n")
-        block = (block + f"\n<!--case:{case_id}-->") if marker_at < 0 else (
-            block[:marker_at + 1] + f"<!--case:{case_id}-->\n" + block[marker_at + 1:])
         heading_ids = re.findall(
             r"^#{3,6}\s+(\d+(?:\.\d+)*)\b", report_md[:match.start()], re.MULTILINE)
         actual_subsection = heading_ids[-1] if heading_ids else ""
-        assignment = _case_assignment_for_plan(case_id, plan_by_id.get(case_id) or {})
-        analysis = _VISIBLE_CASE_QUOTE.sub("", block)
-        analysis = re.sub(r"<!--case:[^>]+-->", "", analysis)
-        analysis = re.sub(r"^.*?例\[\d+\].*?$", "", analysis, count=1,
-                          flags=re.MULTILINE).strip()
-        nodes.append({
+        assignment = _case_assignment_for_plan(
+            case_id, plan, selected_case)
+        extracted = case_presentation.analysis_fragments_from_markdown(block)
+        analysis_fields = {
+            "difficulty": plan.get("problem") or {"statement": focus.get("issue")},
+            "strategy": selected_case.get("strategy_group"),
+            "rationale": plan.get("decision_rationale"),
+            "effect": plan.get("translation_effect"),
+            "bounded_claim": plan.get("bounded_conclusion"),
+            "evidence": {
+                "level": plan.get("evidence_level"),
+                "can_support": list(plan.get("can_support") or []),
+                "cannot_support": list(plan.get("cannot_support") or []),
+            },
+            "visible_analysis": extracted.get("analysis") or [],
+            "limits": extracted.get("limits") or [],
+            "note": extracted.get("note"),
+        }
+        node = {
             "type": "case_example",
             "case_id": case_id,
             "case_type": case_type,
+            "baseline_origin": selected_case.get("baseline_origin")
+            if case_type == "synthetic_contrast" else None,
             "chapter_id": actual_subsection.split(".", 1)[0] if actual_subsection else "3",
             "subsection_id": actual_subsection or assignment["target_subsection"],
             "example_number": index + 1,
-            "source": segment.get("source"),
-            "initial_target": segment.get("initial_target")
+            "research_question_ids": list(selected_case.get("research_questions") or []),
+            "source": (focus.get("source_span") or {}).get("text"),
+            "initial_target": (focus.get("initial_span") or {}).get("text")
             if case_type == "authentic_revision" else None,
-            "target": segment.get("final_target"),
-            "analysis": analysis,
-            "content": block.strip(),
+            "synthetic_baseline": {
+                **dict(selected_case.get("synthetic_baseline") or {}),
+                "text": (focus.get("initial_span") or {}).get("text") or
+                (selected_case.get("synthetic_baseline") or {}).get("text"),
+            } if case_type == "synthetic_contrast" else None,
+            "target": (focus.get("target_span") or {}).get("text"),
+            "focus": {
+                "source": focus.get("source_span"),
+                "initial": focus.get("initial_span")
+                if case_type != "translation_decision" else None,
+                "target": focus.get("target_span"),
+                "issue": focus.get("issue"),
+                "signal": focus.get("signal"),
+            },
+            "difficulty": analysis_fields["difficulty"],
+            "strategy": analysis_fields["strategy"],
+            "effect": analysis_fields["effect"],
+            "bounded_claim": analysis_fields["bounded_claim"],
+            "evidence": analysis_fields["evidence"],
+            "translation_delta": plan.get("translation_delta") or {},
+            "final_case_eligible": bool(selected_case.get("final_case_eligible")),
+            "contrast_ready": bool(selected_case.get("contrast_ready")),
+            "contrast_type": selected_case.get("contrast_type"),
+            "synthetic_evidence": dict(selected_case.get("synthetic_evidence") or {})
+            if case_type == "synthetic_contrast" else None,
+            "analysis_fields": analysis_fields,
             **assignment,
             "visible": True,
-            "provenance_bound": True,
+            "provenance_bound": bool(
+                (focus.get("source_span") or {}).get("text") and
+                (focus.get("target_span") or {}).get("text")),
             "provenance": {
                 "case_id": case_id,
                 "source_segment_id": str(
                     selected_case.get("source_segment_id") or case_id),
                 **dict(selected_case.get("provenance") or {}),
             },
-        })
+        }
+        presentation = case_presentation.build_case_presentation(node)
+        block = case_presentation.render_case_presentation_markdown(presentation)
+        hidden = []
+        for marker in re.findall(
+                r"<!--(?!(?:case|rq):)[A-Za-z0-9_-]+:[A-Za-z0-9_.:-]+-->",
+                report_md[match.start():end]):
+            if marker not in hidden:
+                hidden.append(marker)
+        hidden.extend(
+            f"<!--rq:{rq_id}-->" for rq_id in selected_case.get(
+                "research_questions") or [])
+        if hidden:
+            block += "\n" + "\n".join(hidden)
+        node.update(
+            presentation=presentation,
+            analysis=presentation["analysis"],
+            content=block.strip(),
+        )
+        nodes.append(node)
         chunks.append(report_md[cursor:match.start()])
-        chunks.append(block)
+        chunks.append(block.rstrip() + "\n\n")
         cursor = end
     chunks.append(report_md[cursor:])
     return "".join(chunks), nodes
@@ -2339,6 +3557,29 @@ def _normalize_visible_case_examples(
 ) -> str:
     """Backward-compatible string surface for case realization."""
     return _realize_visible_case_examples(report_md, evidence, selected_cases)[0]
+
+
+_USER_FACING_LANGUAGE_REPLACEMENTS = (
+    ("句法 core cases", "句法类主要例证"),
+    ("rhetoric core cases", "修辞类主要例证"),
+    ("core 与 supporting 案例", "主要例证与补充例证"),
+    ("core cases", "主要例证"),
+    ("core case", "主要例证"),
+    ("translation-decision cases", "翻译决策类案例"),
+    ("authentic revision", "真实修订案例"),
+    ("source/target", "原文与译文"),
+    ("source 与 target", "原文与译文"),
+    ("最小充分 focus", "最小充分语境片段"),
+    ("完整 segment", "完整文本片段"),
+)
+
+
+def _normalize_user_facing_language(text: Any) -> str:
+    """Translate planner/debug labels into ordinary thesis wording."""
+    normalized = str(text or "")
+    for old, new in _USER_FACING_LANGUAGE_REPLACEMENTS:
+        normalized = normalized.replace(old, new)
+    return normalized
 
 
 def finalize_report_tokens(
@@ -2360,7 +3601,11 @@ def finalize_report_tokens(
     normalized = normalize_report_quotes(normalized, evidence, selected_cases)
     normalized = _ensure_case_group_headings(normalized, selected_cases, outline)
     normalized = _expand_report_stat_tokens(normalized, evidence, selected_cases, outline)
-    return re.sub(r"基于\s*基于", "基于", normalized)
+    normalized = re.sub(r"基于\s*基于", "基于", normalized)
+    # Internal portfolio labels stay in structured artifacts.  The visible
+    # thesis should use ordinary academic wording instead of planner/debug
+    # vocabulary, while source excerpts and internal JSON remain untouched.
+    return _normalize_user_facing_language(normalized)
 
 
 def _semantic_review(
@@ -2892,13 +4137,96 @@ def run_academic_pipeline(
             evidence = _save_artifact(state, artifact_dir, "evidence", evidence_new,
                                       evidence_dep, VERSIONS["evidence_version"])
 
+        legacy_recovery: Dict[str, Any] = {
+            "schema_version": VERSIONS["legacy_recovery_version"],
+            "pipeline_status": "not_configured", "metrics": {}, "items": [],
+            "content_hash": academic_evidence.stable_hash([]),
+        }
+        legacy_document = str(settings.get("legacy_case_document") or
+                              settings.get("legacy_case_document_path") or "").strip()
+        if legacy_document:
+            stage("legacy_case_inventory", "【学术写作】恢复旧论文中的分析案例...")
+            legacy_path = Path(legacy_document).expanduser().resolve()
+            if not legacy_path.is_file():
+                raise FileNotFoundError(f"legacy case document not found: {legacy_path}")
+            inventory_new = legacy_cases.parse_legacy_case_inventory(legacy_path)
+            inventory_dep = academic_evidence.stable_hash({
+                "document": str(legacy_path),
+                "size": legacy_path.stat().st_size,
+                "mtime_ns": legacy_path.stat().st_mtime_ns,
+                "version": VERSIONS["legacy_inventory_version"],
+            })
+            legacy_inventory = _load_valid_artifact(
+                state, artifact_dir, "legacy_inventory", inventory_dep,
+                VERSIONS["legacy_inventory_version"])
+            if legacy_inventory is None:
+                legacy_inventory = _save_artifact(
+                    state, artifact_dir, "legacy_inventory", inventory_new,
+                    inventory_dep, VERSIONS["legacy_inventory_version"])
+            qa_case_ids = {"TD-0126", "TD-0047", "TD-0003"}
+            qa_source_ids = {str(item.get("source_segment_id") or "")
+                             for item in evidence.get(
+                                 "translation_decision_candidates") or []
+                             if str(item.get("case_id") or "") in qa_case_ids}
+            manual_review_value = str(settings.get(
+                "legacy_case_manual_review") or "").strip()
+            manual_review_path = Path(manual_review_value).expanduser().resolve() \
+                if manual_review_value else None
+            recovery_dep = academic_evidence.stable_hash({
+                "inventory": legacy_inventory["content_hash"],
+                "evidence": evidence["content_hash"],
+                "qa_source_ids": sorted(qa_source_ids),
+                "manual_review": ({
+                    "path": str(manual_review_path),
+                    "size": manual_review_path.stat().st_size,
+                    "mtime_ns": manual_review_path.stat().st_mtime_ns,
+                } if manual_review_path and manual_review_path.is_file() else None),
+                "version": VERSIONS["legacy_recovery_version"],
+            })
+            legacy_recovery = _load_valid_artifact(
+                state, artifact_dir, "legacy_recovery", recovery_dep,
+                VERSIONS["legacy_recovery_version"])
+            if legacy_recovery is None:
+                legacy_recovery = legacy_cases.recover_legacy_cases(
+                    legacy_inventory, evidence, call_llm, provider, api_key, model,
+                    qa_source_segment_ids=qa_source_ids)
+                if manual_review_path and manual_review_path.is_file():
+                    manual_review = _read_json(manual_review_path) or {}
+                    legacy_recovery = legacy_cases.apply_manual_reviews(
+                        legacy_recovery, manual_review)
+                legacy_recovery = _save_artifact(
+                    state, artifact_dir, "legacy_recovery", legacy_recovery,
+                    recovery_dep, VERSIONS["legacy_recovery_version"])
+            recovery_report_path = artifact_dir / "legacy-case-recovery-report.md"
+            recovery_report_path.write_text(
+                legacy_cases.recovery_report_markdown(legacy_recovery), encoding="utf-8")
+            _state(state)["artifacts"]["legacy_recovery_report"] = {
+                "file": recovery_report_path.name,
+                "version": VERSIONS["legacy_recovery_version"],
+                "updated_at": _now(),
+            }
+
         synthetic_policy = str(settings.get("case_selection_policy") or "mixed")
         if synthetic_policy not in {"authentic_only", "synthetic_only", "mixed"}:
             synthetic_policy = "mixed"
         synthetic_enabled = synthetic_policy != "authentic_only"
+        pause_new_synthetic = bool(settings.get("pause_new_synthetic_generation"))
         max_scan = max(1, int(settings.get("synthetic_max_scan") or 16))
         max_opportunities = max(1, int(settings.get(
             "synthetic_max_opportunities") or 8))
+        report_policy = thesis_constraints.case_policy(settings)
+        if report_policy.get("report_stage") == "final_report" and synthetic_enabled \
+                and not pause_new_synthetic:
+            # Final cases cannot fall back to decision-only examples. Give the
+            # four-gate pipeline a bounded replacement pool larger than the
+            # requested portfolio; rejected baselines are never repaired in place.
+            candidate_pool_size = len(evidence.get("candidate_cases") or []) + len(
+                evidence.get("translation_decision_candidates") or [])
+            requested_target = int(report_policy.get("target_cases") or 24)
+            generation_budget = min(
+                max(candidate_pool_size, 1), max(requested_target + 8, requested_target * 3))
+            max_scan = max(max_scan, generation_budget)
+            max_opportunities = max(max_opportunities, generation_budget)
 
         stage("synthetic_opportunities", "【学术写作】挖掘合成对比案例的翻译难点...")
         synthetic_opportunity_dep = academic_evidence.stable_hash({
@@ -2912,7 +4240,7 @@ def run_academic_pipeline(
         if synthetic_opportunities is None:
             synthetic_opportunities = synthetic_cases.mine_error_opportunities(
                 evidence, call_llm, provider, api_key, model, max_scan, max_opportunities) \
-                if synthetic_enabled else {
+                if synthetic_enabled and not pause_new_synthetic else {
                     "schema_version": VERSIONS["synthetic_opportunity_version"],
                     "items": [], "content_hash": academic_evidence.stable_hash([]),
                     "total_source_segments": len(evidence.get(
@@ -2933,7 +4261,12 @@ def run_academic_pipeline(
             VERSIONS["synthetic_baseline_version"])
         if synthetic_baselines is None:
             synthetic_baselines = synthetic_cases.generate_baselines(
-                synthetic_opportunities, call_llm, provider, api_key, model)
+                synthetic_opportunities, call_llm, provider, api_key, model) \
+                if not pause_new_synthetic else {
+                    "schema_version": VERSIONS["synthetic_baseline_version"],
+                    "items": [], "generated": 0, "pipeline_status": "paused",
+                    "content_hash": academic_evidence.stable_hash([]),
+                }
             synthetic_baselines = _save_artifact(
                 state, artifact_dir, "synthetic_baselines", synthetic_baselines,
                 synthetic_baseline_dep, VERSIONS["synthetic_baseline_version"])
@@ -2948,13 +4281,18 @@ def run_academic_pipeline(
             VERSIONS["synthetic_error_manifest_version"])
         if synthetic_error_manifest is None:
             synthetic_error_manifest = synthetic_cases.build_error_manifest(
-                synthetic_baselines, call_llm, provider, api_key, model)
+                synthetic_baselines, call_llm, provider, api_key, model) \
+                if not pause_new_synthetic else {
+                    "schema_version": VERSIONS["synthetic_error_manifest_version"],
+                    "items": [], "pipeline_status": "paused",
+                    "content_hash": academic_evidence.stable_hash([]),
+                }
             synthetic_error_manifest = _save_artifact(
                 state, artifact_dir, "synthetic_error_manifest",
                 synthetic_error_manifest, synthetic_error_dep,
                 VERSIONS["synthetic_error_manifest_version"])
 
-        stage("synthetic_optimization", "【学术写作】生成并约束 AI 优化译文...")
+        stage("synthetic_optimization", "【学术写作】绑定项目当前正式译文并进行对照...")
         synthetic_optimizer_dep = academic_evidence.stable_hash({
             "errors": synthetic_error_manifest["content_hash"],
             "terminology": academic_evidence.stable_hash(
@@ -2967,7 +4305,12 @@ def run_academic_pipeline(
         if synthetic_optimized is None:
             synthetic_optimized = synthetic_cases.optimize_translations(
                 synthetic_error_manifest, call_llm, provider, api_key, model,
-                evidence.get("project_evidence", {}).get("glossary", []))
+                evidence.get("project_evidence", {}).get("glossary", []),
+                evidence=evidence) if not pause_new_synthetic else {
+                    "schema_version": VERSIONS["synthetic_optimizer_version"],
+                    "items": [], "pipeline_status": "paused",
+                    "content_hash": academic_evidence.stable_hash([]),
+                }
             synthetic_optimized = _save_artifact(
                 state, artifact_dir, "synthetic_optimized", synthetic_optimized,
                 synthetic_optimizer_dep, VERSIONS["synthetic_optimizer_version"])
@@ -2982,7 +4325,12 @@ def run_academic_pipeline(
             VERSIONS["synthetic_validation_version"])
         if synthetic_validation is None:
             synthetic_validation = synthetic_cases.validate_synthetic_cases(
-                synthetic_optimized, call_llm, provider, api_key, model, evidence)
+                synthetic_optimized, call_llm, provider, api_key, model, evidence) \
+                if not pause_new_synthetic else {
+                    "schema_version": VERSIONS["synthetic_validation_version"],
+                    "items": [], "metrics": {}, "pipeline_status": "paused",
+                    "content_hash": academic_evidence.stable_hash([]),
+                }
             synthetic_validation = _save_artifact(
                 state, artifact_dir, "synthetic_validation", synthetic_validation,
                 synthetic_validation_dep, VERSIONS["synthetic_validation_version"])
@@ -3068,17 +4416,29 @@ def run_academic_pipeline(
                 state, artifact_dir, "argument_plan", argument_plan, argument_dep,
                 VERSIONS["argument_plan_version"])
 
-        template_case_minimum = int((
+        report_case_policy = {
+            **thesis_constraints.case_policy(settings),
+            **dict((research_model.get("report_constraints") or {}).get(
+                "case_policy") or {}),
+        }
+        report_stage = str(report_case_policy.get("report_stage") or "final_report")
+        template_requirement = (
             ((research_model.get("template_contract") or {}).get(
-                "document_structure") or {}).get("case_requirement") or {}
-        ).get("minimum_cases") or 0)
+                "document_structure") or {}).get("case_requirement") or {})
+        template_case_minimum = int(template_requirement.get("minimum_cases") or 0) \
+            if template_requirement.get("applies_to_report_stage") == report_stage else 0
         effective_case_limit = max(
-            1, int(settings.get("case_limit") or 5), template_case_minimum)
+            1, int(settings.get(f"{report_stage}_target_cases") or
+                   report_case_policy.get("target_cases") or 1),
+            template_case_minimum)
+        combined_synthetic = legacy_cases.merge_synthetic_artifacts(
+            legacy_recovery, synthetic_validation)
         case_dep = academic_evidence.stable_hash({
             "argument": argument_plan["content_hash"], "evidence": evidence["content_hash"],
-            "synthetic": synthetic_validation["content_hash"],
+            "synthetic": combined_synthetic["content_hash"],
             "policy": synthetic_policy,
             "limit": effective_case_limit,
+            "report_case_policy": report_case_policy,
             "version": VERSIONS["case_selection_version"],
         })
         selected_cases = _load_valid_artifact(
@@ -3088,14 +4448,78 @@ def run_academic_pipeline(
             selected_cases = select_academic_cases(
                 research_model, argument_plan, evidence,
                 limit=effective_case_limit,
-                synthetic_artifact=synthetic_validation, policy=synthetic_policy,
+                synthetic_artifact=combined_synthetic, policy=synthetic_policy,
                 preferred_authentic_count=max(1, int(settings.get(
                     "preferred_authentic_case_count") or 3)),
                 minimum_authentic_count=max(1, int(settings.get(
-                    "minimum_authentic_case_count") or 2)))
+                    "minimum_authentic_case_count") or 2)),
+                report_case_policy=report_case_policy)
             selected_cases = _save_artifact(
                 state, artifact_dir, "selected_cases", selected_cases, case_dep,
                 VERSIONS["case_selection_version"])
+
+        if report_stage == "final_report":
+            portfolio_path = artifact_dir / "final-contrast-case-portfolio.md"
+            portfolio_path.write_text(
+                final_contrast_portfolio_markdown(selected_cases), encoding="utf-8")
+            _state(state)["artifacts"]["final_contrast_portfolio"] = {
+                "file": portfolio_path.name,
+                "version": "final-contrast-portfolio-v1",
+                "updated_at": _now(),
+            }
+
+            # A final report must not be rendered in a knowingly incomplete
+            # case shape.  The portfolio preview remains available for
+            # replacement-candidate review; Chapter 3 and DOCX generation
+            # stop here until the hard contrast contract is satisfied.
+            if report_policy.get("contrast_required"):
+                final_count = int(selected_cases.get("final_case_count") or 0)
+                contrast_count = int(selected_cases.get(
+                    "contrast_ready_case_count") or 0)
+                minimum = int(report_policy.get("minimum_cases") or 20)
+                decision_visible = int(selected_cases.get(
+                    "translation_decision_visible_count") or 0)
+                if final_count < minimum or contrast_count != final_count \
+                        or decision_visible:
+                    message = (
+                        f"Final Report case contract blocked: final={final_count}, "
+                        f"contrast_ready={contrast_count}, minimum={minimum}, "
+                        f"translation_decision_visible={decision_visible}."
+                    )
+                    academic.update(
+                        status="blocked", quality_status="fail",
+                        current_stage="final_case_policy_gate",
+                        report_status="blocked_final_case_policy",
+                        last_error=message, updated_at=_now())
+                    state["report_status"] = "blocked_final_case_policy"
+                    state["p3_done"] = False
+                    save_state(state)
+                    return ""
+
+        # Role assignment happens inside case selection, after the argument
+        # planner has named candidates. Rebind major claims to the final
+        # selected core portfolio before any downstream artifact consumes the
+        # plan, preventing stale candidate IDs from reaching the outline,
+        # report, or validator.
+        argument_plan, plan_changed = _reconcile_argument_plan_with_portfolio(
+            argument_plan, selected_cases)
+        if plan_changed:
+            argument_plan = _save_artifact(
+                state, artifact_dir, "argument_plan", argument_plan, argument_dep,
+                VERSIONS["argument_plan_version"])
+            case_dep = academic_evidence.stable_hash({
+                "argument": argument_plan["content_hash"],
+                "evidence": evidence["content_hash"],
+                "synthetic": combined_synthetic["content_hash"],
+                "policy": synthetic_policy,
+                "limit": effective_case_limit,
+                "report_case_policy": report_case_policy,
+                "version": VERSIONS["case_selection_version"],
+            })
+            selected_cases = _save_artifact(
+                state, artifact_dir, "selected_cases", selected_cases, case_dep,
+                VERSIONS["case_selection_version"])
+            save_state(state)
 
         stage("case_analysis", "【学术写作】规划案例分析证据契约（提纲子步骤）...")
         human_evidence_artifact = {
@@ -3192,6 +4616,21 @@ def run_academic_pipeline(
                 }
             normalized_content = _ensure_section_contract(
                 str(item.get("content") or ""), plan)
+            if str(plan.get("role") or "") == "case_analysis" and plan.get("cases"):
+                packet = _section_packet(
+                    plan, research_model, argument_plan, selected_cases, evidence,
+                    outline, prior_summaries, literature_sources_artifact,
+                    literature_evidence_artifact, literature_claims_artifact,
+                    case_plans)
+                _bound, visible_nodes = _realize_visible_case_examples(
+                    normalized_content, evidence, selected_cases, case_plans)
+                visible_ids = {str(node.get("case_id")) for node in visible_nodes}
+                missing_case_ids = [str(case_id) for case_id in plan.get("cases") or []
+                                    if str(case_id) not in visible_ids]
+                if missing_case_ids:
+                    normalized_content = _repair_missing_case_examples(
+                        normalized_content, packet, missing_case_ids,
+                        call_llm, provider, api_key, model)
             if normalized_content != item.get("content"):
                 item = {**item, "content": normalized_content,
                         "summary": re.sub(
@@ -3218,7 +4657,7 @@ def run_academic_pipeline(
         validation = academic_validator.validate_academic_report(
             report_md, evidence, research_model, argument_plan, selected_cases, outline,
             literature_sources_artifact, literature_evidence_artifact,
-            literature_claims_artifact, human_entries, synthetic_validation,
+            literature_claims_artifact, human_entries, combined_synthetic,
             report_artifact.get("template_contract"), report_artifact)
         validation = _locate_validation_issues(validation, written)
         validation_runs.append(validation)
@@ -3226,7 +4665,7 @@ def run_academic_pipeline(
             "report": academic_evidence.stable_hash(report_md),
             "evidence": evidence["content_hash"],
             "validator": VERSIONS["validator_version"],
-            "synthetic": synthetic_validation["content_hash"],
+            "synthetic": combined_synthetic["content_hash"],
             "literature_sources": literature_sources_artifact["content_hash"],
             "literature_evidence": literature_evidence_artifact["content_hash"],
             "literature_claims": literature_claims_artifact["content_hash"],
@@ -3369,7 +4808,7 @@ def run_academic_pipeline(
                 validation = academic_validator.validate_academic_report(
                     report_md, evidence, research_model, argument_plan, selected_cases, outline,
                     literature_sources_artifact, literature_evidence_artifact,
-                    literature_claims_artifact, human_entries, synthetic_validation,
+                    literature_claims_artifact, human_entries, combined_synthetic,
                     report_artifact.get("template_contract"), report_artifact)
                 validation = _locate_validation_issues(validation, written)
                 validation_runs.append(validation)
@@ -3389,7 +4828,7 @@ def run_academic_pipeline(
         validation_dep = academic_evidence.stable_hash({
             "report": academic_evidence.stable_hash(report_md),
             "evidence": evidence["content_hash"], "validator": VERSIONS["validator_version"],
-            "synthetic": synthetic_validation["content_hash"],
+            "synthetic": combined_synthetic["content_hash"],
             "literature_sources": literature_sources_artifact["content_hash"],
             "literature_evidence": literature_evidence_artifact["content_hash"],
             "literature_claims": literature_claims_artifact["content_hash"],
@@ -3440,7 +4879,7 @@ def run_academic_pipeline(
                 written, report_md, evidence, research_model, argument_plan,
                 selected_cases, outline, literature_sources_artifact,
                 literature_evidence_artifact, literature_claims_artifact,
-                synthetic_validation, case_plans, human_entries, quality_evaluation,
+                combined_synthetic, case_plans, human_entries, quality_evaluation,
                 validation, prior_summaries, call_llm, provider, api_key, model)
             _save_artifact(state, artifact_dir, "selected_cases", selected_cases,
                            case_dep, VERSIONS["case_selection_version"])
@@ -3474,7 +4913,7 @@ def run_academic_pipeline(
         validation = academic_validator.validate_academic_report(
             report_md, evidence, research_model, argument_plan, selected_cases, outline,
             literature_sources_artifact, literature_evidence_artifact,
-            literature_claims_artifact, human_entries, synthetic_validation,
+            literature_claims_artifact, human_entries, combined_synthetic,
             report_artifact.get("template_contract"), report_artifact)
         validation = _locate_validation_issues(validation, written)
         validation_runs.append(validation)
@@ -3493,7 +4932,7 @@ def run_academic_pipeline(
             "evidence": evidence["content_hash"],
             "validator": VERSIONS["validator_version"],
             "template": report_artifact.get("template_hash"),
-            "synthetic": synthetic_validation["content_hash"],
+            "synthetic": combined_synthetic["content_hash"],
             "literature_sources": literature_sources_artifact["content_hash"],
             "literature_evidence": literature_evidence_artifact["content_hash"],
             "literature_claims": literature_claims_artifact["content_hash"],
@@ -3579,11 +5018,17 @@ def run_academic_pipeline(
             aq_status = "review_required"
         template_status = (validation.get("template_compliance") or {}).get(
             "status", "not_configured")
+        literature_required = (
+            str((research_model.get("report_constraints") or {}).get(
+                "report_stage") or "final_report") == "final_report"
+            and not (literature_sources_artifact.get("sources") or []))
         if template_status == "fail":
             report_status = "failed_template_validation"
         elif validation.get("status") == "fail" or quality == "fail" \
                 or aq_status == "fail":
             report_status = "incomplete"
+        elif literature_required:
+            report_status = "literature_required"
         elif quality == "review_required" or aq_status == "review_required" \
                 or template_status == "review_required" or critical_open:
             report_status = "review_required"

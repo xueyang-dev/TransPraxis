@@ -569,6 +569,7 @@ def compile_context_packet(
     next_source: Sequence[str],
     current_batch: Sequence[str],
     style_rules: str = "",
+    entity_hints: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Compile a stable-order packet for generation/review prompts."""
     return {
@@ -581,13 +582,38 @@ def compile_context_packet(
         "previous_accepted_target_context": list(previous_target or []),
         "next_source_context": list(next_source or []),
         "current_batch": list(current_batch or []),
+        "entity_hints": [dict(item) for item in entity_hints or []],
     }
+
+
+def _compact_profile(profile: Dict[str, Any]) -> str:
+    """Render high-value profile fields without repeating raw JSON noise."""
+    if not isinstance(profile, dict) or not profile:
+        return "{}"
+    fields = (
+        ("domain", "领域"), ("subdomain", "细分领域"), ("genre", "文类"),
+        ("audience", "读者"), ("register", "语域"),
+        ("style_constraints", "风格约束"),
+    )
+    lines = [
+        f"{label}：{_clean(profile.get(key), 260)}"
+        for key, label in fields
+        if _clean(profile.get(key), 260)
+    ]
+    sections = profile.get("sections") or []
+    labels = [
+        _clean(item.get("topic") or item.get("section_id"), 100)
+        for item in sections if isinstance(item, dict)
+    ]
+    labels = [item for item in labels if item]
+    if labels:
+        lines.append("章节：" + "；".join(labels[:12]))
+    return "\n".join(lines)[:1800] or "{}"
 
 
 def render_context_packet(packet: Dict[str, Any]) -> str:
     """Render the packet with a stable prefix and current batch at the end."""
-    profile = json.dumps(packet.get("document_profile") or {}, ensure_ascii=False,
-                         sort_keys=True, separators=(",", ":"))
+    profile = _compact_profile(packet.get("document_profile") or {})
     synopsis = packet.get("document_synopsis") or {}
     digest = packet.get("section_digest") or {}
     lines = [
@@ -597,7 +623,15 @@ def render_context_packet(packet: Dict[str, Any]) -> str:
         "【全文发展/论证】\n" + _clean(synopsis.get("document_arc"), 1600),
         "【当前语义单元摘要】\n" + _clean(digest.get("summary"), 1600),
         "【当前单元翻译提示】\n" + "、".join(digest.get("translation_notes") or []),
-        "【锁定术语与范围规则】\n" + (packet.get("locked_glossary") or ""),
+        "【锁定术语与范围规则（项目人工锁定优先）】\n"
+        + (packet.get("locked_glossary") or ""),
+        "【专名/实体连续性提示（仅作建议；人工实体选择优先）】\n" + "\n".join(
+            f"- {item.get('source_form', '')} -> {item.get('preferred_target', '')}"
+            f"（{item.get('entity_type', 'proper noun')}；"
+            f"{item.get('provenance', 'generated_observation')}；"
+            f"优先级：{item.get('precedence', 'entity_continuity_hint')}）"
+            for item in packet.get("entity_hints") or []
+        ),
         "【前文原文上下文】\n" + "\n".join(
             f"- {item}" for item in packet.get("previous_source_context") or []),
         "【前文已接受译文连续性】\n" + "\n".join(
@@ -634,4 +668,5 @@ def context_metadata(packet: Dict[str, Any]) -> Dict[str, Any]:
         "prompt_chars": len(rendered),
         "context_prefix_chars": prefix_chars,
         "current_batch_chars": sum(len(item) for item in packet.get("current_batch") or []),
+        "entity_hint_count": len(packet.get("entity_hints") or []),
     }

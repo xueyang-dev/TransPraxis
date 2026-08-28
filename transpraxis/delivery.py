@@ -15,6 +15,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from . import translation_target
+
 DELIVERY_STATUSES = ("draft", "review_required", "approved", "final")
 _HUMAN_ACTIONS = ("human_fixed", "accepted_risk", "retranslated",
                   "approve_final", "bypass_freeze", "preserved")
@@ -368,6 +370,40 @@ def approve_delivery(state: Dict[str, Any], note: str = "", actor: str = "user",
         return state, False, ["翻译尚未完成，不能创建最终交付版本"]
     if not report_ready(state):
         return state, False, ["实践报告尚未完成或未通过校验，不能创建最终交付版本"]
+    target_report = translation_target.validate_translation_pairs(
+        state.get("pairs") or [])
+    pair_count_mismatch = bool(
+        state.get("paras") and len(state.get("pairs") or []) != len(state.get("paras") or [])
+    )
+    if target_report["blocking"] or pair_count_mismatch:
+        existing = {
+            (item.get("type"), item.get("segment_index"), item.get("invariant_code"))
+            for item in state.setdefault("findings", [])
+        }
+        for finding in translation_target.target_invariant_findings(target_report):
+            key = (finding.get("type"), finding.get("segment_index"),
+                   finding.get("invariant_code"))
+            if key not in existing:
+                state["findings"].append(finding)
+        if pair_count_mismatch and not any(
+                item.get("type") == "delivery_invariant"
+                and item.get("invariant_code") == "pair_count_mismatch"
+                for item in state["findings"] if isinstance(item, dict)):
+            state["findings"].append({
+                "type": "delivery_invariant", "severity": "blocking",
+                "category": "format_integrity", "segment_index": None,
+                "segment_id": None, "invariant_code": "pair_count_mismatch",
+                "summary": "双语 pairs 数量与源文段落数量不一致",
+                "reason": "双语 pairs 数量与源文段落数量不一致，不能进入最终交付",
+                "detector": "Translation Target Invariant",
+            })
+        errors = [
+            item.get("message", "译文未通过 Translation Target Invariant")
+            for item in target_report.get("issues") or []
+        ]
+        if pair_count_mismatch:
+            errors.append("双语 pairs 数量与源文段落数量不一致，不能进入最终交付")
+        return state, False, errors
     blockers = unresolved_blocking(state)
     if blockers:
         if not accept_blocking:

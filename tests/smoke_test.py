@@ -610,7 +610,8 @@ def test_e2e_pipeline():
             jid, "demo.docx", docx_bytes,
             provider="DeepSeek", api_key="test-key", model="deepseek-chat",
             target_lang="简体中文", auto_term=True, enable_report=True,
-            translation_theory="目的论 (Skopos Theory)", user_glossary=[])
+            translation_theory="目的论 (Skopos Theory)", user_glossary=[],
+            research_settings={"report_stage": "proposal"})
         assert state["p1_done"] and len(state["paras"]) == 2
         assert state["auto_terms"] == {"MT": "机器翻译", "CAT": "计算机辅助翻译"}
         assert state["p2_done"] and len(state["pairs"]) == 2
@@ -630,7 +631,8 @@ def test_e2e_pipeline():
             jid, "demo.docx", None,
             provider="DeepSeek", api_key="test-key", model="deepseek-chat",
             target_lang="简体中文", auto_term=True, enable_report=True,
-            translation_theory="目的论 (Skopos Theory)", user_glossary=[])
+            translation_theory="目的论 (Skopos Theory)", user_glossary=[],
+            research_settings={"report_stage": "proposal"})
         assert len(calls) == n_before
         assert state2["p3_md"] == state["p3_md"]
         assert core.load_source(jid) == docx_bytes
@@ -802,7 +804,8 @@ def test_resume_translation():
                 jid, "demo.docx", docx_bytes,
                 provider="DeepSeek", api_key="test-key", model="deepseek-chat",
                 target_lang="简体中文", auto_term=True, enable_report=True,
-                translation_theory="目的论 (Skopos Theory)", user_glossary=[])
+                translation_theory="目的论 (Skopos Theory)", user_glossary=[],
+                research_settings={"report_stage": "proposal"})
             raise AssertionError("应在批次翻译处抛出异常")
         except RuntimeError as e:
             assert "模拟网络中断" in str(e)
@@ -818,7 +821,8 @@ def test_resume_translation():
             jid, "demo.docx", None,
             provider="DeepSeek", api_key="test-key", model="deepseek-chat",
             target_lang="简体中文", auto_term=True, enable_report=True,
-            translation_theory="目的论 (Skopos Theory)", user_glossary=[])
+            translation_theory="目的论 (Skopos Theory)", user_glossary=[],
+            research_settings={"report_stage": "proposal"})
         assert state["p2_done"] and len(state["pairs"]) == 3
         assert state["pairs"][0]["target"] == "译文：这是第一段，内容足够长以通过过滤。"
         assert state["pairs"][1]["target"] == "译文：这是第二段，内容足够长以通过过滤。"
@@ -861,7 +865,8 @@ def test_resume_report_sections():
                 jid, "demo.docx", docx_bytes,
                 provider="DeepSeek", api_key="test-key", model="deepseek-chat",
                 target_lang="简体中文", auto_term=True, enable_report=True,
-                translation_theory="目的论 (Skopos Theory)", user_glossary=[])
+                translation_theory="目的论 (Skopos Theory)", user_glossary=[],
+                research_settings={"report_stage": "proposal"})
             raise AssertionError("应在第一节处抛出异常")
         except RuntimeError as e:
             assert "学术写作阶段失败" in str(e)
@@ -879,7 +884,8 @@ def test_resume_report_sections():
             jid, "demo.docx", None,
             provider="DeepSeek", api_key="test-key", model="deepseek-chat",
             target_lang="简体中文", auto_term=True, enable_report=True,
-            translation_theory="目的论 (Skopos Theory)", user_glossary=[])
+            translation_theory="目的论 (Skopos Theory)", user_glossary=[],
+            research_settings={"report_stage": "proposal"})
         assert state["p3_done"]
         artifact = json.loads((tmp / jid / "academic-sections.json").read_text(
             encoding="utf-8"))

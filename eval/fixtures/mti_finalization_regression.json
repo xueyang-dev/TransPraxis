@@ -1,0 +1,27 @@
+{
+  "name": "anonymous_mti_finalization_regression",
+  "description": "Synthetic, document-free MTI finalization cases for offline regression.",
+  "cases": [
+    {
+      "case_id": "AR-0382",
+      "case_type": "authentic_revision",
+      "source": "Although the field appears stable, its meaning shifts with context.",
+      "historical_initial": "虽然该领域看似稳定，但其含义会随语境变化。",
+      "current_translation": "尽管该领域表面稳定，其含义仍会随语境变化。"
+    },
+    {
+      "case_id": "SC-0015",
+      "case_type": "synthetic_contrast",
+      "source": "The image does not merely describe distance; it makes distance felt.",
+      "synthetic_baseline": "这幅图不仅仅描述距离。",
+      "current_translation": "这幅图不只是描述距离，更让人切身感受到距离。",
+      "review_status": "approved"
+    }
+  ],
+  "expected": {
+    "authentic_case_count": 1,
+    "synthetic_case_count": 1,
+    "approved_synthetic_remains_non_historical": true,
+    "contains_private_paper_text": false
+  }
+}

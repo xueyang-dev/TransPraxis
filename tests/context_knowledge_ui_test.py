@@ -204,3 +204,40 @@ def test_context_and_knowledge_surfaces_rerun_without_widget_identity_errors():
     finally:
         core.OUTPUT_DIR = old_dir
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_knowledge_library_bounds_large_pending_lists_and_supports_search():
+    from streamlit.testing.v1 import AppTest
+
+    root = Path(__file__).resolve().parent.parent
+    tmp = Path(tempfile.mkdtemp(prefix="knowledge-library-ui-"))
+    old_dir = core.OUTPUT_DIR
+    core.OUTPUT_DIR = tmp
+    try:
+        job_id = "knowledgeboundui01"
+        state = core.new_job_state("large-knowledge.docx")
+        state.update(knowledge_candidates=[
+            _candidate(f"term {index}", f"术语 {index}", index)
+            for index in range(25)
+        ])
+        core.save_job_state(job_id, state)
+
+        at = AppTest.from_file(str(root / "app.py"), default_timeout=30)
+        at.run()
+        next(button for button in at.sidebar.button
+             if button.label == "术语库与记忆").click()
+        at.run()
+        assert not at.exception, at.exception
+        assert any(text.label == "搜索待确认词条" for text in at.text_input)
+        assert any("显示 20 / 25 条待确认词条" in item.value
+                   for item in at.caption)
+
+        at.session_state["knowledge_library_search"] = "term 24"
+        at.run()
+        assert not at.exception, at.exception
+        assert any("显示 1 / 1 条待确认词条" in item.value
+                   for item in at.caption)
+        assert any("术语 24" in item.value for item in at.markdown)
+    finally:
+        core.OUTPUT_DIR = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)

@@ -223,10 +223,11 @@ def _question_template(need: Dict[str, Any], segment: Dict[str, Any],
                 f"这是一条为分析构造的模拟初译：「{baseline}」。你认为一名具备基本能力的"
                 "译者是否可能作出这种处理？请只评价合理性，不把它当作你的历史译文。")
     if need_type == "synthetic_optimization_preference":
-        optimized = str((plan.get("optimized_translation") or {}).get("text") or "")[:100]
+        target = str(plan.get("final_target") or
+                     (plan.get("optimized_translation") or {}).get("text") or "")[:100]
         return (question_type,
-                f"对于这条分析用优化译文「{optimized}」，你认为它是否解决了所述问题？"
-                "如有更合适的译法，请说明。")
+                f"对于这条项目当前正式译文「{target}」，你认为它是否解决了所述问题？"
+                "这里的模拟初译只是分析对照，不是历史初稿；如有更合适的译法，请说明。")
     if need_type == "translator_rationale":
         if final:
             return (question_type,
@@ -299,9 +300,12 @@ def generate_questions(
                 "synthetic_initial_translation": (
                     (plan.get("synthetic_baseline") or {}).get("text") or "")[:200]
                 if synthetic else None,
-                "optimized_translation": (
+                "final_target": (
+                    plan.get("final_target") or
                     (plan.get("optimized_translation") or {}).get("text") or "")[:200]
                 if synthetic else None,
+                "target_provenance": "project_current_target" if synthetic else None,
+                "synthetic_evidence": plan.get("synthetic_evidence") if synthetic else None,
             },
             "priority": need.get("academic_value", "low"),
             "status": "open",

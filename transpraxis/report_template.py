@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import re
+from copy import deepcopy
 from typing import Any, Dict, List, Mapping, Optional
 
 from docx import Document
@@ -19,8 +20,8 @@ from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.text.paragraph import Paragraph
 
 
-SCHEMA_VERSION = "report-template-contract-v2"
-RENDERER_VERSION = "report-template-renderer-v2"
+SCHEMA_VERSION = "report-template-contract-v3"
+RENDERER_VERSION = "report-template-renderer-v4"
 
 
 class TemplateParseError(ValueError):
@@ -193,8 +194,10 @@ def _case_requirement(chapters: List[Mapping[str, Any]]) -> Dict[str, Any]:
            "2.2.3", "3.1", "3.2", "3.3"}.issubset(required)
     return {
         "minimum_cases": 6 if is_mti_practice else 0,
+        "applies_to_report_stage": "proposal" if is_mti_practice else None,
         "status_when_insufficient": "failed_template_validation",
-        "source": "canonical_mti_structure" if is_mti_practice else "template_unspecified",
+        "source": "proposal_requirement_in_canonical_mti_structure"
+        if is_mti_practice else "template_unspecified",
     }
 
 
@@ -543,9 +546,11 @@ def anonymize_sensitive_institutions(text: str) -> str:
 
 def public_report_markdown(
     text: str, case_labels: Optional[Mapping[str, str]] = None,
+    case_types: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Hide provenance while retaining academic case labels and quotations."""
     labels = dict(case_labels or {})
+    case_types = dict(case_types or {})
     case_ids = []
     for line in str(text or "").splitlines():
         match = _PUBLIC_QUOTE.match(line.strip())
@@ -562,8 +567,8 @@ def public_report_markdown(
 
     quote_labels = {
         "SOURCE": "原文", "INITIAL": "初译", "TARGET": "改译",
-        "SYNTHETIC_SOURCE": "原文", "SIMULATED": "模拟译法",
-        "OPTIMIZED": "优化译文",
+        "SYNTHETIC_SOURCE": "原文", "SIMULATED": "模拟初译",
+        "OPTIMIZED": "改译",
     }
     seen = set()
     lines = []
@@ -579,7 +584,10 @@ def public_report_markdown(
                         lines.append("")
                     lines.extend([f"**{labels.get(case_id, '例')}**", ""])
                 seen.add(case_id)
-            lines.append(f"> {quote_labels[kind]}：{value}")
+            label = "译文" if kind == "TARGET" and (
+                case_types.get(case_id) == "translation_decision" or
+                case_id.upper().startswith("TD-")) else quote_labels[kind]
+            lines.append(f"> {label}：{value}")
             continue
         for case_id, label in labels.items():
             line = line.replace(case_id, label)
@@ -640,6 +648,15 @@ def _replace_visible_text(document, replacements: Mapping[str, str]) -> None:
                 if old in run.text:
                     run.text = run.text.replace(old, new)
 
+    # python-docx intentionally omits paragraphs nested in structured document
+    # tags, including the cached result of a Word TOC.  Replace text nodes in
+    # the main part as well so project-title placeholders cannot survive there.
+    for node in document.element.xpath(".//w:t"):
+        value = str(node.text or "")
+        for old, new in replacements.items():
+            value = value.replace(old, new)
+        node.text = value
+
 
 def _fill_cover(document, project_title: str) -> None:
     if not project_title:
@@ -665,6 +682,178 @@ def _set_update_fields(document) -> None:
         node = OxmlElement("w:updateFields")
         settings.append(node)
     node.set(qn("w:val"), "true")
+
+
+_CHAPTER_NUMBERS = {
+    "1": "一", "2": "二", "3": "三", "4": "四", "5": "五",
+    "6": "六", "7": "七", "8": "八", "9": "九", "10": "十",
+}
+
+
+def canonical_chapter_title(section_id: Any, title: Any) -> str:
+    """Return the visible chapter title used by body headings and the TOC."""
+    text = _norm(title)
+    if re.match(r"^第\s*[一二三四五六七八九十百千万]+\s*章", text):
+        return text
+    number = _CHAPTER_NUMBERS.get(str(section_id))
+    return f"第{number}章 {text}" if number else text
+
+
+def _surface_matter_title(title: Any, project_title: Any = "") -> str:
+    text = re.sub(r"\s*[（(]如果有\s*[，,、]?\s*另起一页[）)]\s*$", "", _norm(title))
+    project = _norm(project_title)
+    if "《XXX》" in text:
+        text = text.replace("《XXX》", f"《{project}》" if project else "《当前翻译项目》")
+    return text
+
+
+def canonical_toc_entries(report_artifact: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Build the deterministic TOC cache from the final structured artifact."""
+    entries: List[Dict[str, Any]] = [
+        {"title": "摘  要", "level": 1},
+        {"title": "ABSTRACT", "level": 1},
+    ]
+    for section in report_artifact.get("sections") or []:
+        section_id = str(section.get("section_id") or "")
+        entries.append({
+            "title": canonical_chapter_title(section_id, section.get("title")),
+            "level": 1,
+        })
+        for subsection in section.get("subsections") or []:
+            heading_id = str(subsection.get("heading_id") or "").strip()
+            title = _norm(subsection.get("title"))
+            if not heading_id or not title:
+                continue
+            entries.append({
+                "title": f"{heading_id} {title}",
+                "level": min(3, heading_id.count(".") + 1),
+            })
+    for item in report_artifact.get("back_matter") or []:
+        title = _surface_matter_title(item.get("title"), report_artifact.get("project_title"))
+        if title:
+            entries.append({"title": title, "level": 1})
+    return entries
+
+
+def _field_run(kind: str, text: str = "") -> Any:
+    run = OxmlElement("w:r")
+    if kind == "instruction":
+        node = OxmlElement("w:instrText")
+        node.set(qn("xml:space"), "preserve")
+        node.text = text
+    else:
+        node = OxmlElement("w:fldChar")
+        node.set(qn("w:fldCharType"), kind)
+    run.append(node)
+    return run
+
+
+def _text_run(text: str) -> Any:
+    run = OxmlElement("w:r")
+    node = OxmlElement("w:t")
+    node.text = text
+    run.append(node)
+    return run
+
+
+def _refresh_toc_cache(document, report_artifact: Mapping[str, Any]) -> None:
+    """Replace a template TOC's stale cache while retaining its Word field.
+
+    Word or LibreOffice may later refresh page numbers.  Until that happens,
+    the visible cache still contains the exact canonical headings instead of
+    template samples.
+    """
+    toc = next((node for node in document.element.xpath(".//w:sdt")
+                if "TOC" in " ".join(str(item.text or "")
+                                      for item in node.iter(qn("w:instrText")))), None)
+    if toc is None:
+        field_paragraph = next((paragraph for paragraph in
+                                document.element.xpath(".//w:p")
+                                if "TOC" in " ".join(str(item.text or "")
+                                                     for item in paragraph.iter(
+                                                         qn("w:instrText")))), None)
+        if field_paragraph is None:
+            return
+        parent = field_paragraph.getparent()
+        position = parent.index(field_paragraph)
+        parent.remove(field_paragraph)
+        title_paragraph = OxmlElement("w:p")
+        title_props = OxmlElement("w:pPr")
+        title_style = OxmlElement("w:pStyle")
+        title_style.set(qn("w:val"), "TOCHeading")
+        title_props.append(title_style)
+        title_paragraph.append(title_props)
+        title_paragraph.append(_text_run("目录"))
+        parent.insert(position, title_paragraph)
+        position += 1
+        entries = canonical_toc_entries(report_artifact)
+        for index, entry in enumerate(entries):
+            paragraph = OxmlElement("w:p")
+            props = OxmlElement("w:pPr")
+            style = OxmlElement("w:pStyle")
+            style.set(qn("w:val"), f"TOC{int(entry.get('level') or 1)}")
+            props.append(style)
+            paragraph.append(props)
+            if index == 0:
+                paragraph.extend([
+                    _field_run("begin"),
+                    _field_run("instruction", ' TOC \\o "1-3" \\h \\z \\u '),
+                    _field_run("separate"),
+                ])
+            paragraph.append(_text_run(str(entry.get("title") or "")))
+            if index == len(entries) - 1:
+                paragraph.append(_field_run("end"))
+            parent.insert(position, paragraph)
+            position += 1
+        return
+    content = toc.find(qn("w:sdtContent"))
+    if content is None:
+        return
+    old_paragraphs = list(content.findall(qn("w:p")))
+    title_props = deepcopy(old_paragraphs[0].find(qn("w:pPr"))) \
+        if old_paragraphs and old_paragraphs[0].find(qn("w:pPr")) is not None else None
+    style_props: Dict[int, Any] = {}
+    for index, paragraph in enumerate(old_paragraphs[1:4], start=1):
+        props = paragraph.find(qn("w:pPr"))
+        if props is not None:
+            style_props[index] = deepcopy(props)
+    for child in list(content):
+        content.remove(child)
+
+    title_paragraph = OxmlElement("w:p")
+    if title_props is not None:
+        title_paragraph.append(title_props)
+    title_paragraph.append(_text_run("目录"))
+    content.append(title_paragraph)
+
+    entries = canonical_toc_entries(report_artifact)
+    for index, entry in enumerate(entries):
+        paragraph = OxmlElement("w:p")
+        level = int(entry.get("level") or 1)
+        source_props = style_props.get(level)
+        if source_props is None:
+            source_props = style_props.get(1)
+        props = deepcopy(source_props) if source_props is not None else None
+        if props is not None:
+            paragraph.append(props)
+        if index == 0:
+            paragraph.extend([
+                _field_run("begin"),
+                _field_run("instruction", ' TOC \\o "1-3" \\h \\z \\u '),
+                _field_run("separate"),
+            ])
+        paragraph.append(_text_run(str(entry.get("title") or "")))
+        if index == len(entries) - 1:
+            paragraph.append(_field_run("end"))
+        content.append(paragraph)
+
+
+def _update_anchor_lineage(
+    anchors: Dict[str, Paragraph], heading_id: str, paragraph: Paragraph,
+) -> None:
+    parts = [part for part in str(heading_id or "").split(".") if part]
+    for end in range(1, len(parts) + 1):
+        anchors[".".join(parts[:end])] = paragraph
 
 
 def _section_content(report_artifact: Mapping[str, Any], section_id: str) -> Dict[str, Any]:
@@ -717,6 +906,7 @@ def render_report_docx(
     _remove_body_examples(document, preserve, chapter_paragraphs[0])
 
     case_labels = report_artifact.get("case_labels") or {}
+    case_types = report_artifact.get("case_types") or {}
 
     for chapter in chapters:
         section_id = str(chapter.get("section_id"))
@@ -725,24 +915,57 @@ def render_report_docx(
             continue
         section = _section_content(report_artifact, section_id)
         if section.get("title"):
-            heading.text = str(section["title"])
-        subsections = { _title_key(x.get("title")): x
-                        for x in section.get("subsections") or [] }
-        if subsections:
+            heading.text = canonical_chapter_title(section_id, section["title"])
+        # A real MTI template in the supported corpus marks Chapter 4 as
+        # Heading 2.  The parser promotes it logically; the final surface must
+        # promote its Word style as well so a refreshed TOC keeps four peers.
+        try:
+            heading.style = "Heading 1"
+        except KeyError:
+            pass
+        section_subsections = list(section.get("subsections") or [])
+        subsections = {_title_key(x.get("title")): x for x in section_subsections}
+        subsections_by_id = {str(x.get("heading_id") or ""): x
+                             for x in section_subsections if x.get("heading_id")}
+        if section_subsections:
             chapter_content = section.get("intro_content") or ""
+            chapter_anchor = heading
             if chapter_content:
-                _insert_content_after(
-                    heading, public_report_markdown(chapter_content, case_labels))
+                chapter_anchor = _insert_content_after(
+                    heading, public_report_markdown(
+                        chapter_content, case_labels, case_types))
+            anchor_by_id: Dict[str, Paragraph] = {section_id: chapter_anchor}
+            required_ids = set()
             for required in chapter.get("required_subsections") or []:
                 sub_heading = _find_heading(document, required.get("title"))
                 if sub_heading is None:
                     continue
-                item = subsections.get(_title_key(required.get("title"))) or {}
-                _insert_content_after(sub_heading, public_report_markdown(
-                    item.get("content") or "", case_labels))
+                heading_id = str(required.get("heading_id") or "")
+                required_ids.add(heading_id)
+                item = subsections_by_id.get(heading_id) or subsections.get(
+                    _title_key(required.get("title"))) or {}
+                last = _insert_content_after(
+                    sub_heading, public_report_markdown(
+                        item.get("content") or "", case_labels, case_types))
+                _update_anchor_lineage(anchor_by_id, heading_id, last)
+            for item in section_subsections:
+                heading_id = str(item.get("heading_id") or "")
+                if not heading_id or heading_id in required_ids:
+                    continue
+                parent_id = heading_id.rsplit(".", 1)[0] if "." in heading_id else ""
+                anchor = anchor_by_id.get(parent_id)
+                if anchor is None:
+                    continue
+                level = max(1, min(3, int(item.get("level") or 4) - 1))
+                dynamic_heading = _insert_paragraph_after(
+                    anchor, f"{heading_id} {item.get('title')}", f"Heading {level}")
+                last = _insert_content_after(
+                    dynamic_heading, public_report_markdown(
+                        item.get("content") or "", case_labels, case_types))
+                _update_anchor_lineage(anchor_by_id, heading_id, last)
         else:
             _insert_content_after(heading, public_report_markdown(
-                section.get("content") or "", case_labels))
+                section.get("content") or "", case_labels, case_types))
 
     matter = {str(x.get("role")): x for x in report_artifact.get("front_matter") or []}
     front_contract = (template_contract.get("document_structure") or {}).get(
@@ -769,8 +992,19 @@ def render_report_docx(
         item = matter.get(role) or {}
         anchor.text = "摘  要" if role == "abstract_zh" else "ABSTRACT"
         content = str(item.get("content") or "需要用户补充。")
+        if role == "abstract_en":
+            report = report_artifact.get("report") or {}
+            content = str(report.get("abstract_en") or content).strip()
+            if not content or re.search(r"[\u3400-\u9fff]", content):
+                content = (
+                    "This report presents the translation project and its case "
+                    "analysis based on the documented source and target texts.")
         keywords_role = "keywords_zh" if role == "abstract_zh" else "keywords_en"
         keywords = (matter.get(keywords_role) or {}).get("keywords") or []
+        if role == "abstract_en" and (
+                not keywords or any(re.search(r"[\u3400-\u9fff]", str(x))
+                                    for x in keywords)):
+            keywords = ["translation practice", "case analysis"]
         label = "关键词" if role == "abstract_zh" else "Keywords"
         _insert_content_after(anchor, content + "\n\n" + label + "：" +
                               "，".join(str(x) for x in keywords))
@@ -783,16 +1017,26 @@ def render_report_docx(
         role = str(contract_item.get("role") or "")
         candidates = [x for x in report_artifact.get("back_matter") or []
                       if x.get("role") == role]
-        item = next((x for x in candidates if _title_key(x.get("title")) ==
-                     _title_key(contract_item.get("title"))), None) or back_matter.get(role) or {}
+        item = next((x for x in candidates if str(x.get("section_id") or "") ==
+                     str(contract_item.get("section_id") or "")), None)
+        item = item or next((x for x in candidates if _title_key(x.get("title")) ==
+                             _title_key(contract_item.get("title"))), None)
+        item = item or back_matter.get(role) or {}
+        if item.get("title"):
+            heading.text = _surface_matter_title(
+                item.get("title"), report_artifact.get("project_title"))
         content = item.get("content") or "需要用户补充。"
-        _insert_content_after(heading, public_report_markdown(str(content), case_labels))
+        _insert_content_after(heading, public_report_markdown(
+            str(content), case_labels, case_types))
 
+    project_title = str(report_artifact.get("project_title") or "")
     _replace_visible_text(document, {
         "示例大学": "XX大学",
         "Nanjing University of Aeronautics and Astronautics": "XX University",
+        "《XXX》": f"《{project_title}》" if project_title else "《当前翻译项目》",
     })
-    _fill_cover(document, str(report_artifact.get("project_title") or ""))
+    _fill_cover(document, project_title)
+    _refresh_toc_cache(document, report_artifact)
     _set_update_fields(document)
     out = io.BytesIO()
     document.save(out)

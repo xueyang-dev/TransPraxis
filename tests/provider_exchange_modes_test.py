@@ -235,7 +235,8 @@ def test_mode_semantics():
         core.call_llm = llm
         docx_bytes = _make_docx(["The Skopos theory is important.", "Fidelity matters."])
 
-        # 关闭严格术语治理：跳过画像，直接翻译完成
+        # 标准运行时把全文理解与严格术语治理解耦：即使不启用冻结门禁，
+        # 也应生成画像和语义理解产物。
         jid = "qm000000000000001"
         state = core.run_job_pipeline(
             jid, "q.docx", docx_bytes, provider="DeepSeek", api_key="k",
@@ -243,8 +244,9 @@ def test_mode_semantics():
             enable_report=False, enable_review=False, enable_annotate=False,
             translation_theory="目的论 (Skopos Theory)", user_glossary=[],
             strict_terminology_governance=False)
-        assert state["p2_done"] and not state["profile_done"], \
-            "关闭严格术语治理时应跳过文档画像"
+        assert state["p2_done"] and state["profile_done"], \
+            "Standard runtime 不应因关闭严格术语治理而跳过文档画像"
+        assert state["understanding_done"]
 
         # 严格术语治理 + 导入锁定术语 + 无自动候选：无需冻结直接翻译
         jid2 = "qm000000000000002"
@@ -270,8 +272,9 @@ def test_mode_semantics():
             strict_terminology_governance=False)
         assert state3["p2_done"] and state3["p3_done"], \
             "开启实践报告后应完成翻译与报告"
-        assert not state3["profile_done"] and not state3["quality_mode"], \
-            "实践报告不能隐式开启文档画像或严格术语治理"
+        assert state3["profile_done"] and state3["understanding_done"] \
+            and not state3["quality_mode"], \
+            "实践报告不应控制文档理解或严格术语治理"
     finally:
         core.call_llm = original_llm
         core.generate_mti_report = original_report

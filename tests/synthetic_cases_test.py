@@ -17,7 +17,7 @@ from docx import Document
 
 import core
 from transpraxis import academic_evidence, academic_quality, academic_validator, academic_writer
-from transpraxis import case_analysis, human_evidence, synthetic_cases
+from transpraxis import case_analysis, case_presentation, human_evidence, synthetic_cases
 
 
 JOB = "syntheticfixture"
@@ -87,6 +87,10 @@ class SuccessfulModel:
                 "case_id": "SC-0000", "diagnosis_grounding": "confirmed",
                 "error_materiality": "confirmed",
                 "repair_correctness": "confirmed", "repair_value": "confirmed",
+                "academic_analysis_value": "confirmed",
+                "baseline_issue_span": "没有把这个计划称为失败",
+                "final_repair_span": "甚至直言这个计划是失败的",
+                "academic_analysis_value_reason": "The contrast isolates the negation mechanism.",
                 "baseline_already_correct": False, "unrelated_meaning_change": False,
                 "reason": "优化译文恢复了否定范围和语用力度。",
             }]}, ensure_ascii=False)
@@ -96,6 +100,7 @@ class SuccessfulModel:
 def test_successful_staged_pipeline_preserves_history():
     state = _state()
     before = copy.deepcopy(state)
+    pair_hash_before = academic_evidence.stable_hash(state["pairs"])
     evidence = academic_evidence.build_academic_evidence(state, JOB)
     model = SuccessfulModel()
     opportunities = synthetic_cases.mine_error_opportunities(
@@ -118,9 +123,99 @@ def test_successful_staged_pipeline_preserves_history():
         case["error"]["error_id"]
     assert "initial_target" not in case and "final_target" not in case
     assert state == before
+    assert academic_evidence.stable_hash(state["pairs"]) == pair_hash_before
     baseline_payload = json.dumps(model.baseline_payload, ensure_ascii=False)
     assert "真实初译" not in baseline_payload and "真实终译" not in baseline_payload
     print("  ✓ staged synthetic case passes without historical-state contamination")
+
+
+def test_project_target_binding_is_read_only_and_uses_three_gates():
+    state, evidence, validated = _validated_fixture()
+    before_pairs = copy.deepcopy(state["pairs"])
+
+    class NoGeneration:
+        def __call__(self, *_args, **_kwargs):
+            raise AssertionError("project target binding must not call a generator")
+
+    bound = synthetic_cases.optimize_translations(
+        validated, NoGeneration(), "fake", "key", "model", evidence=evidence)
+    row = bound["items"][0]
+    segment = academic_evidence.segment_index(evidence)[row["source_segment_id"]]
+    assert row["final_target"] == segment["final_target"]
+    assert row["optimized_translation"]["text"] == segment["final_target"]
+    assert row["optimized_translation"]["generation_status"] == "project_target"
+    assert row["optimized_translation"]["provenance"] == "project_current_target"
+    assert row["provenance"] == {
+        "historical": False, "generated_for_analysis": True}
+
+    class GateReviewer:
+        def __call__(self, _provider, _api_key, _model, system, user, temperature=0.1):
+            assert "current project target" in system
+            cases = json.loads(user)["cases"]
+            return json.dumps({"validations": [{
+                "case_id": case["case_id"],
+                "diagnosis_grounding": "confirmed",
+                "material_difference": "confirmed",
+                "repair_correctness": "confirmed",
+                "repair_value": "confirmed",
+                "academic_analysis_value": "confirmed",
+                "baseline_issue_span": case["synthetic_baseline"]["text"],
+                "final_repair_span": case["optimized_translation"]["text"],
+                "academic_analysis_value_reason": "The contrast isolates the project-target repair.",
+                "baseline_already_correct": False,
+                "unrelated_meaning_change": False,
+                "reason": "The project target addresses the diagnosed issue.",
+            } for case in cases]})
+
+    checked = synthetic_cases.validate_synthetic_cases(
+        bound, GateReviewer(), "fake", "key", "model", evidence)
+    checked_row = checked["items"][0]
+    assert checked_row["validation"]["academic_case_eligible"]
+    assert checked_row["synthetic_evidence"] == {
+        "historical": False,
+        "generated_for_analysis": True,
+        "baseline_plausibility": "pass",
+        "material_difference": "pass",
+        "repair_correctness": "pass",
+        "academic_analysis_value": "pass",
+        "generation_reason": checked_row["generation_reason"],
+        "targeted_issue": checked_row["targeted_issue"],
+        "academic_analysis_reason": checked_row["synthetic_evidence"][
+            "academic_analysis_reason"],
+    }
+    assert state["pairs"] == before_pairs
+    assert bound["generated"] == 0
+    assert bound["model_call_status"] == "not_called_project_target"
+
+    tampered = copy.deepcopy(bound)
+    tampered["items"][0]["target_contrast_text"] = "不是项目正式译文"
+    rejected = synthetic_cases.validate_synthetic_cases(
+        tampered, GateReviewer(), "fake", "key", "model", evidence)
+    assert not rejected["items"][0]["validation"]["academic_case_eligible"]
+    assert "project_target_grounded" in rejected["items"][0]["validation"][
+        "rejected_reasons"]
+    print("  ✓ current target is read-only; plausibility, materiality and repair gates stay separate")
+
+
+def test_visible_synthetic_schema_uses_simulated_initial_and_revised_target():
+    node = {
+        "case_id": "SC-0001", "case_type": "synthetic_contrast", "example_number": 1,
+        "focus": {
+            "source_span": {"text": "The source sentence contains a metaphor."},
+            "target_span": {"text": "正式译文保留了其修辞功能。"},
+            "issue": "metaphor → 修辞功能",
+        },
+        "synthetic_baseline": {"text": "正式译文把它直译了。"},
+        "analysis_fields": {"visible_analysis": [
+            "模拟译法基本可通，但把隐喻功能压平；改译在当前语境中恢复了该功能。"]},
+    }
+    presentation = case_presentation.build_case_presentation(node)
+    rendered = case_presentation.render_case_presentation_markdown(presentation)
+    assert "**模拟初译**：" in rendered
+    assert "**改译**：" in rendered
+    assert "**初译**：" not in rendered
+    assert "**译文**：" not in rendered
+    print("  ✓ synthetic visible schema is 原文/模拟初译/改译/分析")
 
 
 def test_review_grounding_requires_an_explicit_matching_trigger():
@@ -160,12 +255,15 @@ def _validated_fixture():
 
 
 def _candidate(case_id: str, *, plausibility="plausible", materiality="major",
-               adequate=False, optimized="优化译文") -> dict:
+               adequate=False, optimized="他甚至直言这个计划就是失败的。") -> dict:
     return {
         "case_id": case_id, "case_type": "synthetic_contrast",
         "source_segment_id": f"seg-{JOB}-0000",
         "source_text": "He did not stop short of calling the plan a failure.",
+        "context_before": "The surrounding paragraph frames the speaker's evaluation.",
+        "context_after": "The following sentence explains the consequence.",
         "difficulty": {"category": "lexical_polysemy", "trigger": "stop short of",
+                       "academic_value": "high",
                        "reason": "A grounded ambiguity."},
         "synthetic_baseline": {"text": "模拟译文", "generation_status": "generated",
                                "provenance": "model_generated_for_analysis"},
@@ -200,6 +298,10 @@ class RejectionValidator:
                 else "confirmed",
                 "repair_value": "not_confirmed" if case_id == "SC-REPAIR"
                 else "confirmed",
+                "academic_analysis_value": "confirmed",
+                "baseline_issue_span": case["synthetic_baseline"]["text"],
+                "final_repair_span": case["optimized_translation"]["text"],
+                "academic_analysis_value_reason": "The case exposes a non-surface mechanism.",
                 "baseline_already_correct": case_id == "SC-CORRECT",
                 "unrelated_meaning_change": case_id == "SC-UNRELATED",
                 "reason": "independent decision",
@@ -244,6 +346,7 @@ def test_mixed_selection_and_human_evidence_never_promote_synthetic():
     assert sum(x["case_type"] == "synthetic_contrast" for x in selected["cases"]) == 1
     assert {x["case_type"] for x in selected["cases"]} == {
         "authentic_revision", "synthetic_contrast"}
+    assert len({x["case_id"] for x in selected["cases"]}) == len(selected["cases"])
 
     case = next(x for x in selected["cases"] if x["case_type"] == "synthetic_contrast")
     adequacy = case_analysis.synthetic_evidence_adequacy(case)

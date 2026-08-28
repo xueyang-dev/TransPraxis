@@ -1085,7 +1085,7 @@ def test_report_prompt_evidence_contract():
             provider="DeepSeek", api_key="k", model="deepseek-chat",
             target_lang="简体中文", auto_term=False, enable_report=True,
             translation_theory="目的论 (Skopos Theory)", user_glossary=[],
-            mode="quick")
+            mode="quick", research_settings={"report_stage": "proposal"})
         assert report_prompts, "报告应被调用"
         writer_prompts = [x for x in report_prompts if "证据约束型学术写作者" in x[0]]
         assert writer_prompts and "从结果看可解释为" in writer_prompts[0][0]

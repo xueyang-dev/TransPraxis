@@ -18,7 +18,7 @@ from .academic_evidence import (
     stable_hash,
 )
 
-ANALYSIS_VERSION = "case-analysis-v4"
+ANALYSIS_VERSION = "case-analysis-v5"
 
 EVIDENCE_LEVELS = ("rich_process_evidence", "partial_process_evidence",
                    "source_final_only", "validated_synthetic_contrast")
@@ -237,6 +237,8 @@ def synthetic_evidence_adequacy(case: Dict[str, Any]) -> Dict[str, Any]:
             "has_revision_rationale": False,
             "has_theory_support": False,
         },
+        "provenance": case.get("provenance") or {},
+        "synthetic_evidence": case.get("synthetic_evidence") or {},
     }
 
 
@@ -358,13 +360,21 @@ def _scoped_planner_input(
                 "can_support": adequacy["can_support"],
                 "cannot_support": adequacy["cannot_support"],
                 "translation_delta": adequacy["translation_delta"],
-                "source_text": case.get("source_text", "")[:800],
+                "source_text": ((case.get("focus") or {}).get(
+                    "source_span") or {}).get("text") or case.get("source_text", ""),
                 "difficulty": case.get("difficulty"),
+                "baseline_origin": case.get("baseline_origin"),
+                "legacy_analysis_seed": case.get("legacy_analysis_seed"),
                 "synthetic_baseline": case.get("synthetic_baseline"),
                 "baseline_plausibility": case.get("baseline_plausibility"),
                 "error": case.get("error"),
                 "optimized_translation": case.get("optimized_translation"),
+                "final_target": case.get("final_target") or
+                ((case.get("optimized_translation") or {}).get("text")
+                 if isinstance(case.get("optimized_translation"), dict) else ""),
+                "target_contrast_text": case.get("target_contrast_text") or "",
                 "repair_validation": case.get("validation"),
+                "synthetic_evidence": case.get("synthetic_evidence"),
                 "provenance": case.get("provenance"),
             })
             continue
@@ -382,9 +392,17 @@ def _scoped_planner_input(
             "can_support": adequacy["can_support"],
             "cannot_support": adequacy["cannot_support"],
             "translation_delta": adequacy["translation_delta"],
-            "source": (segment.get("source") or "")[:800],
-            "initial_target": (segment.get("initial_target") or "")[:800],
-            "final_target": (segment.get("final_target") or "")[:800],
+            "source": ((case.get("focus") or {}).get(
+                "source_span") or {}).get("text"),
+            "initial_target": ((case.get("focus") or {}).get(
+                "initial_span") or {}).get("text")
+            if case_type == "authentic_revision" else None,
+            "final_target": ((case.get("focus") or {}).get(
+                "target_span") or {}).get("text"),
+            "focus": case.get("focus"),
+            "difficulty_group": case.get("difficulty_group"),
+            "strategy_group": case.get("strategy_group"),
+            "research_question_ids": case.get("research_questions"),
             "findings": [
                 {k: x.get(k) for k in ("severity", "type", "reason",
                                        "suggested_target")}
@@ -434,9 +452,9 @@ def build_case_analysis_plans(
         "你是保守的 MTI 案例分析规划器。为每个案例制定分析计划；只使用输入中的"
         "项目证据与文献主张，不编造译者意图、草稿、过程历史或理论。区分："
         "authentic_revision 是真实历史初译→修订→终译；translation_decision 是"
-        "初译与终译一致但具有真实术语、句法、修辞或 QA 证据的决策案例，不得写成"
+        "没有历史修订的当前原文—译文决策案例，不得写成"
         "错误修订；synthetic_contrast 是"
-        "为分析生成且已验证的模拟初译→错误诊断→AI 优化，绝非作者历史。"
+        "为分析生成且已验证的模拟初译→错误诊断→当前正式译文对照，绝非作者历史。"
         "evidence_level 决定案例能支持什么。对每个案例给出 problem（必须是具体"
         "翻译问题；证据不足时 grounded=false 并说明需要什么人工证据）、"
         "initial_failure（authentic 指历史初译不足；synthetic 只能指模拟初译中的"
@@ -566,9 +584,19 @@ def build_case_analysis_plans(
             if case_type == "synthetic_contrast" else None,
             "synthetic_baseline": selected_case.get("synthetic_baseline")
             if case_type == "synthetic_contrast" else None,
+            "baseline_origin": selected_case.get("baseline_origin")
+            if case_type == "synthetic_contrast" else None,
+            "legacy_analysis_seed": selected_case.get("legacy_analysis_seed")
+            if case_type == "synthetic_contrast" else None,
             "error_manifest": selected_case.get("error")
             if case_type == "synthetic_contrast" else None,
             "optimized_translation": selected_case.get("optimized_translation")
+            if case_type == "synthetic_contrast" else None,
+            "final_target": selected_case.get("final_target")
+            if case_type == "synthetic_contrast" else None,
+            "target_contrast_text": selected_case.get("target_contrast_text")
+            if case_type == "synthetic_contrast" else None,
+            "synthetic_evidence": selected_case.get("synthetic_evidence")
             if case_type == "synthetic_contrast" else None,
             "synthetic_validation": selected_case.get("validation")
             if case_type == "synthetic_contrast" else None,
@@ -622,6 +650,12 @@ def build_case_analysis_plans(
             if case_type == "synthetic_contrast" else None,
             "optimized_translation": selected_case.get("optimized_translation")
             if case_type == "synthetic_contrast" else None,
+            "final_target": selected_case.get("final_target")
+            if case_type == "synthetic_contrast" else None,
+            "target_contrast_text": selected_case.get("target_contrast_text")
+            if case_type == "synthetic_contrast" else None,
+            "synthetic_evidence": selected_case.get("synthetic_evidence")
+            if case_type == "synthetic_contrast" else None,
             "synthetic_validation": selected_case.get("validation")
             if case_type == "synthetic_contrast" else None,
             "problem": {"type": "other", "statement": "", "grounded": False},
@@ -640,6 +674,19 @@ def build_case_analysis_plans(
             "analysis_contract": {
                 component: "unplanned" for component in ANALYSIS_CONTRACT},
         })
+    for plan in plans:
+        selected_case = selected_by_id.get(str(plan.get("case_id"))) or {}
+        plan.update({
+            "source_segment_id": selected_case.get("source_segment_id") or
+            selected_case.get("segment_id") or plan.get("source_segment_id"),
+            "research_question_ids": list(selected_case.get("research_questions") or []),
+            "difficulty_group": selected_case.get("difficulty_group"),
+            "strategy_group": selected_case.get("strategy_group"),
+            "difficulty_subsection": selected_case.get("difficulty_subsection"),
+            "strategy_subsection": selected_case.get("strategy_subsection"),
+            "target_subsection": selected_case.get("target_subsection"),
+            "focus": selected_case.get("focus"),
+        })
     plans.sort(key=lambda x: x["case_id"])
     artifact = {"schema_version": ANALYSIS_VERSION, "plans": plans}
     artifact["content_hash"] = stable_hash(
@@ -655,19 +702,20 @@ def render_analysis_contract(plan: Dict[str, Any]) -> str:
     """Human/machine-readable contract the writer must realise."""
     if plan.get("case_type") == "synthetic_contrast":
         baseline = (plan.get("synthetic_baseline") or {}).get("text", "")
-        optimized = (plan.get("optimized_translation") or {}).get("text", "")
+        optimized = plan.get("target_contrast_text") or plan.get("final_target") or (
+            plan.get("optimized_translation") or {}).get("text", "")
         error = plan.get("error_manifest") or {}
         validation = plan.get("synthetic_validation") or {}
         lines = [
             f"案例 {plan.get('case_id')}（synthetic_contrast；非历史证据）",
             "- 推理链：翻译难点 → 合理模拟错误 → 错误诱因 → 错误诊断 → "
-            "意义/功能失真 → AI 优化 → 修复验证 → 理论连接（若有）→ 有界结论",
+            "意义/功能失真 → 当前正式译文对照 → 修复验证 → 理论连接（若有）→ 有界结论",
             f"- 真实源文：{plan.get('source_text') or ''}",
             f"- 模拟初译：{baseline}",
             f"- 错误诊断：{error.get('diagnosis') or '（未计划，需如实说明）'}",
-            f"- 优化译文：{optimized}",
+            f"- 当前正式译文（改译对照）：{optimized}",
             f"- 修复验证：{validation.get('reason') or validation.get('repair_correctness')}",
-            "- 来源边界：模拟初译和优化译文均为分析阶段生成，不属于作者翻译历史。",
+            "- 来源边界：模拟初译属于分析阶段构造；当前正式译文来自项目 target，不属于历史改译证据。",
             "- 必须使用 SYNTHETIC_SOURCE / SIMULATED / OPTIMIZED 标签；"
             "禁止‘笔者初译/经审校修改/最终修订’等历史过程措辞。",
             "- 结论边界：只说明一种合理失败模式，不声称其在人类译者中常见。",
@@ -682,8 +730,8 @@ def render_analysis_contract(plan: Dict[str, Any]) -> str:
         return "\n".join(lines)
     if plan.get("case_type") == "translation_decision":
         lines = [
-            f"案例 {plan.get('case_id')}（translation_decision；初译与终译一致）",
-            "- 推理链：真实翻译难点 → 已保存译文决策 → 术语/句法/修辞或 QA 证据 → "
+            f"案例 {plan.get('case_id')}（translation_decision；无历史修订）",
+            "- 推理链：真实翻译难点 → 当前译文决策 → 术语/句法/修辞或 QA 证据 → "
             "决策理由 → 具体效果 → 有界结论",
             "- 标签：使用 SOURCE / TARGET；不得声称发生过初译错误或历史修订。",
             f"- 问题：{plan.get('problem', {}).get('statement') or '（未计划，需如实说明）'}",

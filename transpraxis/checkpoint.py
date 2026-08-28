@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from . import translation_target
+
 
 EVENTS_FILE = "events.jsonl"
 
@@ -138,7 +140,8 @@ def recovery_summary(job_root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
 
 def _eligible(source: str, target: str) -> bool:
     return bool(re.search(r"[A-Za-z0-9\u4e00-\u9fff]", str(source or ""))) \
-        and bool(str(target or "").strip())
+        and bool(str(target or "").strip()) \
+        and not translation_target.is_translation_transport_wrapper(target)
 
 
 def _state_entries(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:

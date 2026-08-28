@@ -297,7 +297,9 @@ def test_freeze_gate_backend_enforced():
         st2 = core.load_job_state(jid)
         core.translate_stage(st2, jid, st2["glossary"], "DeepSeek", "k",
                              "deepseek-chat", "简体中文", "", enable_review=False)
-        assert called["n"] == 1
+        # Standard runtime 在翻译后还会执行一次低权限的连续性知识观察；
+        # 该观察不是审校，也不改变冻结术语门禁。
+        assert called["n"] >= 2
         print("  ✓ freeze gate：backend translate_stage 强制（UI 禁用 ≠ 后端拒绝）")
     finally:
         core.OUTPUT_DIR = old

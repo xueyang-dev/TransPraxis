@@ -39,8 +39,11 @@ def _default_new_fields() -> Dict[str, Any]:
         "understanding_warnings": [],
         "context_packet_log": [],
         "knowledge_candidates": [],
+        "translation_continuity": [],
         "knowledge_events": [],
         "knowledge_feedback_failures": 0,
+        "entity_registry": [],
+        "translation_failures": [],
         "review_evidence": [],
         "repair_overlays": [],
         "tm_recovered_count": 0,
@@ -58,10 +61,13 @@ def _default_new_fields() -> Dict[str, Any]:
         "latest_delivery_snapshot_version": None,
         "exported_assets": [],
         "pipeline_config": {},
+        "translator_config": {},
+        "reviewer_config": {},
         "delivery_config": {},
         "quality_mode": False,
         "quality_bypass": False,
         "delivery_notes": "",
+        "delivery_validation": {},
         "research_settings": {},
         "literature_sources": [],
         "report_template": None,
@@ -137,6 +143,16 @@ def migrate_state(state: Any) -> Dict[str, Any]:
         out["glossary"] = []
     if out.get("auto_term_entries") == {}:
         out["auto_term_entries"] = []
+    if not out.get("translation_continuity") and out.get("knowledge_candidates"):
+        out["translation_continuity"] = list(out.get("knowledge_candidates") or [])
+    for candidate in out.get("knowledge_candidates") or []:
+        if isinstance(candidate, dict):
+            candidate.setdefault("provenance", "generated_continuity")
+            candidate.setdefault("scope", "document")
+            candidate.setdefault("confidence", 0.35)
+    from . import entity_registry
+    out["entity_registry"] = entity_registry.normalize_registry(
+        out.get("entity_registry") or [])
 
     # An explicitly approved delivery is a durable milestone, not a value to
     # recompute from the mutable processing flags on reload.

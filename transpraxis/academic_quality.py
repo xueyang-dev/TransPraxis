@@ -19,7 +19,7 @@ from .academic_evidence import (
 )
 from . import academic_validator, case_analysis
 
-QUALITY_VERSION = "academic-quality-v6"
+QUALITY_VERSION = "academic-quality-v8"
 REPORT_VERSION = "academic-quality-report-v1"
 
 DIMENSIONS = (
@@ -43,6 +43,7 @@ CASE_CLASSES = ("strong_case", "usable_case", "weak_case", "redundant_case", "mi
 
 _CLAIM_MARKER = re.compile(r"<!--claim:([A-Za-z0-9_.:-]+)-->")
 _RQ_MARKER = re.compile(r"<!--rq:([A-Za-z0-9_.:-]+)-->")
+_CASE_MARKER = re.compile(r"<!--case:([A-Za-z0-9_.:-]+)-->")
 _LIT_CLAIM_MARKER = re.compile(r"<!--lit-claim:([A-Za-z0-9_.:-]+)-->")
 _LIT_EVIDENCE_MARKER = re.compile(r"<!--lit-evidence:([A-Za-z0-9_.:-]+)-->")
 _CITE_MARKER = re.compile(r"\[@([A-Za-z0-9_.:-]+)\]|<!--cite:([A-Za-z0-9_.:-]+)-->")
@@ -308,9 +309,11 @@ def evidence_utilization(
     segs = segment_index(evidence)
     used_segments = set()
     for section in sections:
-        used_segments.update(_SEG_REF.findall(section.get("content") or ""))
-        used_segments.update(_SEG_QUOTE_REF.findall(section.get("content") or ""))
-        used_segments.update(_SYNTH_REF.findall(section.get("content") or ""))
+        content = section.get("content") or ""
+        used_segments.update(_CASE_MARKER.findall(content))
+        used_segments.update(_SEG_REF.findall(content))
+        used_segments.update(_SEG_QUOTE_REF.findall(content))
+        used_segments.update(_SYNTH_REF.findall(content))
     rows = []
     for case in selected_cases.get("cases", []):
         case_id = str(case.get("case_id") or "")
@@ -402,8 +405,9 @@ def cross_section_checks(sections: Iterable[Dict[str, Any]]) -> List[Dict[str, A
     for section in sections:
         section_id = str(section.get("section_id"))
         content = section.get("content") or ""
-        for seg_id in sorted(set(_SEG_REF.findall(content)) | set(
-                _SYNTH_REF.findall(content))):
+        for seg_id in sorted(set(_CASE_MARKER.findall(content)) |
+                             set(_SEG_REF.findall(content)) |
+                             set(_SYNTH_REF.findall(content))):
             case_sections.setdefault(seg_id, []).append(section_id)
         for claim_id in sorted(set(_CLAIM_MARKER.findall(content))):
             claim_sections.setdefault(claim_id, []).append(section_id)
@@ -468,6 +472,8 @@ def deterministic_diagnostics(
         case_rows.append({
             "case_id": case_id,
             "case_type": case.get("case_type", "authentic_revision"),
+            "argument_role": case.get("argument_role", "supporting"),
+            "semantic_alignment": (case.get("semantic_alignment") or {}).get("status"),
             "class": cls,
             "reasons": reasons,
             "supports_claims": sorted(set(case.get("supports_claims") or [])),
@@ -480,6 +486,8 @@ def deterministic_diagnostics(
                     "trigger") and case.get("difficulty", {}).get("reason") else "not_confirmed",
                 "baseline_plausibility": case.get("baseline_plausibility", {}).get(
                     "status", "implausible"),
+                "material_difference": (case.get("synthetic_evidence") or {}).get(
+                    "material_difference", "fail"),
                 "error_materiality": case.get("validation", {}).get(
                     "error_materiality", "not_confirmed"),
                 "diagnosis_depth": "confirmed" if case.get("error", {}).get(
@@ -487,11 +495,17 @@ def deterministic_diagnostics(
                         "meaning_or_function_distortion") else "not_confirmed",
                 "repair_validity": case.get("validation", {}).get(
                     "repair_correctness", "not_confirmed"),
+                "repair_correctness": (case.get("synthetic_evidence") or {}).get(
+                    "repair_correctness", "fail"),
+                "academic_analysis_value": (case.get("synthetic_evidence") or {}).get(
+                    "academic_analysis_value", "fail"),
                 "analysis_depth": "pending_semantic_review",
                 "theory_case_fit": "pending_literature_grounding",
                 "bounded_conclusion": "pending_semantic_review",
-                "provenance_correctness": "confirmed" if case.get("provenance") == {
-                    "historical": False, "generated_for_analysis": True}
+                "provenance_correctness": "confirmed" if (
+                    (case.get("provenance") or {}).get("historical") is False
+                    and (case.get("provenance") or {}).get(
+                        "generated_for_analysis") is True)
                 else "not_confirmed",
             } if synthetic else {},
         })
@@ -638,40 +652,47 @@ def _scoped_inputs(
     literature_claims: Dict[str, Any],
     diagnostics: Dict[str, Any],
 ) -> Dict[str, Any]:
-    segs = segment_index(evidence)
     case_pool = []
     for case in selected_cases.get("cases", []):
+        focus = case.get("focus") or {}
+        focused_source = dict(focus.get("source_span") or {})
+        focused_initial = dict(focus.get("initial_span") or {})
+        focused_target = dict(focus.get("target_span") or {})
         if case.get("case_type") == "synthetic_contrast":
             case_pool.append({
                 "case_id": case.get("case_id"),
                 "case_type": "synthetic_contrast",
                 "source_segment_id": case.get("source_segment_id"),
                 "supports_claims": case.get("supports_claims"),
-                "source_text": (case.get("source_text") or "")[:200],
+                "focus": {
+                    "source": focused_source,
+                    "initial": focused_initial or None,
+                    "target": focused_target,
+                },
                 "difficulty": case.get("difficulty"),
                 "synthetic_baseline": case.get("synthetic_baseline"),
                 "error": case.get("error"),
                 "optimized_translation": case.get("optimized_translation"),
+                "final_target": case.get("final_target") or
+                (case.get("optimized_translation") or {}).get("text"),
                 "validation": case.get("validation"),
+                "synthetic_evidence": case.get("synthetic_evidence"),
                 "provenance": case.get("provenance"),
             })
             continue
-        segment = segs.get(str(case.get("source_segment_id") or
-                               case.get("case_id") or "")) or {}
         case_pool.append({
             "case_id": case.get("case_id"), "coverage_zone": case.get("coverage_zone"),
             "case_type": case.get("case_type", "authentic_revision"),
             "source_segment_id": case.get("source_segment_id"),
             "supports_claims": case.get("supports_claims"),
-            "source": (segment.get("source") or "")[:200],
-            "final_target": (segment.get("final_target") or "")[:200],
-            "initial_target": (segment.get("initial_target") or "")[:200],
-            "findings": [
-                {k: x.get(k) for k in ("severity", "type", "reason")}
-                for x in (segment.get("process_evidence", {}).get("findings") or [])[:4]],
-            "repair_history": bool(segment.get("process_evidence", {}).get("repair_history")),
-            "terminology_decision_count": len(segment.get(
-                "process_evidence", {}).get("injected_glossary_entry_ids") or []),
+            "focus": {
+                "source": focused_source,
+                "initial": focused_initial or None,
+                "target": focused_target,
+            },
+            "difficulty_group": case.get("difficulty_group"),
+            "strategy_group": case.get("strategy_group"),
+            "decision_evidence": case.get("decision_evidence"),
         })
     return {
         "research_model": {
@@ -714,7 +735,11 @@ def evaluate_quality(
     call_llm: Callable, provider: str, api_key: str, model: str,
     case_analysis_plans: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    has_literature = bool(literature_claims.get("items"))
+    has_literature = bool(literature_sources.get("sources")) and bool(
+        literature_evidence_artifact.get("items")) and bool(
+            literature_claims.get("items"))
+    final_report = str((research_model.get("report_constraints") or {}).get(
+        "report_stage") or "") == "final_report"
     diagnostics = deterministic_diagnostics(
         research_model, argument_plan, selected_cases, outline, sections, evidence)
     diagnostics["deterministic_validation_issues"] = [
@@ -786,7 +811,8 @@ def evaluate_quality(
     dimensions: Dict[str, str] = {}
     for name in DIMENSIONS:
         if name == "literature_support":
-            dimensions[name] = "not_applicable" if not has_literature else "pass"
+            dimensions[name] = "pass" if has_literature else (
+                "review_required" if final_report else "not_applicable")
         elif name == "theory_case_fit":
             dimensions[name] = "not_applicable" if not has_literature else "pass"
         else:
@@ -934,6 +960,46 @@ def evaluate_quality(
                                          and x.get("case_role") == "revision_case"),
         "synthetic_contrast_cases": sum(1 for x in diagnostics["case_quality"]
                                          if x.get("case_type") == "synthetic_contrast"),
+        "synthetic_case_count": sum(1 for x in diagnostics["case_quality"]
+                                     if x.get("case_type") == "synthetic_contrast"),
+        "synthetic_baseline_plausibility": {
+            "pass": sum((x.get("synthetic_dimensions") or {}).get(
+                "baseline_plausibility") == "plausible"
+                for x in diagnostics["case_quality"]
+                if x.get("case_type") == "synthetic_contrast"),
+            "fail": sum((x.get("synthetic_dimensions") or {}).get(
+                "baseline_plausibility") != "plausible"
+                for x in diagnostics["case_quality"]
+                if x.get("case_type") == "synthetic_contrast"),
+        },
+        "synthetic_materiality": {
+            "pass": sum((x.get("synthetic_dimensions") or {}).get(
+                "material_difference") == "pass"
+                for x in diagnostics["case_quality"]),
+            "fail": sum((x.get("synthetic_dimensions") or {}).get(
+                "material_difference") != "pass"
+                for x in diagnostics["case_quality"]
+                if x.get("case_type") == "synthetic_contrast"),
+        },
+        "synthetic_repair_correctness": {
+            "pass": sum((x.get("synthetic_dimensions") or {}).get(
+                "repair_correctness") == "pass"
+                for x in diagnostics["case_quality"]),
+            "fail": sum((x.get("synthetic_dimensions") or {}).get(
+                "repair_correctness") != "pass"
+                for x in diagnostics["case_quality"]
+                if x.get("case_type") == "synthetic_contrast"),
+        },
+        "synthetic_academic_analysis_value": {
+            "pass": sum((x.get("synthetic_dimensions") or {}).get(
+                "academic_analysis_value") == "pass"
+                for x in diagnostics["case_quality"]
+                if x.get("case_type") == "synthetic_contrast"),
+            "fail": sum((x.get("synthetic_dimensions") or {}).get(
+                "academic_analysis_value") != "pass"
+                for x in diagnostics["case_quality"]
+                if x.get("case_type") == "synthetic_contrast"),
+        },
         "non_revision_cases": sum(1 for x in diagnostics["case_quality"]
                                   if x.get("case_type") == "authentic_revision"
                                   and x.get("case_role") == "non_revision_case"),

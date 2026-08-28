@@ -8,15 +8,17 @@ from __future__ import annotations
 import difflib
 import json
 import re
+from collections import Counter
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from . import academic_evidence
 from .academic_evidence import has_meaningful_revision, segment_index, stable_hash
 
-OPPORTUNITY_VERSION = "synthetic-opportunity-v4"
-BASELINE_VERSION = "synthetic-baseline-v1"
-ERROR_MANIFEST_VERSION = "synthetic-error-manifest-v2"
-OPTIMIZER_VERSION = "synthetic-optimizer-v1"
-VALIDATION_VERSION = "synthetic-validation-v3"
+OPPORTUNITY_VERSION = "synthetic-opportunity-v6"
+BASELINE_VERSION = "synthetic-baseline-v2"
+ERROR_MANIFEST_VERSION = "synthetic-error-manifest-v3"
+OPTIMIZER_VERSION = "synthetic-optimizer-v2"
+VALIDATION_VERSION = "synthetic-validation-v8"
 
 CASE_TYPE = "synthetic_contrast"
 ERROR_CATEGORIES = (
@@ -158,11 +160,48 @@ def _passage_for_trigger(source: str, trigger: str) -> str:
     if start < 0:
         return ""
     end = start + len(trigger)
-    prior = list(re.finditer(r"[.!?][\"'”’]?\s+", source[:start]))
+    boundary = re.compile(
+        r"[.!?。！？](?:[\"'”’])?(?:[0-9⁰¹²³⁴⁵⁶⁷⁸⁹]+)?"
+        r"(?=\s|$|[A-Z\u3400-\u9fff])")
+    prior = list(boundary.finditer(source[:start]))
     passage_start = prior[-1].end() if prior else 0
-    following = re.search(r"[.!?][\"'”’]?(?:\s+|$)", source[end:])
+    following = boundary.search(source[end:])
     passage_end = end + following.end() if following else len(source)
     return source[passage_start:passage_end].strip()
+
+
+def _target_excerpt_for_source(
+    source: str, source_excerpt: str, target: str,
+) -> str:
+    """Bind a focused source passage to an excerpt of the saved target.
+
+    Synthetic opportunities are intentionally focused on one source passage,
+    while project evidence stores paragraph-level targets.  Sentence order is
+    the only alignment assumption available here; the returned text remains an
+    exact substring of the saved target and is never a generated translation.
+    """
+    if not source or not source_excerpt or not target:
+        return ""
+    start = source.casefold().find(source_excerpt.casefold())
+    if start < 0:
+        return ""
+    boundary = re.compile(
+        r"[.!?。！？](?:[\"'”’])?(?:[0-9⁰¹²³⁴⁵⁶⁷⁸⁹]+)?"
+        r"(?=\s|$|[A-Z\u3400-\u9fff])")
+    source_prefix_count = len(boundary.findall(source[:start]))
+    source_sentence_count = max(1, len(boundary.findall(source_excerpt)))
+    spans = []
+    cursor = 0
+    for match in boundary.finditer(target):
+        spans.append((cursor, match.end()))
+        cursor = match.end()
+    if cursor < len(target.strip()):
+        spans.append((cursor, len(target)))
+    if not spans:
+        return target
+    first = min(source_prefix_count, len(spans) - 1)
+    last = min(len(spans), first + source_sentence_count)
+    return target[spans[first][0]:spans[last - 1][1]].strip()
 
 
 def _bounded_source_pool(
@@ -172,6 +211,9 @@ def _bounded_source_pool(
     candidates = []
     for segment in segments:
         source = str(segment.get("source") or "").strip()
+        final_target = str(segment.get("final_target") or "").strip()
+        if segment.get("integrity_flags") or not final_target:
+            continue
         signals = _screening_signals(source)
         if not source or not signals:
             continue
@@ -202,6 +244,111 @@ def _bounded_source_pool(
     } for row in ordered]
 
 
+def _deterministic_opportunity_pool(
+    evidence: Dict[str, Any], existing_segment_ids: Iterable[str], limit: int,
+) -> List[Dict[str, Any]]:
+    """Fill a screened opportunity pool from evidence-derived case signals.
+
+    This is a candidate generator, not an acceptance gate.  Every fallback
+    opportunity still goes through baseline plausibility, materiality, repair,
+    and academic-value validation before it can reach a report.
+    """
+    segments = segment_index(evidence)
+    glossary = evidence.get("project_evidence", {}).get("glossary", [])
+    seen = {str(x) for x in existing_segment_ids}
+    candidates = list(evidence.get("translation_decision_candidates") or [])
+    candidates.sort(key=lambda x: (-float(x.get("score") or 0),
+                                   int(x.get("segment_index") or 0)))
+    out = []
+    for candidate in candidates:
+        if len(out) >= limit:
+            break
+        segment_id = str(candidate.get("source_segment_id") or "")
+        if not segment_id or segment_id in seen:
+            continue
+        segment = segments.get(segment_id) or {}
+        source = str(segment.get("source") or "")
+        if not source or segment.get("integrity_flags"):
+            continue
+        features = candidate.get("features") or {}
+        term_anchor, term = academic_evidence._term_anchor(segment, glossary, source)
+        proper = re.search(
+            r"\b[A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+)+\b", source)
+        rhetoric = re.search(
+            r"\b(?:gaze|flatten(?:ing)?|fluidity|imaginary|metaphor|vulnerab|"
+            r"estrangement|affective|nonhuman|community|world-scale)\w*\b",
+            source, re.IGNORECASE)
+        connector = re.search(
+            r"\b(?:although|whereas|rather|instead|because|since|while|despite|"
+            r"not only|but also|unless)\b", source, re.IGNORECASE)
+        pronoun = re.search(r"\b(?:it|this|that|they|them|which|who|whose)\b",
+                            source, re.IGNORECASE)
+        if term_anchor and int(features.get("term_count") or 0) >= 1 and term:
+            category = "lexical_polysemy"
+            trigger = str(term.get("source") or source[term_anchor[0]:term_anchor[1]])
+            reason = ("该术语在当前文本中承担概念识别功能；普通译者可能采用一个表面可通、"
+                      "但概念边界或术语链关联较弱的对应词。")
+            failure = "采用字面或近义术语后，概念边界与同段术语关系变弱。"
+        elif proper:
+            category = "proper_noun"
+            trigger = proper.group(0)
+            reason = ("该专名同时涉及文本指称与背景识别；普通译者可能选择合理但不够稳定的"
+                      "音译、意译或专名形式。")
+            failure = "专名处理基本可读，但会削弱指称稳定性或文化识别线索。"
+        elif rhetoric:
+            category = "metaphor"
+            trigger = rhetoric.group(0)
+            reason = ("该表达在上下文中承担修辞或评价功能；普通译者可能作语义上可成立的"
+                      "字面处理，却没有充分保留其意象或论述功能。")
+            failure = "字面处理保留基本意义，但会压平隐喻、评价色彩或语篇作用。"
+        elif connector and int(features.get("clause_markers") or 0) >= 2:
+            category = "information_structure"
+            trigger = connector.group(0)
+            reason = ("该连接结构组织了让步、转折或焦点关系；普通译者可能保留过多英语"
+                      "信息顺序，使逻辑关系在中文中不够显化。")
+            failure = "逻辑关系大体可恢复，但信息焦点或句间层次不够清晰。"
+        elif pronoun and len(source) >= 80:
+            category = "reference_resolution"
+            trigger = pronoun.group(0)
+            reason = ("该指代需要结合局部语境解析；普通译者可能使用形式上对应的指代词，"
+                      "但使所指关系或篇章衔接变得含混。")
+            failure = "形式对应保留了指代，却没有充分显化中文读者需要的所指关系。"
+        elif int(features.get("clause_markers") or 0) >= 3:
+            category = "syntax_attachment"
+            trigger = (connector or pronoun).group(0) if (connector or pronoun) else source[:24]
+            reason = ("该句包含多层修饰或从属关系；普通译者可能基本保留英语修饰顺序，"
+                      "造成中文修饰边界或信息焦点不够自然。")
+            failure = "语义基本完整，但修饰层级和信息焦点仍受英语句法牵引。"
+        else:
+            continue
+        passage = _passage_for_trigger(source, trigger)
+        if not passage:
+            continue
+        seen.add(segment_id)
+        index = int(candidate.get("segment_index") or segment.get("segment_index") or 0)
+        out.append({
+            "opportunity_id": f"EO-F{index:04d}",
+            "segment_id": segment_id,
+            "segment_index": index,
+            "source_text": passage,
+            "context_before": "",
+            "context_after": "",
+            "error_category": category,
+            "trigger_span": trigger,
+            "difficulty_reason": reason,
+            "likely_failure_mode": failure,
+            "academic_value": "high" if category in {
+                "lexical_polysemy", "metaphor", "information_structure",
+                "syntax_attachment"} else "medium",
+            "confidence": "medium",
+            "error_pattern_grounding": {
+                "type": "model_inference",
+                "empirical_frequency_supported": False,
+            },
+        })
+    return out
+
+
 def mine_error_opportunities(
     evidence: Dict[str, Any], call_llm: Callable, provider: str, api_key: str,
     model: str, max_scan: int = 16, max_opportunities: int = 8,
@@ -212,7 +359,12 @@ def mine_error_opportunities(
         "You identify a small set of academically useful translation-error opportunities "
         "in real English source passages. A difficulty must name the exact source trigger "
         "and explain a realistic mistranslation mechanism. Do not select a sentence merely "
-        "because it is long. Do not claim that humans commonly make the error. Return JSON "
+        "because it is long. Prefer a defensible terminology, syntactic/information-structure, "
+        "rhetorical, cultural/proper-name or cohesion contrast when the source supports one; "
+        "use negation or temporal categories only when a direct reading would materially change "
+        "meaning or function. Keep the returned opportunities varied when the source pool allows "
+        "it, rather than assigning the same category to every sentence. Do not claim that humans "
+        "commonly make the error. Return JSON "
         "only: {\"opportunities\":[{\"segment_id\":\"seg-...\",\"error_category\":"
         "\"lexical_polysemy|idiom_misreading|syntax_attachment|logical_relation|"
         "negation_scope|reference_resolution|cultural_reference|proper_noun|register|"
@@ -232,6 +384,8 @@ def mine_error_opportunities(
     items = []
     seen = set()
     rejected = []
+    category_counts = Counter()
+    category_cap = max(1, int(max_opportunities * 0.4))
     for item in raw.get("opportunities") or []:
         if not isinstance(item, dict):
             rejected.append({"reason": "not_an_object"})
@@ -252,6 +406,11 @@ def mine_error_opportunities(
             rejected.append({"segment_id": segment_id, "reason": "invalid_error_category",
                              "value": category})
             continue
+        if category_counts[category] >= category_cap:
+            rejected.append({"segment_id": segment_id,
+                             "reason": "category_overrepresented",
+                             "value": category})
+            continue
         if not trigger or trigger.casefold() not in source["source_text"].casefold():
             rejected.append({"segment_id": segment_id, "reason": "trigger_not_exact_source_span",
                              "value": trigger[:160]})
@@ -265,6 +424,7 @@ def mine_error_opportunities(
                              "reason": "trigger_passage_not_recoverable"})
             continue
         seen.add(segment_id)
+        category_counts[category] += 1
         items.append({
             "opportunity_id": f"EO-{source['segment_index']:04d}",
             "segment_id": segment_id,
@@ -287,9 +447,21 @@ def mine_error_opportunities(
         })
         if len(items) >= max_opportunities:
             break
+    if len(items) < max_opportunities:
+        fallback = _deterministic_opportunity_pool(
+            evidence, seen, max_opportunities - len(items))
+        for opportunity in fallback:
+            category = str(opportunity.get("error_category") or "")
+            if category_counts[category] >= category_cap:
+                continue
+            seen.add(str(opportunity.get("segment_id") or ""))
+            category_counts[category] += 1
+            items.append(opportunity)
+            if len(items) >= max_opportunities:
+                break
     return _artifact(
         OPPORTUNITY_VERSION, items,
-        pipeline_status="complete" if raw.get("_call_status") == "ok" else "failed",
+        pipeline_status="complete" if raw.get("_call_status") == "ok" or items else "failed",
         total_source_segments=len(evidence.get("project_evidence", {}).get("segments", [])),
         screened_segments=len(source_pool), opportunities_found=len(items),
         model_call_status=raw.get("_call_status", "unknown"),
@@ -319,11 +491,15 @@ def generate_baselines(
                          pipeline_status=opportunities.get("pipeline_status", "complete"))
     system = (
         "Generate one simulated Chinese initial translation per item for academic contrast. "
-        "It should be fluent and locally defensible, like work from a reasonably competent "
-        "translator, but materially affected by the supplied difficulty. Never make absurd, "
-        "random or gratuitously ungrammatical errors. You are not seeing and must not infer a "
-        "historical translation. Return JSON only: {\"baselines\":[{\"case_id\":\"SC-...\","
-        "\"text\":\"...\",\"why_tempting\":\"...\"}]}"
+        "The supplied targeted issue and likely failure mode are the exact analytical target: "
+        "construct a plausible human-like baseline that leaves that one difficulty materially "
+        "unresolved, without inventing a different error. Keep the basic meaning, grammar and "
+        "surface fluency intact; do not omit a whole sentence, use machine-like nonsense, or "
+        "make a gratuitous low-level mistake. If the supplied issue has no defensible material "
+        "contrast for this passage, return an empty text for that case rather than forcing one. "
+        "You are not seeing and must not infer a historical translation. Return JSON only: "
+        "{\"baselines\":[{\"case_id\":\"SC-...\",\"text\":\"...\","
+        "\"why_tempting\":\"...\"}]}"
     )
     raw = _call_json(call_llm, provider, api_key, model, system,
                      {"cases": inputs}, 0.45)
@@ -337,6 +513,7 @@ def generate_baselines(
         items.append({
             "case_id": case_id,
             "case_type": CASE_TYPE,
+            "baseline_origin": "newly_generated",
             "opportunity_id": opportunity["opportunity_id"],
             "source_segment_id": opportunity["segment_id"],
             "source_text": opportunity["source_text"],
@@ -353,11 +530,24 @@ def generate_baselines(
             "error_pattern_grounding": opportunity["error_pattern_grounding"],
             "synthetic_baseline": {
                 "text": text,
-                "provenance": "model_generated_for_analysis",
+                "provenance": "analytical_simulation",
+                "baseline_origin": "newly_generated",
                 "why_tempting": str(value.get("why_tempting") or "")[:500],
+                "generation_reason": opportunity["difficulty_reason"][:500],
+                "targeted_issue": opportunity["error_category"],
+                "generated_at": str(value.get("generated_at") or "")[:80],
                 "generation_status": "generated" if text else "failed",
             },
-            "provenance": {"historical": False, "generated_for_analysis": True},
+            "historical": False,
+            "generated_for_analysis": True,
+            "source_provenance": "project_source",
+            "target_provenance": "project_current_target",
+            "provenance": {
+                "historical": False,
+                "generated_for_analysis": True,
+            },
+            "generation_reason": opportunity["difficulty_reason"][:500],
+            "targeted_issue": opportunity["error_category"],
         })
     return _artifact(BASELINE_VERSION, items, generated=sum(
         x["synthetic_baseline"]["generation_status"] == "generated" for x in items),
@@ -478,7 +668,55 @@ def build_error_manifest(
 def optimize_translations(
     error_manifest: Dict[str, Any], call_llm: Callable, provider: str,
     api_key: str, model: str, terminology: Optional[Iterable[Dict[str, Any]]] = None,
+    evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Bind each baseline to the real current target for controlled contrast.
+
+    The old function name is kept for artifact compatibility.  With project
+    evidence it does not generate a replacement translation: the target is
+    read-only project evidence and remains separate from translation state.
+    """
+    if evidence is not None:
+        segments = segment_index(evidence)
+        items = []
+        for case in error_manifest.get("items", []):
+            segment = segments.get(str(case.get("source_segment_id") or "")) or {}
+            target = str(segment.get("final_target") or segment.get("target") or "").strip()
+            baseline_text = str((case.get("synthetic_baseline") or {}).get(
+                "text") or "").strip()
+            target_contrast = _target_excerpt_for_source(
+                str(segment.get("source") or ""),
+                str(case.get("source_text") or ""), target)
+            items.append({
+                **case,
+                "final_target": target,
+                "target_contrast_text": target_contrast,
+                "target_contrast_provenance": "project_current_target",
+                "optimized_translation": {
+                    "text": target,
+                    "focus_text": target_contrast,
+                    "provenance": "project_current_target",
+                    "repairs_error_id": "",
+                    "repair_decision": "",
+                    "addresses_error": "",
+                    "generation_status": "project_target" if target else "failed",
+                },
+                "source_provenance": "project_source",
+                "target_provenance": "project_current_target",
+                "historical": False,
+                "generated_for_analysis": True,
+                "provenance": {
+                    "historical": False,
+                    "generated_for_analysis": True,
+                },
+            })
+        return _artifact(
+            OPTIMIZER_VERSION, items,
+            generated=0,
+            project_targets_bound=sum(bool(x.get("final_target")) for x in items),
+            pipeline_status=error_manifest.get("pipeline_status", "complete"),
+            model_call_status="not_called_project_target")
+
     eligible_inputs = [x for x in error_manifest.get("items", [])
                        if x.get("baseline_plausibility", {}).get("status") == "plausible"
                        and x.get("error", {}).get("materiality") in {"major", "moderate"}
@@ -553,24 +791,39 @@ def validate_synthetic_cases(
     api_key: str, model: str, evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     reviewable = [x for x in optimized_artifact.get("items", [])
-                  if x.get("optimized_translation", {}).get("generation_status") == "generated"]
+                  if x.get("optimized_translation", {}).get("generation_status")
+                  in {"generated", "project_target"}]
     if not optimized_artifact.get("items"):
         return _artifact(VALIDATION_VERSION, [], metrics={
+            "synthetic_case_count": 0,
             "synthetic_baselines_generated": 0,
             "baselines_rejected_as_implausible": 0,
             "errors_rejected_as_non_material": 0,
             "repairs_rejected": 0,
             "academically_eligible_synthetic_cases": 0,
+            "synthetic_academic_analysis_value": {"pass": 0, "fail": 0},
+            "synthetic_baseline_plausibility": {"pass": 0, "fail": 0},
+            "synthetic_materiality": {"pass": 0, "fail": 0},
+            "synthetic_repair_correctness": {"pass": 0, "fail": 0},
         }, pipeline_status=optimized_artifact.get("pipeline_status", "complete"))
     system = (
         "Independently validate each synthetic contrast. Judge separately whether the error is "
-        "grounded in the source, material, the optimized translation fixes the diagnosed problem, "
-        "and the repair adds meaningful value without changing unrelated meaning. Reject a baseline that is already "
+        "grounded in the source, materially different from the current project target, and whether "
+        "the current project target fixes the diagnosed problem without changing unrelated meaning. "
+        "Confirm academic_analysis_value only when the contrast concerns a non-surface translation "
+        "problem, exposes a concrete strategy, has enough local context, can be tied to a research "
+        "question, and is worth substantive MTI case analysis rather than repeating another case. "
+        "Reject a baseline that is already "
         "correct. Return JSON only: {\"validations\":[{\"case_id\":\"SC-...\","
         "\"diagnosis_grounding\":\"confirmed|partial|not_confirmed\","
+        "\"material_difference\":\"confirmed|partial|not_confirmed\","
         "\"error_materiality\":\"confirmed|partial|not_confirmed\","
         "\"repair_correctness\":\"confirmed|partial|not_confirmed\","
         "\"repair_value\":\"confirmed|partial|not_confirmed\","
+        "\"academic_analysis_value\":\"confirmed|partial|not_confirmed\","
+        "\"baseline_issue_span\":\"exact contiguous span from the baseline showing the diagnosed issue\","
+        "\"final_repair_span\":\"exact contiguous span from the project-target focus showing the repair\","
+        "\"academic_analysis_value_reason\":\"...\","
         "\"baseline_already_correct\":false,\"unrelated_meaning_change\":false,"
         "\"reason\":\"...\"}]}"
     )
@@ -582,7 +835,8 @@ def validate_synthetic_cases(
             "cases": [{k: x.get(k) for k in (
                 "case_id", "source_text", "context_before", "context_after", "difficulty",
                 "synthetic_baseline", "baseline_plausibility", "error",
-                "optimized_translation")} for x in reviewable]
+                "optimized_translation", "final_target", "target_contrast_text")}
+                       for x in reviewable]
         }, 0.1)
     validations = {str(x.get("case_id")): x for x in raw.get("validations") or []
                    if isinstance(x, dict)}
@@ -590,50 +844,172 @@ def validate_synthetic_cases(
     for case in optimized_artifact.get("items", []):
         raw_validation = validations.get(case["case_id"]) or {}
         checks = {}
+        raw_materiality = raw_validation.get("material_difference")
+        if raw_materiality is None:
+            raw_materiality = raw_validation.get("error_materiality")
+        raw_repair_value = raw_validation.get("repair_value")
+        if raw_repair_value is None:
+            raw_repair_value = raw_validation.get("repair_correctness")
+        raw_checks = {
+            "diagnosis_grounding": raw_validation.get("diagnosis_grounding"),
+            "error_materiality": raw_materiality,
+            "repair_correctness": raw_validation.get("repair_correctness"),
+            "repair_value": raw_repair_value,
+            "academic_analysis_value": raw_validation.get("academic_analysis_value"),
+        }
         for key in ("diagnosis_grounding", "error_materiality",
-                    "repair_correctness", "repair_value"):
-            value = str(raw_validation.get(key) or "not_confirmed")
+                    "repair_correctness", "repair_value",
+                    "academic_analysis_value"):
+            value = str(raw_checks.get(key) or "not_confirmed")
             checks[key] = value if value in CONFIRMATION else "not_confirmed"
         delta = contrast_delta(case.get("synthetic_baseline", {}).get("text"),
+                               case.get("target_contrast_text") or
+                               case.get("final_target") or
                                case.get("optimized_translation", {}).get("text"))
         canonical_segment = segment_index(evidence or {}).get(str(
             case.get("source_segment_id") or ""))
         source_text = str(case.get("source_text") or "")
+        baseline_text = str((case.get("synthetic_baseline") or {}).get("text") or "")
         trigger = str(case.get("difficulty", {}).get("trigger") or "")
         source_evidence_span = str(case.get("error", {}).get(
             "source_evidence_span") or "")
         canonical_source = str((canonical_segment or {}).get("source") or "")
+        project_target = str((canonical_segment or {}).get("final_target") or "")
+        target_contrast = str(case.get("target_contrast_text") or
+                              case.get("final_target") or
+                              case.get("optimized_translation", {}).get("text") or "")
+        baseline_issue_span = str(raw_validation.get("baseline_issue_span") or "").strip()
+        final_repair_span = str(raw_validation.get("final_repair_span") or "").strip()
+        repair_evidence_confirmed = bool(
+            baseline_issue_span and final_repair_span
+            and baseline_issue_span in baseline_text
+            and final_repair_span in target_contrast
+            and has_meaningful_revision(baseline_issue_span, final_repair_span))
+        content_baseline = academic_evidence.normalized_translation_target(
+            baseline_text, ignore_punctuation=True)
+        content_target = academic_evidence.normalized_translation_target(
+            target_contrast, ignore_punctuation=True)
+        content_matcher = difflib.SequenceMatcher(
+            None, content_baseline, content_target, autojunk=False)
+        changed_content_size = sum(
+            len(content_baseline[i1:i2]) + len(content_target[j1:j2])
+            for tag, i1, i2, j1, j2 in content_matcher.get_opcodes()
+            if tag != "equal")
+        repair_baseline_content = academic_evidence.normalized_translation_target(
+            baseline_issue_span, ignore_punctuation=True)
+        repair_target_content = academic_evidence.normalized_translation_target(
+            final_repair_span, ignore_punctuation=True)
+        repair_matcher = difflib.SequenceMatcher(
+            None, repair_baseline_content, repair_target_content, autojunk=False)
+        repair_opcodes = [op for op in repair_matcher.get_opcodes()
+                          if op[0] != "equal"]
+        repair_changed_content_size = sum(
+            len(repair_baseline_content[i1:i2])
+            + len(repair_target_content[j1:j2])
+            for tag, i1, i2, j1, j2 in repair_opcodes)
+        # A one-word synonym swap is not a controlled analytical contrast by
+        # itself.  Keep the threshold small and transparent; a keyed term or
+        # name can still pass when the reviewer supplies a real repair span.
+        issue_category = str(case.get("difficulty", {}).get("category") or "")
+        micro_edit = (len(repair_opcodes) == 1
+                      and repair_changed_content_size <= 4
+                      and repair_opcodes[0][0] == "replace"
+                      and issue_category not in {
+                          "proper_noun", "cultural_reference", "lexical_polysemy",
+                      })
+        term_anchor, term = academic_evidence._term_anchor(
+            canonical_segment or {},
+            (evidence or {}).get("project_evidence", {}).get("glossary", []),
+            canonical_source or source_text)
+        trigger_matches_term = bool(
+            term and trigger and str(term.get("source") or "").casefold()
+            in trigger.casefold())
+        target_term_markers = [str(term.get(key) or "") for key in (
+            "target", "preferred", "proposed_target") if term]
+        target_issue_anchor = (not trigger_matches_term or
+                               any(marker and marker in target_contrast
+                                   for marker in target_term_markers))
+        project_target_status = case.get("optimized_translation", {}).get(
+            "generation_status") == "project_target"
+        boundary = re.compile(
+            r"[.!?。！？](?:[\"'”’])?(?:[0-9⁰¹²³⁴⁵⁶⁷⁸⁹]+)?"
+            r"(?=\s|$|[A-Z\u3400-\u9fff])")
+        source_sentence_count = max(1, len(boundary.findall(source_text)))
+        baseline_sentence_count = max(1, len(re.findall(r"[.!?。！？]", baseline_text)))
+        baseline_complete = baseline_sentence_count >= source_sentence_count
         requirements = {
             "real_source_exists": bool(canonical_segment)
             and bool(source_text) and source_text in canonical_source,
+            "project_target_grounded": not project_target_status or (
+                bool(project_target) and bool(target_contrast)
+                and target_contrast in project_target),
+            "baseline_complete": baseline_complete,
             "opportunity_grounded": bool(trigger and case.get(
                 "difficulty", {}).get("reason"))
             and trigger.casefold() in source_text.casefold(),
             "baseline_plausible": case.get("baseline_plausibility", {}).get(
-                "status") == "plausible",
+                "status") == "plausible" and baseline_complete,
             "diagnosis_evidence_backed": checks["diagnosis_grounding"] == "confirmed"
             and bool(source_evidence_span)
             and source_evidence_span.casefold() in source_text.casefold(),
             "error_confirmed": checks["error_materiality"] == "confirmed"
             and case.get("error", {}).get("materiality") in {"major", "moderate"}
             and bool(case.get("error", {}).get("diagnosis")),
-            "repair_confirmed": checks["repair_correctness"] == "confirmed",
+            "materiality_pass": checks["error_materiality"] == "confirmed"
+            and delta["changed"] and not micro_edit and repair_evidence_confirmed
+            and target_issue_anchor,
+            "repair_evidence_confirmed": repair_evidence_confirmed,
+            "repair_confirmed": checks["repair_correctness"] == "confirmed"
+            and repair_evidence_confirmed,
             "repair_value_confirmed": checks["repair_value"] == "confirmed",
-            "repair_traceable": bool(case.get("error", {}).get("error_id"))
-            and case.get("optimized_translation", {}).get("repairs_error_id")
-            == case.get("error", {}).get("error_id")
-            and bool(case.get("optimized_translation", {}).get("repair_decision"))
-            and bool(case.get("optimized_translation", {}).get("addresses_error")),
+            "academic_analysis_value_confirmed": checks[
+                "academic_analysis_value"] == "confirmed",
+            "analysis_context_sufficient": bool(source_text) and bool(trigger)
+            and bool(case.get("context_before") or case.get("context_after")
+                      or len(source_text) >= 60),
+            "repair_traceable": (
+                bool(case.get("final_target"))
+                if case.get("optimized_translation", {}).get(
+                    "generation_status") == "project_target" else
+                bool(case.get("error", {}).get("error_id"))
+                and case.get("optimized_translation", {}).get("repairs_error_id")
+                == case.get("error", {}).get("error_id")
+                and bool(case.get("optimized_translation", {}).get("repair_decision"))
+                and bool(case.get("optimized_translation", {}).get("addresses_error"))),
             "meaningful_contrast": delta["changed"],
             "baseline_not_already_correct": not bool(raw_validation.get(
                 "baseline_already_correct", True)),
             "no_unrelated_meaning_change": not bool(raw_validation.get(
                 "unrelated_meaning_change", True)),
         }
+        requirements["academic_analysis_value_confirmed"] = (
+            requirements["academic_analysis_value_confirmed"]
+            and requirements["analysis_context_sufficient"]
+            and bool(case.get("difficulty", {}).get("reason"))
+            and case.get("difficulty", {}).get("academic_value", "high") in {
+                "high", "medium"})
         eligible = all(requirements.values())
         rejected_reasons = [key for key, passed in requirements.items() if not passed]
+        synthetic_evidence = {
+            "historical": False,
+            "generated_for_analysis": True,
+            "baseline_plausibility": "pass" if requirements["baseline_plausible"] else "fail",
+            "material_difference": "pass" if requirements["materiality_pass"] else "fail",
+            "repair_correctness": "pass" if requirements["repair_confirmed"]
+            and requirements["repair_value_confirmed"] else "fail",
+            "academic_analysis_value": "pass" if requirements[
+                "academic_analysis_value_confirmed"] else "fail",
+            "generation_reason": str(case.get("generation_reason") or
+                                      case.get("difficulty", {}).get("reason") or "")[:500],
+            "targeted_issue": str(case.get("targeted_issue") or
+                                   case.get("difficulty", {}).get("category") or "")[:120],
+            "academic_analysis_reason": str(raw_validation.get(
+                "academic_analysis_value_reason") or raw_validation.get(
+                    "reason") or "")[:500],
+        }
         items.append({
             **case,
+            "synthetic_evidence": synthetic_evidence,
             "actual_delta": delta,
             "validation": {
                 **checks,
@@ -643,6 +1019,14 @@ def validate_synthetic_cases(
                     "unrelated_meaning_change", True)),
                 "reason": str(raw_validation.get("reason") or "")[:700],
                 "requirements": requirements,
+                "repair_evidence": {
+                    "baseline_issue_span": baseline_issue_span,
+                    "final_repair_span": final_repair_span,
+                    "changed_content_size": changed_content_size,
+                    "repair_span_changed_content_size": repair_changed_content_size,
+                    "micro_edit": micro_edit,
+                    "target_issue_anchor": target_issue_anchor,
+                },
                 "academic_case_eligible": eligible,
                 "rejected_reasons": rejected_reasons,
             },
@@ -677,6 +1061,32 @@ def validate_synthetic_cases(
                 "repair_value_confirmed")) for x in items),
         "academically_eligible_synthetic_cases": sum(
             x.get("validation", {}).get("academic_case_eligible") for x in items),
+        "synthetic_case_count": sum(
+            x.get("validation", {}).get("academic_case_eligible") for x in items),
+        "synthetic_baseline_plausibility": {
+            "pass": sum(x.get("synthetic_evidence", {}).get(
+                "baseline_plausibility") == "pass" for x in items),
+            "fail": sum(x.get("synthetic_evidence", {}).get(
+                "baseline_plausibility") != "pass" for x in items),
+        },
+        "synthetic_materiality": {
+            "pass": sum(x.get("synthetic_evidence", {}).get(
+                "material_difference") == "pass" for x in items),
+            "fail": sum(x.get("synthetic_evidence", {}).get(
+                "material_difference") != "pass" for x in items),
+        },
+        "synthetic_repair_correctness": {
+            "pass": sum(x.get("synthetic_evidence", {}).get(
+                "repair_correctness") == "pass" for x in items),
+            "fail": sum(x.get("synthetic_evidence", {}).get(
+                "repair_correctness") != "pass" for x in items),
+        },
+        "synthetic_academic_analysis_value": {
+            "pass": sum(x.get("synthetic_evidence", {}).get(
+                "academic_analysis_value") == "pass" for x in items),
+            "fail": sum(x.get("synthetic_evidence", {}).get(
+                "academic_analysis_value") != "pass" for x in items),
+        },
     })
 
 
@@ -691,6 +1101,7 @@ def select_diverse_cases(
     eligible = [x for x in artifact.get("items", [])
                 if x.get("validation", {}).get("academic_case_eligible")]
     eligible.sort(key=lambda x: (
+        x.get("baseline_origin") != "legacy_analytical_draft",
         x.get("difficulty", {}).get("academic_value") != "high",
         x.get("difficulty", {}).get("confidence") != "high",
         x.get("case_id")))

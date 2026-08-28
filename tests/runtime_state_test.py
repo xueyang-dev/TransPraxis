@@ -175,6 +175,34 @@ def test_retry_section_invalidates_only_academic_downstream(tmp_path):
         core.OUTPUT_DIR = old_output
 
 
+def test_retry_structural_section_failure_rebuilds_case_outline(tmp_path):
+    old_output = core.OUTPUT_DIR
+    core.OUTPUT_DIR = tmp_path
+    try:
+        job_id = "runtimeretrystructure"
+        state = core.new_job_state("fixture.docx")
+        state.update(p1_done=True, p2_done=True, report_enabled=True)
+        state["academic_state"]["artifacts"] = {
+            name: {"file": f"{name}.json"} for name in (
+                "evidence", "case_analysis_plans", "outline", "sections", "validation")
+        }
+        core.save_job_state(job_id, state)
+        core.update_runtime_state(
+            job_id, status="failed", stage="academic_writing",
+            operation_id="section_rewrite", section_id="3",
+            error={"message": (
+                "学术写作阶段失败：missing case target subsection: 3.3.4")})
+
+        assert core.retry_job_step(job_id)
+        artifacts = core.load_job_state(job_id)["academic_state"]["artifacts"]
+        assert "evidence" in artifacts
+        assert "case_analysis_plans" not in artifacts
+        assert "outline" not in artifacts
+        assert "sections" not in artifacts
+    finally:
+        core.OUTPUT_DIR = old_output
+
+
 def test_event_visibility_and_checkpoint_noise_are_normalized(tmp_path):
     old_output = core.OUTPUT_DIR
     core.OUTPUT_DIR = tmp_path
@@ -318,6 +346,11 @@ def test_pipeline_persists_resume_and_delivery_configuration(tmp_path):
             "style_rules": "保留正式语域", "enable_review": True,
             "enable_annotate": True, "use_tm": False,
             "strict_terminology_governance": False,
+            "enable_understanding": False,
+            "translator": {"provider": "DeepSeek", "model": "deepseek-chat",
+                            "base_url": "", "configured": True},
+            "reviewer": {"provider": "DeepSeek", "model": "deepseek-chat",
+                          "base_url": "", "configured": True},
         }
         assert saved["target_lang"] == "العربية"
         assert saved["auto_term_enabled"] is True

@@ -20,7 +20,9 @@ from typing import Any, Dict, List, Optional
 from defusedxml.ElementTree import fromstring as safe_xml_fromstring
 
 from . import delivery as _delivery
+from . import model_roles
 from . import models
+from . import translation_target
 
 XML_DECL = '<?xml version="1.0" encoding="UTF-8"?>\n'
 
@@ -130,6 +132,10 @@ def tmx_eligible(state: Dict[str, Any], index: int, pair: Dict[str, Any]) -> boo
     """
     if not pair.get("reviewed") or pair.get("stale_due_to_glossary"):
         return False
+    if not translation_target.validate_translation_target(
+            pair.get("source"), pair.get("target"),
+            segment_index=index)["ok"]:
+        return False
     for f in state.get("findings") or []:
         if f.get("segment_index") == index \
                 and f.get("severity") in ("blocking", "actionable"):
@@ -200,6 +206,10 @@ def validate_tmx(xml_bytes: bytes, expected_tus: Optional[int] = None) -> List[s
 def build_jsonl(state: Dict[str, Any], job_id: str = "",
                 delivery_status: Optional[str] = None) -> str:
     """每行一个双语 segment 的 JSONL。"""
+    validation = translation_target.validate_translation_pairs(
+        state.get("pairs") or [])
+    if validation["blocking"]:
+        raise ValueError("JSONL 导出被 Translation Target Invariant 阻止")
     status = delivery_status or state.get("delivery_status") or "draft"
     findings_by_seg: Dict[int, List[Dict[str, Any]]] = {}
     for f in state.get("findings") or []:
@@ -250,11 +260,21 @@ def build_delivery_manifest(
     model: str = "",
     generated_assets: Optional[List[str]] = None,
     source_filename: str = "",
+    translator_config: Optional[Dict[str, Any]] = None,
+    reviewer_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """生成交付清单（统计与任务状态一致）。"""
     stats = state.get("review_stats") or {}
     fg = state.get("glossary_frozen") or {}
     unresolved = _delivery.unresolved_findings(state)
+    translator = model_roles.public_role_config(
+        translator_config or {
+            "provider": provider, "model": model,
+        })
+    reviewer = model_roles.public_role_config(
+        reviewer_config or state.get("reviewer_config") or {
+            "provider": provider, "model": model,
+        })
     return {
         "source_filename": source_filename or state.get("filename", ""),
         "source_hash": _source_hash(state),
@@ -262,6 +282,12 @@ def build_delivery_manifest(
         "target_language": target_lang,
         "model": model,
         "provider": provider,
+        "translator": translator,
+        "reviewer": reviewer,
+        "translation_target_validation": state.get("delivery_validation") or {
+            "status": "not_run",
+            "blocking": False,
+        },
         "document_profile": state.get("document_profile"),
         "frozen_glossary": {
             "version": fg.get("version"),
@@ -332,7 +358,9 @@ def export_all(state: Dict[str, Any], job_id: str, target_lang: str = "",
         state, job_id, target_lang, provider, model,
         generated_assets=["terms.tbx", "memory.tmx", "bilingual.jsonl",
                           "delivery_manifest.json"],
-        source_filename=source_filename)
+        source_filename=source_filename,
+        translator_config=state.get("translator_config"),
+        reviewer_config=state.get("reviewer_config"))
     return {
         "terms.tbx": tbx,
         "memory.tmx": tmx,

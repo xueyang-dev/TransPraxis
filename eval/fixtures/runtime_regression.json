@@ -1,0 +1,52 @@
+{
+  "name": "long_document_runtime_regression",
+  "target_language": "简体中文",
+  "segments": [
+    {
+      "source": "Volumetric sensing is introduced as a theoretical method.",
+      "term": "volumetric sensing",
+      "runtime_target": "体积感知作为一种理论方法被提出。",
+      "runtime_term_target": "体积感知",
+      "raw_term_target": "容积传感",
+      "raw_target": "容积传感作为一种理论方法被提出。"
+    },
+    {
+      "source": "The same volumetric sensing method returns in the next section.",
+      "term": "volumetric sensing",
+      "runtime_target": "下一节再次讨论同一体积感知方法。",
+      "runtime_term_target": "体积感知",
+      "raw_term_target": "容量感知",
+      "raw_target": "下一节再次讨论同一容量感知方法。"
+    },
+    {
+      "source": "The Repellent Fence is cited as an artwork and named object.",
+      "entity": "The Repellent Fence",
+      "runtime_target": "《驱离之篱》被作为一件作品和命名对象引用。",
+      "runtime_entity_target": "《驱离之篱》",
+      "raw_target": "《驱虫栅栏》被作为一件作品和命名对象引用。"
+      ,"raw_entity_target": "《驱虫栅栏》"
+    },
+    {
+      "source": "Later, The Repellent Fence is discussed again.",
+      "entity": "The Repellent Fence",
+      "runtime_target": "随后再次讨论《驱离之篱》。",
+      "runtime_entity_target": "《驱离之篱》",
+      "raw_target": "随后再次讨论《驱鸟围栏》。",
+      "raw_entity_target": "《驱鸟围栏》"
+    }
+  ],
+  "ingestion_case": {
+    "body_before": "winds, temperature, and",
+    "caption": "Odilon Redon, The Eye Like a Strange Balloon",
+    "body_after": "air pressure all play a part.",
+    "expected_caption_in_body": false
+  },
+  "malformed_response": "[\"译文 A\", \"译文 B\"]",
+  "expected": {
+    "term_consistency": true,
+    "entity_consistency": true,
+    "segment_alignment": true,
+    "malformed_output_rejected": true,
+    "source_structural_integrity": true
+  }
+}
