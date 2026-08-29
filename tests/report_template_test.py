@@ -47,7 +47,7 @@ def _mti_template_bytes():
     document.add_paragraph("专业学位硕士学位论文")
     document.add_paragraph("示例大学")
     document.add_paragraph("A Report on E-C Translation of")
-    document.add_paragraph("Nanjing University of Aeronautics and Astronautics")
+    document.add_paragraph("Sample University")
     document.add_paragraph("Master of Translation and Interpreting")
     document.add_paragraph("学位论文独创性声明")
     document.add_paragraph("学位论文使用授权声明")
@@ -490,7 +490,7 @@ def test_mti_contract_captures_full_front_body_and_back_structure():
     assert structure["case_requirement"]["minimum_cases"] == 6
     serialized = __import__("json").dumps(contract, ensure_ascii=False)
     assert "示例大学" not in serialized
-    assert "Nanjing University of Aeronautics and Astronautics" not in serialized
+    assert "Sample University" not in serialized
 
 
 def test_mti_outline_cannot_drift_or_turn_research_questions_into_chapters():
@@ -566,7 +566,7 @@ def test_mti_required_subsection_and_case_minimum_are_hard_failures():
 def test_public_report_hides_ids_anonymizes_universities_and_deduplicates_headings():
     visible = report_template.public_report_markdown(
         "## 3 案例分析\n## 三、案例分析\n"
-        "> [SOURCE seg-job-0001]: Nanjing University of Aeronautics and Astronautics\n"
+        "> [SOURCE seg-job-0001]: Sample University\n"
         "finding-abc term-secret claim-C1 AQ-001 示例大学",
         {"seg-job-0001": "例[1]"})
     assert "seg-" not in visible and "finding-" not in visible

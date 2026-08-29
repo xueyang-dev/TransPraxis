@@ -43,8 +43,11 @@ def test_case_subsections_follow_actual_chapter_and_missing_headings_are_created
     }]}
     fallback = academic_writer._fallback_outline(
         {"research_questions": [], "target_words": 1000}, {"claims": []}, selected)
+    default_case_section = next(
+        section for section in fallback["sections"]
+        if section.get("role") == "case_analysis")
     sections = [
-        (fallback["sections"][0], "1.2", "1.3"),
+        (default_case_section, "3.2", "3.3"),
         ({"section_id": "2", "title": "案例分析", "role": "case_analysis",
           "cases": ["SC-1"], "required_subsections": []}, "2.2", "2.3"),
         ({"section_id": "4", "title": "案例分析", "role": "case_analysis",

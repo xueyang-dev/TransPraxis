@@ -6,90 +6,89 @@ from typing import Any, Dict, Mapping
 
 
 SCHEMA_VERSION = "transpraxis-report-constraints-v4"
+DEFAULT_PROFILE_ID = "MTI_PRACTICE_REPORT_DEFAULT"
+REFERENCE_SOURCE_ID = "mti_practice_report_reference_v1"
+PROJECT_TRACE_SOURCE = "docs/mti-practice-driven-roadmap.md"
 
 
-# This is a concrete project profile, not a generic rules engine.  The
-# roadmap is the currently checked-in authority map; any item that still
-# needs a school-handbook confirmation is explicitly marked manual.
+# The default is a template-driven product profile, not a claim about every
+# institution. User templates and explicit project overrides remain primary.
 COMPLIANCE_PROFILES = {
-    "MTI_PRACTICE_REPORT_DEFAULT": {
-        "profile_id": "MTI_PRACTICE_REPORT_DEFAULT",
-        "institution": "示例培养单位",
-        "program": "MTI 英语笔译",
+    DEFAULT_PROFILE_ID: {
+        "profile_id": DEFAULT_PROFILE_ID,
+        "display_name": "默认 MTI 实践报告规范",
+        "profile_type": "default_mti_practice_report",
+        "program": "MTI 翻译实践报告",
         "effective_date": "2026",
+        "authority_mapping_status": "reference_template_mapped",
         "source_documents": [{
-            "file": "docs/mti-practice-driven-roadmap.md",
-            "page": "—",
-            "clause": "阶段 4：Compliance Profile + Language Constraints",
-            "authority": "TransPraxis 项目规范映射；待学校手册逐条确认的项目显示为 manual",
+            "source_id": REFERENCE_SOURCE_ID,
+            "title": "默认 MTI 实践报告参考结构",
+            "source_type": "reference_template",
+            "scope": "default_profile",
+            "available": True,
         }],
-        "rules": [
-            {"id": "abstract_zh_length", "label": "中文摘要 400—600 字",
-             "source_clause": "阶段 4 / 首批确定性检查 / 中文摘要",
-             "applicability": "启用实践报告时",
-             "check_level": "deterministic"},
-            {"id": "keywords_count", "label": "中英文关键词各 5—8 个",
-             "source_clause": "阶段 4 / 首批确定性检查 / 中英文关键词",
-             "applicability": "启用实践报告时",
-             "check_level": "deterministic"},
-            {"id": "toc_depth", "label": "目录最多三级",
-             "source_clause": "阶段 4 / 首批确定性检查 / 目录",
-             "applicability": "启用实践报告时",
-             "check_level": "deterministic"},
-            {"id": "citation_reference_bidirectional", "label": "正文引用与参考文献双向对应",
-             "source_clause": "阶段 4 / 首批确定性检查 / 正文引用与参考文献",
-             "applicability": "存在参考文献或正文引用时",
-             "check_level": "deterministic"},
-            {"id": "figure_table_numbering", "label": "图表按章编号",
-             "source_clause": "阶段 4 / 首批确定性检查 / 图号与表号",
-             "applicability": "报告含图表时",
-             "check_level": "deterministic"},
-            {"id": "front_back_matter", "label": "正文与附录角色正确",
-             "source_clause": "阶段 4 / 首批确定性检查 / 正文与附录",
-             "applicability": "启用模板或报告要求附录时",
-             "check_level": "deterministic"},
-            {"id": "bilingual_appendix", "label": "存在双语对照附录",
-             "source_clause": "阶段 4 / 首批确定性检查 / 双语对照附录",
-             "applicability": "实践报告终稿",
-             "check_level": "deterministic"},
-            {"id": "source_word_count", "label": "源文原则上不少于 10,000 词",
-             "source_clause": "阶段 4 / 首批确定性检查 / 笔译实践源文",
-             "applicability": "实践报告终稿",
-             "check_level": "deterministic"},
-            {"id": "case_conclusion_coverage", "label": "案例分析为核心章节且结论回应研究问题",
-             "source_clause": "阶段 4 / 首批确定性检查 / 案例分析与结论",
-             "applicability": "启用实践报告时",
-             "check_level": "deterministic"},
-            {"id": "layout_structure", "label": "页面与标题结构符合模板",
-             "source_clause": "阶段 4 / 首批确定性检查 / 页面结构与样式",
-             "applicability": "存在 DOCX 时",
-             "check_level": "manual"},
-            {"id": "synthetic_case_policy", "label": "合成案例计数与披露符合 profile",
-             "source_clause": "阶段 4 / 首批确定性检查 / synthetic case 政策",
-             "applicability": "报告含合成对照案例时",
-             "check_level": "deterministic"},
-            {"id": "author_placeholders", "label": "人工确认项已处理",
-             "source_clause": "阶段 4 / 首批确定性检查 / 【待作者填写】",
-             "applicability": "报告或模板含人工确认项时",
-             "check_level": "manual"},
-        ],
+        "implementation_sources": [{
+            "file": PROJECT_TRACE_SOURCE,
+            "clause": "Stage 4: Compliance Profile + Language Constraints",
+            "source_kind": "implementation_trace",
+        }],
     },
 }
 
 
-def compliance_profile(profile_id: str = "MTI_PRACTICE_REPORT_DEFAULT") -> Dict[str, Any]:
-    """Return a copy of one explicit compliance profile."""
-    profile = deepcopy(COMPLIANCE_PROFILES.get(profile_id) or
-                       COMPLIANCE_PROFILES["MTI_PRACTICE_REPORT_DEFAULT"])
-    source = profile.get("source_documents", [{}])[0]
-    for rule in profile.get("rules") or []:
-        rule["source"] = {
-            "file": source.get("file", "—"),
-            "page": source.get("page", "—"),
-            "clause": rule.get("source_clause") or "—",
-            "authority": source.get("authority", "—"),
-        }
-    return profile
+def compliance_profile(profile_id: str = DEFAULT_PROFILE_ID) -> Dict[str, Any]:
+    """Return the anonymous default profile; custom import is future scope."""
+    return deepcopy(COMPLIANCE_PROFILES[DEFAULT_PROFILE_ID])
+
+
+DEFAULT_MTI_REPORT_SECTIONS = [
+    {
+        "section_id": "1", "title": "第一章 引言", "role": "introduction",
+        "purpose": "说明项目背景、报告目标和全文结构。",
+        "required_subsections": [
+            {"heading_id": "1.1", "title": "项目背景与意义"},
+            {"heading_id": "1.2", "title": "研究问题或报告目标"},
+            {"heading_id": "1.3", "title": "报告结构"},
+        ],
+    },
+    {
+        "section_id": "2", "title": "第二章 翻译项目概述",
+        "role": "project_overview", "purpose": "说明项目及完整翻译流程。",
+        "required_subsections": [
+            {"heading_id": "2.1", "title": "项目简介"},
+            {"heading_id": "2.2", "title": "翻译流程"},
+            {"heading_id": "2.2.1", "title": "译前准备", "level": 3},
+            {"heading_id": "2.2.2", "title": "翻译过程", "level": 3},
+            {"heading_id": "2.2.3", "title": "译后管理", "level": 3},
+        ],
+    },
+    {
+        "section_id": "3", "title": "第三章 翻译项目案例分析",
+        "role": "case_analysis", "purpose": "呈现文本特征、难点与案例解决方案。",
+        "required_subsections": [
+            {"heading_id": "3.1", "title": "文本特征"},
+            {"heading_id": "3.2", "title": "翻译难点", "mapping_side": "problem"},
+            {"heading_id": "3.3", "title": "案例分析与解决方案",
+             "mapping_side": "solution", "allows_dynamic_children": True},
+        ],
+    },
+    {
+        "section_id": "4", "title": "第四章 总结与反思",
+        "role": "conclusion_reflection", "purpose": "总结实践结果与局限。",
+        "required_subsections": [],
+    },
+]
+
+DEFAULT_FRONT_MATTER = [
+    {"role": "abstract_zh", "title": "中文摘要"},
+    {"role": "abstract_en", "title": "ABSTRACT"},
+    {"role": "toc", "title": "目录"},
+]
+DEFAULT_BACK_MATTER = [
+    {"role": "references", "title": "参考文献"},
+    {"role": "appendix", "title": "附录"},
+]
 
 CASE_POLICIES = {
     "proposal": {
@@ -177,6 +176,11 @@ def _sections(settings: Mapping[str, Any], raw=None) -> list[Dict[str, Any]]:
                     "title": heading_title,
                     "level": int(subsection.get("level") or 2),
                     "markdown_prefix": "#" * (int(subsection.get("level") or 2) + 1),
+                    "required": bool(subsection.get("required", True)),
+                    "allows_dynamic_children": bool(
+                        subsection.get("allows_dynamic_children", False)),
+                    "mapping_group": subsection.get("mapping_group"),
+                    "mapping_side": subsection.get("mapping_side"),
                 })
         sections.append({
             "section_id": section_id,
@@ -247,7 +251,11 @@ def build_constraints(settings: Mapping[str, Any] | None = None) -> Dict[str, An
         structure_source = "parsed_template_contract"
     else:
         sections = _sections(settings)
-        structure_source = "user_configured_sections" if sections else "generic_planning"
+        if sections:
+            structure_source = "user_configured_sections"
+        else:
+            sections = _sections(settings, DEFAULT_MTI_REPORT_SECTIONS)
+            structure_source = "default_mti_profile"
     language = str(settings.get("body_language") or "").strip()
     identity = (contract or {}).get("template_identity") or {}
     structure = (contract or {}).get("document_structure") or {}
@@ -282,8 +290,10 @@ def build_constraints(settings: Mapping[str, Any] | None = None) -> Dict[str, An
             "current_pipeline_scope": "configured_sections",
         },
         "chapters": sections,
-        "front_matter": list(structure.get("front_matter") or []) if contract else [],
-        "back_matter": list(structure.get("back_matter") or []) if contract else [],
+        "front_matter": (list(structure.get("front_matter") or []) if contract
+                         else deepcopy(DEFAULT_FRONT_MATTER)),
+        "back_matter": (list(structure.get("back_matter") or []) if contract
+                        else deepcopy(DEFAULT_BACK_MATTER)),
         "style_contract": (contract or {}).get("style_contract") or {},
         "strict_structure": bool(contract),
         "cross_chapter_chain": list(settings.get("cross_chapter_chain") or []),

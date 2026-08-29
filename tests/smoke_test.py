@@ -621,7 +621,8 @@ def test_e2e_pipeline():
         assert stats["reviewed_segments"] == 2 and stats["batches_reviewed"] == 1
         assert stats["blocking"] == 0 and stats["actionable"] == 0
         assert state["has_blocking"] is False
-        assert state["p3_done"] and state["p3_md"].count("## ") == 1
+        assert state["p3_done"] and len(re.findall(
+            r"^## ", state["p3_md"], re.MULTILINE)) == 4
         # 审校通过的段落应已写入翻译记忆
         tm = core.load_tm()
         assert len(tm) == 2 and all(v["reviewed"] for v in tm.values())
@@ -889,8 +890,8 @@ def test_resume_report_sections():
         assert state["p3_done"]
         artifact = json.loads((tmp / jid / "academic-sections.json").read_text(
             encoding="utf-8"))
-        assert len(artifact["sections"]) == 1
-        assert state["p3_md"].count("## ") == 1
+        assert len(artifact["sections"]) == 4
+        assert len(re.findall(r"^## ", state["p3_md"], re.MULTILINE)) == 4
         assert flaky.report_calls == 1, "首次中断应只调用一次未完成的 section"
         print("  ✓ 报告章节级断点续写")
     finally:

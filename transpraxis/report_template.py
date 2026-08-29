@@ -536,8 +536,6 @@ _INTERNAL_ID = re.compile(
 def anonymize_sensitive_institutions(text: str) -> str:
     """Apply the report's user-facing university anonymisation policy."""
     value = str(text or "")
-    value = value.replace(
-        "Nanjing University of Aeronautics and Astronautics", "XX University")
     value = re.sub(r"[\u3400-\u9fff]{2,20}大学", "XX大学", value)
     value = re.sub(
         r"\b(?:[A-Z][A-Za-z&.'’-]*(?:\s+|$)){1,8}University\b(?!\s+Press)",
@@ -651,9 +649,12 @@ def _replace_visible_text(document, replacements: Mapping[str, str]) -> None:
                           for element in part.element.xpath(".//w:p"))
     for paragraph in paragraphs:
         for run in paragraph.runs:
+            value = run.text
             for old, new in replacements.items():
-                if old in run.text:
-                    run.text = run.text.replace(old, new)
+                value = value.replace(old, new)
+            value = anonymize_sensitive_institutions(value)
+            if value != run.text:
+                run.text = value
 
     # python-docx intentionally omits paragraphs nested in structured document
     # tags, including the cached result of a Word TOC.  Replace text nodes in
@@ -662,7 +663,7 @@ def _replace_visible_text(document, replacements: Mapping[str, str]) -> None:
         value = str(node.text or "")
         for old, new in replacements.items():
             value = value.replace(old, new)
-        node.text = value
+        node.text = anonymize_sensitive_institutions(value)
 
 
 def _fill_cover(document, project_title: str) -> None:
@@ -1038,8 +1039,6 @@ def render_report_docx(
 
     project_title = str(report_artifact.get("project_title") or "")
     _replace_visible_text(document, {
-        "示例大学": "XX大学",
-        "Nanjing University of Aeronautics and Astronautics": "XX University",
         "《XXX》": f"《{project_title}》" if project_title else "《当前翻译项目》",
     })
     _fill_cover(document, project_title)

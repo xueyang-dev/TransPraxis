@@ -86,6 +86,8 @@ def _default_new_fields() -> Dict[str, Any]:
         "case_review_overrides": {},
         "final_qa": default_final_qa(),
         "compliance_profile_id": "MTI_PRACTICE_REPORT_DEFAULT",
+        "compliance_record": {},
+        "language_constraint_record": {},
         "academic_state": default_academic_state(),
     }
 
@@ -151,6 +153,10 @@ def migrate_state(state: Any) -> Dict[str, Any]:
     for key, default in _default_new_fields().items():
         if key not in out or out[key] is None:
             out[key] = default
+    # v0.4 exposes one anonymous default profile. Unknown or private profile
+    # identifiers are not preserved in public-facing state until custom
+    # profile import exists.
+    out["compliance_profile_id"] = "MTI_PRACTICE_REPORT_DEFAULT"
 
     # 旧任务可能把新字段存成空串/空 dict，统一归一化
     if out.get("glossary") == {}:
