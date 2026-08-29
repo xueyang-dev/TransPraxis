@@ -25,6 +25,30 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def translation_truth_hash(state: Mapping[str, Any]) -> str:
+    """Hash only the persisted source/initial/current translation triples."""
+    pairs = state.get("pairs") or []
+    payload = {
+        "pairs": [
+            {key: pair.get(key) for key in ("source", "initial_target", "target")}
+            for pair in pairs if isinstance(pair, Mapping)
+        ],
+    }
+    return _sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":")).encode("utf-8"))
+
+
+def _artifact_payload(job_root: Path, record: Mapping[str, Any]) -> Dict[str, Any]:
+    filename = str(record.get("file") or "")
+    if not filename:
+        return {}
+    try:
+        value = json.loads((Path(job_root) / filename).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def state_identity(state: Dict[str, Any]) -> str:
     """Hash the approved translation state without snapshot bookkeeping."""
     value = deepcopy(state)
@@ -94,6 +118,15 @@ def create_snapshot(
             dict(action) for action in state.get("human_actions") or []
             if action.get("action") == "accepted_risk"
         ]
+        artifact_records = deepcopy((state.get("academic_state") or {}).get(
+            "artifacts") or {})
+        final_docx_record = artifact_records.get("final_docx_validation") or {}
+        render_record = artifact_records.get("libreoffice_render") or {}
+        report_qa_record = artifact_records.get("report_qa") or {}
+        compliance_record = artifact_records.get("compliance") or {}
+        final_docx_payload = _artifact_payload(job_root, final_docx_record)
+        render_payload = _artifact_payload(job_root, render_record)
+        truth_hash = translation_truth_hash(state)
         manifest = {
             "snapshot_version": version,
             "created_at": approval.get("timestamp") or _now_iso(),
@@ -106,6 +139,23 @@ def create_snapshot(
             "delivery_status": "final",
             "case_reviews": deepcopy(state.get("case_reviews") or {}),
             "case_review_overrides": deepcopy(state.get("case_review_overrides") or {}),
+            "compliance_state": deepcopy(state.get("compliance_record") or {}),
+            "qa_state": deepcopy(state.get("final_qa") or {}),
+            "translation_truth_hash": truth_hash,
+            "translation_truth": deepcopy(state.get("translation_truth") or {}),
+            "artifact_records": artifact_records,
+            "finalization_bindings": {
+                "translation_truth_hash": truth_hash,
+                "compliance_hash": compliance_record.get("content_hash"),
+                "qa_hash": report_qa_record.get("content_hash") or _sha256(
+                    json.dumps(state.get("final_qa") or {}, ensure_ascii=False,
+                               sort_keys=True, separators=(",", ":")).encode("utf-8")),
+                "report_docx_hash": final_docx_payload.get("source_docx_hash") or
+                final_docx_record.get("source_docx_hash"),
+                "rendered_pdf_hash": render_payload.get("rendered_pdf_hash") or
+                render_record.get("rendered_pdf_hash"),
+                "report_qa_hash": report_qa_record.get("content_hash"),
+            },
             "assets": sorted(asset_records, key=lambda item: item["name"]),
             "artifact_hashes": {
                 item["name"]: item["sha256"] for item in asset_records
