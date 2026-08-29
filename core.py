@@ -41,6 +41,7 @@ from transpraxis import pdf_ingestion as _pdf_ingestion
 from transpraxis import translation_protocol as _translation_protocol
 from transpraxis import translation_target as _translation_target
 from transpraxis import finalization as _finalization
+from transpraxis import rendered_qa as _rendered_qa
 
 # ================= 常量 =================
 # 任务进度与过程文件的本地存储目录（已加入 .gitignore）
@@ -3462,19 +3463,150 @@ def dependency_impact_view(job_id, state=None):
 
 
 def compliance_profile_view(job_id, state=None):
-    """Evaluate the explicit default MTI profile against current persisted artifacts."""
+    """Evaluate source-backed compliance and explicit project constraints."""
     state = state if state is not None else load_job_state(job_id) or {}
-    from transpraxis import thesis_constraints
+    from transpraxis import compliance
     artifacts = {
         name: load_academic_artifact(job_id, name)
         for name in ("evidence", "report", "validation", "outline",
                      "selected_cases", "literature_sources",
                      "final_docx_validation")
     }
-    profile_id = str(state.get("compliance_profile_id") or "MTI_PRACTICE_REPORT_DEFAULT")
-    profile = thesis_constraints.compliance_profile(profile_id)
-    return _finalization.evaluate_compliance(
+    profile_id = str(state.get("compliance_profile_id") or
+                     compliance.DEFAULT_PROFILE_ID)
+    profile = compliance.compliance_profile(profile_id)
+    result = compliance.evaluate_compliance(
         state, artifacts, profile, state.get("p3_md") or "")
+    language = compliance.evaluate_language_constraints(
+        state, state.get("p3_md") or "")
+    result["language_constraints"] = language
+    language_constraints = language.get("constraints") or []
+    result["counts"]["pass"] += sum(
+        item.get("status") == "pass" for item in language_constraints)
+    result["counts"]["fail"] += len(language.get("failures") or [])
+    result["counts"]["manual_review"] += sum(
+        item.get("status") == "manual_review" for item in language_constraints)
+    project = result.setdefault("project_constraints", {})
+    project.setdefault("failures", []).extend(
+        f"language:{item.get('kind')}:{item.get('value')}"
+        for item in language.get("failures") or [])
+    if language.get("failures"):
+        project["status"] = "fail"
+        result["status"] = "fail"
+    if language.get("status") == "manual_review" and \
+            result.get("status") != "fail":
+        result["status"] = "manual_review"
+    return result
+
+
+def current_translation_hash(state=None):
+    from transpraxis import academic_evidence
+    state = state or {}
+    return academic_evidence.stable_hash({
+        "pairs": [
+            {key: pair.get(key) for key in ("source", "initial_target", "target")}
+            for pair in state.get("pairs") or []
+        ],
+    })
+
+
+def generate_report_qa(job_id, state=None, *, save_file=False):
+    """Build the concise QA report and bind it to current artifact hashes."""
+    from transpraxis import academic_evidence, academic_writer
+    state = state or load_job_state(job_id) or {}
+    report_record = load_academic_artifact(job_id, "report") or {}
+    render_record = load_academic_artifact(job_id, "libreoffice_render") or {}
+    final_docx = load_academic_artifact(job_id, "final_docx_validation") or {}
+    compliance = compliance_profile_view(job_id, state)
+    case_review = _finalization.case_review_gate(
+        state, load_academic_artifact(job_id, "selected_cases"))
+    final_qa = _finalization.normalize_final_qa(state.get("final_qa"))
+    final_qa["structural_qa"] = "PASS" if final_docx.get("status") in {
+        "pass", "pass_with_warnings"} else "FAIL" if final_docx.get(
+        "status") == "fail" else "NOT_RUN"
+    translation_hash = current_translation_hash(state)
+    report_hash = str(report_record.get("content_hash") or "")
+    docx_hash = str(render_record.get("source_docx_hash") or
+                    final_docx.get("source_docx_hash") or "")
+    markdown = _rendered_qa.render_qa_markdown(
+        translation_hash=translation_hash, report_hash=report_hash,
+        docx_hash=docx_hash, render_record=render_record,
+        pdf_qa=render_record.get("analysis") or {}, compliance=compliance,
+        case_review=case_review, final_qa=final_qa,
+        placeholders=next((x.get("actual") or [] for x in compliance.get(
+            "rules") or [] if x.get("rule_id") == "author_placeholders"), []))
+    value = {
+        "schema_version": _rendered_qa.VERSION,
+        "generated_at": _finalization.now_iso(),
+        "translation_truth_hash": translation_hash,
+        "report_content_hash": report_hash,
+        "source_docx_hash": docx_hash,
+        "rendered_pdf_hash": render_record.get("rendered_pdf_hash"),
+        "final_qa": final_qa,
+        "compliance_status": compliance.get("status"),
+        "case_review_status": case_review.get("status"),
+        "content_hash": academic_evidence.stable_hash({
+            "translation": translation_hash, "report": report_hash,
+            "docx": docx_hash, "pdf": render_record.get("rendered_pdf_hash"),
+            "compliance": compliance.get("status"),
+            "case_review": case_review.get("status"), "final_qa": final_qa,
+        }),
+        "markdown": markdown,
+    }
+    if save_file:
+        academic_writer._save_artifact(
+            state, job_dir(job_id), "report_qa", value, str(value["content_hash"]),
+            _rendered_qa.VERSION,
+            input_artifact_ids=["report", "final_docx_validation",
+                                "libreoffice_render"],
+            input_segment_ids=[])
+        (job_dir(job_id) / "report-qa.md").write_text(markdown, encoding="utf-8")
+        save_job_state(job_id, state)
+    return value
+
+
+def save_compliance_record(job_id, state=None):
+    """Persist the current compliance and language-constraint artifacts."""
+    from transpraxis import academic_evidence, academic_writer, compliance
+    state = state or load_job_state(job_id) or {}
+    result = compliance_profile_view(job_id, state)
+    academic = state.get("academic_state") or {}
+    records = academic.get("artifacts") or {}
+    compliance_dependency = academic_evidence.stable_hash({
+        "profile_id": result.get("profile_id"),
+        "report": (records.get("report") or {}).get("content_hash"),
+        "evidence": (records.get("evidence") or {}).get("content_hash"),
+        "selected_cases": (records.get("selected_cases") or {}).get("content_hash"),
+        "literature_sources": (records.get("literature_sources") or {}).get(
+            "content_hash"),
+        "outline": (records.get("outline") or {}).get("content_hash"),
+    })
+    academic_writer._save_artifact(
+        state, job_dir(job_id), "compliance", result,
+        compliance_dependency, compliance.compliance_profile(
+            str(state.get("compliance_profile_id") or compliance.DEFAULT_PROFILE_ID)
+        ).get("schema_version"),
+        input_artifact_ids=["report", "evidence", "selected_cases",
+                            "literature_sources"])
+    language = result.get("language_constraints") or {}
+    settings = state.get("research_settings") or {}
+    language_dependency = academic_evidence.stable_hash({
+        "report": (records.get("report") or {}).get("content_hash"),
+        "language_constraints": {
+            key: settings.get(key) for key in (
+                "forbidden_report_phrases", "allowed_theory_labels",
+                "required_terminology", "protected_names",
+                "protected_work_titles")
+        },
+    })
+    academic_writer._save_artifact(
+        state, job_dir(job_id), "language_constraints", language,
+        language_dependency, compliance.VERSION,
+        input_artifact_ids=["report"])
+    state["compliance_record"] = result
+    state["language_constraint_record"] = language
+    save_job_state(job_id, state)
+    return result
 
 
 def _case_artifact_case(job_id, case_id):
@@ -3484,10 +3616,18 @@ def _case_artifact_case(job_id, case_id):
     return selected, case
 
 
-def _mark_case_downstream_stale(job_id, state, case_id, reason, *, actor="user", action="case_changed"):
+def _mark_case_downstream_stale(job_id, state, case_id, reason, *, actor="user",
+                                action="case_changed", root_stale=True):
     from transpraxis import academic_writer
+    root_id = f"case:{case_id}"
+    before_root = dict((state.get("academic_state") or {}).get(
+        "artifacts", {}).get(root_id) or {})
     propagated = academic_writer.propagate_artifact_staleness(
         state, input_artifact_ids=[f"case:{case_id}"])
+    if not root_stale and before_root:
+        academic = state.setdefault("academic_state", {})
+        academic.setdefault("artifacts", {})[root_id] = before_root
+        academic_writer._write_status_mirror(academic, root_id, before_root)
     enriched = dict(state)
     enriched["_finalization_artifacts"] = _finalization_artifacts(job_id)
     impact = _finalization.build_dependency_impact(
@@ -3549,6 +3689,10 @@ def review_academic_case(job_id, case_id, status, note="", actor="user"):
         "timestamp": _finalization.now_iso(),
         "actor": actor,
     })
+    _mark_case_downstream_stale(
+        job_id, state, str(case_id),
+        "作者更新案例审核状态，需重组案例相关写作下游",
+        actor=actor, action="case_review_changed", root_stale=False)
     save_job_state(job_id, state)
     return state, True, "已保存案例审校状态"
 
@@ -3629,9 +3773,9 @@ def replace_rejected_case(job_id, case_id, *, actor="user"):
         str(record.get("dependency_hash") or ""),
         str(record.get("version") or "case-review-v1"))
     _mark_case_downstream_stale(
-        job_id, state, str(case_id),
+        job_id, state, str(candidate.get("case_id")),
         "作者排除案例后从已验证候选池替换，需重组其写作下游",
-        actor=actor, action="case_replaced")
+        actor=actor, action="case_replaced", root_stale=False)
     state.setdefault("case_reviews", {})[str(candidate.get("case_id"))] = {
         "review_status": "unreviewed",
         "case_origin": candidate.get("case_origin"),
@@ -3718,13 +3862,18 @@ def record_final_qa(job_id, field, status, note="", actor="user"):
 
 
 def run_libreoffice_render_qa(job_id, state=None):
-    """Render the current report/translation DOCX with LibreOffice and record QA."""
+    """Render through LibreOffice, then run separate deterministic PDF QA."""
     state = state or load_job_state(job_id)
     if state is None:
         raise ValueError(f"找不到任务 {job_id}")
     docx = report_docx_bytes(job_id, state)
     document_kind = "report"
     if docx is None:
+        report_record = (state.get("academic_state") or {}).get(
+            "artifacts", {}).get("report") or {}
+        if state.get("report_enabled") and state.get("p3_done") and \
+                report_record.get("status") in {"stale", "missing", "failed"}:
+            raise RuntimeError("当前实践报告 artifact 已 stale，请先按影响范围重建报告")
         try:
             docx = build_delivery_assets(job_id, state).get("translation.docx")
             document_kind = "translation"
@@ -3732,10 +3881,47 @@ def run_libreoffice_render_qa(job_id, state=None):
             raise RuntimeError(f"当前 DOCX 不可生成：{str(exc)[:180]}") from exc
     if not docx:
         raise RuntimeError("当前没有可渲染的 DOCX")
+    previous_render = load_academic_artifact(job_id, "libreoffice_render") or {}
+    current_qa = _finalization.normalize_final_qa(state.get("final_qa"))
+    if (previous_render.get("rendered_pdf_hash") or
+            previous_render.get("qa_status") == "PASS" or
+            current_qa.get("author_visual_review") == "CONFIRMED" or
+            current_qa.get("word_final_review") == "CONFIRMED"):
+        _reset_final_qa(state, "LibreOffice render rerun; author and Word reviews reset")
+        if current_qa.get("structural_qa") in {"PASS", "FAIL"}:
+            state["final_qa"]["structural_qa"] = current_qa["structural_qa"]
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not soffice:
-        raise RuntimeError("未找到 LibreOffice（soffice），无法运行渲染预检")
+        qa = _finalization.normalize_final_qa(state.get("final_qa"))
+        qa.update({"libreoffice_render": "NOT_RUN", "rendered_at": None,
+                   "page_count": None, "source_docx_hash": _rendered_qa.sha256(docx),
+                   "rendered_pdf_hash": None,
+                   "updated_at": _finalization.now_iso(),
+                   "translation_truth_version": int(
+                       (state.get("translation_truth") or {}).get("version") or 0)})
+        qa.setdefault("notes", {})["libreoffice_render"] = \
+            "LibreOffice not installed; render NOT_RUN"
+        state["final_qa"] = qa
+        from transpraxis import academic_writer
+        academic_writer._save_artifact(
+            state, job_dir(job_id), "libreoffice_render", {
+                "schema_version": _rendered_qa.VERSION,
+                "status": "not_run", "qa_status": "NOT_RUN",
+                "render_engine": "libreoffice", "render_engine_version": None,
+                "source_docx_hash": _rendered_qa.sha256(docx),
+                "rendered_pdf_hash": None, "rendered_at": None, "page_count": None,
+                "stale_reason": "LibreOffice unavailable; render was not run",
+                "analysis": {"warnings": [], "manual_reviews": [{
+                    "type": "libreoffice_unavailable", "severity": "manual_review"}]},
+            }, "no-engine", _rendered_qa.VERSION,
+            input_artifact_ids=["final_docx_validation"], status="missing")
+        generate_report_qa(job_id, state, save_file=True)
+        save_job_state(job_id, state)
+        return state, qa
     from transpraxis import academic_evidence, academic_writer
+    version_result = subprocess.run([soffice, "--version"], capture_output=True,
+                                    text=True, timeout=10, check=False)
+    engine_version = (version_result.stdout or version_result.stderr or "").strip()
     with tempfile.TemporaryDirectory(prefix=f"transpraxis-lo-{job_id}-") as tmp:
         tmp_path = Path(tmp)
         source_path = tmp_path / "current.docx"
@@ -3761,6 +3947,13 @@ def run_libreoffice_render_qa(job_id, state=None):
             render_value = {
                 "status": "fail", "qa_status": "FAIL", "document_kind": document_kind,
                 "detail": detail[:700],
+                "render_engine": "libreoffice", "render_engine_version": engine_version,
+                "source_docx_hash": _rendered_qa.sha256(docx),
+                "rendered_pdf_hash": None,
+                "rendered_at": _finalization.now_iso(), "page_count": None,
+                "stale_reason": {"code": "render_failed",
+                                 "source_type": "artifact",
+                                 "source_id": "final_docx_validation"},
             }
             academic_writer._save_artifact(
                 state, job_dir(job_id), "libreoffice_render", render_value,
@@ -3773,28 +3966,24 @@ def run_libreoffice_render_qa(job_id, state=None):
                 input_artifact_ids=["final_docx_validation"], status="failed",
                 stale_reason={"code": "render_failed", "source_type": "artifact",
                               "source_id": "final_docx_validation"})
+            generate_report_qa(job_id, state, save_file=True)
             save_job_state(job_id, state)
             raise RuntimeError(f"LibreOffice 渲染失败：{detail[:180]}")
         pdf_bytes = pdf_path.read_bytes()
     output = job_dir(job_id) / "libreoffice-render.pdf"
     output.write_bytes(pdf_bytes)
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
-        page_count = document.page_count
-        page_metrics = []
-        for page in document:
-            blocks = page.get_text("blocks")
-            page_metrics.append({
-                "text_blocks": len(blocks),
-                "text_chars": len(page.get_text("text")),
-                "images": len(page.get_images(full=True)),
-                "drawings": len(page.get_drawings()),
-            })
+    analysis = _rendered_qa.analyze_pdf(pdf_bytes)
+    page_count = int(analysis.get("page_count") or 0)
+    page_metrics = analysis.get("pages") or []
+    render_status = "PASS" if page_count and not analysis.get(
+        "definite_failures") else "FAIL"
     qa = _finalization.normalize_final_qa(state.get("final_qa"))
     qa.update({
-        "libreoffice_render": "PASS" if page_count and all(
-            item["text_chars"] > 0 for item in page_metrics) else "FAIL",
+        "libreoffice_render": render_status,
         "rendered_at": _finalization.now_iso(),
         "page_count": page_count,
+        "source_docx_hash": _rendered_qa.sha256(docx),
+        "rendered_pdf_hash": _rendered_qa.sha256(pdf_bytes),
         "translation_truth_version": int(
             (state.get("translation_truth") or {}).get("version") or 0),
         "updated_at": _finalization.now_iso(),
@@ -3802,13 +3991,11 @@ def run_libreoffice_render_qa(job_id, state=None):
     qa.setdefault("notes", {})["document_kind"] = document_kind
     qa["page_metrics"] = page_metrics
     state["final_qa"] = qa
-    render_value = {
-        "status": "pass" if qa["libreoffice_render"] == "PASS" else "fail",
-        "qa_status": qa["libreoffice_render"],
-        "document_kind": document_kind,
-        "page_count": page_count,
-        "page_metrics": page_metrics,
-    }
+    render_value = _rendered_qa.build_render_record(
+        document_kind=document_kind, source_docx=docx, rendered_pdf=pdf_bytes,
+        engine="libreoffice", engine_version=engine_version, analysis=analysis)
+    render_value["qa_status"] = render_status
+    render_value["status"] = "pass" if render_status == "PASS" else "fail"
     academic_writer._save_artifact(
         state, job_dir(job_id), "libreoffice_render", render_value,
         academic_evidence.stable_hash({
@@ -3818,6 +4005,7 @@ def run_libreoffice_render_qa(job_id, state=None):
         }), _finalization.VERSION,
         input_artifact_ids=["final_docx_validation"],
         status="valid" if qa["libreoffice_render"] == "PASS" else "failed")
+    generate_report_qa(job_id, state, save_file=True)
     save_job_state(job_id, state)
     return state, qa
 
@@ -4192,8 +4380,13 @@ def report_docx_bytes(job_id, state=None, frozen_assets=None):
         return None
     template = load_report_template(job_id)
     if template:
-        from transpraxis import academic_evidence, academic_writer, final_docx, report_template
+        from transpraxis import academic_evidence, academic_writer, compliance
+        from transpraxis import final_docx, report_template
         artifact = load_academic_artifact(job_id, "report")
+        report_record = academic_writer.artifact_record(state, "report")
+        if isinstance((state.get("academic_state") or {}).get("artifacts", {}).get(
+                "report"), dict) and report_record.get("status") != "valid":
+            return None
         if not artifact:
             raise report_template.TemplateParseError(
                 "模板化报告缺少结构化 report artifact，请重新生成报告。")
@@ -4203,7 +4396,32 @@ def report_docx_bytes(job_id, state=None, frozen_assets=None):
             return None
         rendered = _bytes(report_template.render_report_docx(
             artifact, template["bytes"], template["contract"]))
+        source_docx_hash = _rendered_qa.sha256(rendered)
+        previous_docx = academic_writer.artifact_record(
+            state, "final_docx_validation")
+        previous_qa = _finalization.normalize_final_qa(state.get("final_qa"))
+        previous_docx_hash = str(
+            previous_docx.get("source_docx_hash") or
+            previous_qa.get("source_docx_hash") or "")
+        if (previous_docx_hash and previous_docx_hash != source_docx_hash) or (
+                isinstance(previous_docx, dict) and previous_docx and (
+                    previous_qa.get("author_visual_review") == "CONFIRMED" or
+                    previous_qa.get("word_final_review") == "CONFIRMED")):
+            academic_writer.propagate_artifact_staleness(
+                state, input_artifact_ids=["final_docx_validation"])
+            _reset_final_qa(state, "DOCX bytes changed; render and human reviews reset")
         final_validation = final_docx.validate_final_docx(rendered, artifact)
+        final_validation.update({
+            "source_docx_hash": source_docx_hash,
+            "report_content_hash": (state.get("academic_state") or {}).get(
+                "artifacts", {}).get("report", {}).get("content_hash") or
+                artifact.get("content_hash"),
+            "layout_facts": compliance.inspect_docx_layout(rendered),
+        })
+        final_validation["content_hash"] = academic_evidence.stable_hash({
+            key: value for key, value in final_validation.items()
+            if key != "content_hash"
+        })
         final_validation_dep = academic_evidence.stable_hash({
             "report": (state.get("academic_state") or {}).get("artifacts", {}).get(
                 "report", {}).get("content_hash") or artifact.get("content_hash"),
@@ -4216,12 +4434,27 @@ def report_docx_bytes(job_id, state=None, frozen_assets=None):
             final_validation_dep, final_docx.SCHEMA_VERSION,
             input_artifact_ids=["report"],
             status="valid" if final_validation.get("status") != "fail" else "failed")
+        qa = _finalization.normalize_final_qa(state.get("final_qa"))
+        qa.update({
+            "structural_qa": "FAIL" if final_validation.get("status") == "fail"
+            else "PASS",
+            "source_docx_hash": source_docx_hash,
+            "updated_at": _finalization.now_iso(),
+        })
+        state["final_qa"] = qa
+        save_compliance_record(job_id, state)
+        generate_report_qa(job_id, state, save_file=True)
         save_job_state(job_id, state)
         if final_validation.get("status") == "fail":
             return None
         return rendered
     if state.get("report_status") in {
             "incomplete", "failed_template_validation", "review_required"}:
+        return None
+    from transpraxis import academic_writer
+    if isinstance((state.get("academic_state") or {}).get("artifacts", {}).get(
+            "report"), dict) and academic_writer.artifact_record(
+                state, "report").get("status") != "valid":
         return None
     return _bytes(markdown_to_word(report, state.get("theory") or ""))
 
@@ -4596,12 +4829,23 @@ def load_context_artifacts(job_id, state=None):
     }
 
 
-def task_status_label(state):
+def task_status_label(state, job_id=""):
     """User-facing task status derived from persisted workflow state."""
     from transpraxis import delivery as _delivery
 
+    if job_id:
+        snapshot = delivery_snapshot_status(job_id, state)
+        latest = snapshot.get("latest") or {}
+        version = latest.get("snapshot_version")
+        if snapshot.get("current"):
+            return (f"已冻结交付 v{version}" if version is not None else
+                    "已冻结交付")
+        if snapshot.get("diverged"):
+            return (f"工作版本已偏离冻结交付 v{version}" if version is not None else
+                    "工作版本已偏离冻结交付")
+
     if state.get("delivery_status") == "final":
-        return "已交付"
+        return "已冻结交付"
     if state.get("p2_done") and _delivery.unresolved_blocking(state):
         return "待审校"
     academic = state.get("academic_state") or {}
@@ -4611,7 +4855,14 @@ def task_status_label(state):
         return "待学术复核"
     if state.get("p2_done") and (
             state.get("p3_done") or not state.get("report_enabled", True)):
-        return "可交付"
+        if state.get("report_enabled", True):
+            final_qa = state.get("final_qa") or {}
+            report_status = state.get("report_status") or academic.get("report_status")
+            if (report_status != "generated" or
+                    final_qa.get("author_visual_review") != "CONFIRMED" or
+                    final_qa.get("word_final_review") != "CONFIRMED"):
+                return "暂不满足交付条件"
+        return "可以冻结交付"
     if state.get("p1_done") and not state.get("p2_done"):
         if (state.get("stage") == "TERMS_PREPARED" and state.get("quality_mode")
                 and state.get("glossary") is not None
@@ -4638,7 +4889,7 @@ def save_glossary_draft(job_id, entries):
     return state
 
 
-def _apply_glossary_staleness(state):
+def _apply_glossary_staleness(state, job_id=None):
     """把受冻结术语表变更影响的段落标记 stale，并清除其 TM 信任。
 
     权威集合：每次调用都重新计算（先清旧标记/旧 stale finding，
@@ -4710,6 +4961,31 @@ def _apply_glossary_staleness(state):
                                  if f["severity"] == "informational")
     state["has_blocking"] = stats["blocking"] > 0
     state["delivery_status"] = _delivery.compute_delivery_status(state)
+    if job_id:
+        from transpraxis import academic_writer
+        segment_ids = [
+            _finalization.segment_id(job_id, index, pairs[index])
+            for index in stale if 0 <= index < len(pairs)
+        ]
+        propagated = academic_writer.propagate_artifact_staleness(
+            state, input_segment_ids=segment_ids)
+        enriched = dict(state)
+        enriched["_finalization_artifacts"] = _finalization_artifacts(job_id)
+        state["dependency_impact"] = _finalization.build_dependency_impact(
+            enriched, job_id, stale, "冻结术语表变化")
+        affected_cases = [name.split(":", 1)[1] for name in propagated
+                          if str(name).startswith("case:")]
+        _finalization.mark_case_reviews_stale(
+            state, affected_cases, "冻结术语表变化影响了本案例绑定段落")
+        if propagated:
+            academic = state.setdefault("academic_state", {})
+            if any(name in propagated for name in {"sections", "report", "validation", "review"}):
+                state["p3_done"] = False
+                state["p3_md"] = ""
+                state["p3_sections"] = []
+                academic["status"] = "stale"
+            _reset_final_qa(state, "冻结术语表变化；相关案例与学术下游需重新检查")
+            _invalidate_final_delivery_state(state)
     return state, stale
 
 
@@ -4891,7 +5167,7 @@ def freeze_glossary(job_id, entries=None, frozen_by="user"):
     if state.get("delivery_status") not in ("approved", "final"):
         state["delivery_status"] = "draft"
     # 术语决策变化 -> 立即失效受影响段落
-    state, stale = _apply_glossary_staleness(state)
+    state, stale = _apply_glossary_staleness(state, job_id)
     if was_final and not stale:
         _invalidate_final_delivery_state(state)
     save_job_state(job_id, state)
@@ -5007,13 +5283,70 @@ def approve_delivery(job_id, note="", accept_blocking=False, actor="user",
     state = load_job_state(job_id)
     if state is None:
         return None, False, ["任务不存在"]
+    if state.get("report_enabled") and state.get("report_status") in {
+            "incomplete", "failed_template_validation", "review_required"}:
+        return state, False, ["实践报告尚未完成，不能冻结最终交付"]
+    academic_records = (state.get("academic_state") or {}).get("artifacts") or {}
+    # A pre-v0.4 job may have only p3_md and the old delivery formats.  It can
+    # still be read and delivered through its historical path; strict report
+    # compliance/QA begins once a structured report artifact is present.
+    strict_report_gate = state.get("report_enabled") and (
+        isinstance(academic_records.get("report"), dict) or
+        any(name in academic_records for name in (
+            "compliance", "final_docx_validation", "libreoffice_render",
+            "report_qa")))
     case_gate = _finalization.case_review_gate(
-        state, load_academic_artifact(job_id, "selected_cases"))
+        state, load_academic_artifact(job_id, "selected_cases"),
+        require_artifact_status=bool(strict_report_gate))
     if case_gate.get("status") == "blocked":
         labels = ", ".join(case_gate.get("blocked_case_ids") or [])
         return state, False, [
             f"案例人工终审未通过：{labels}。作者拒绝或过期案例不能进入最终交付。"
         ]
+    if strict_report_gate:
+        compliance = compliance_profile_view(job_id, state)
+        profile_rules = compliance.get("profile_compliance") or {}
+        project = compliance.get("project_constraints") or {}
+        if profile_rules.get("status") == "fail":
+            return state, False, [
+                "Default profile compliance failed: " +
+                ", ".join(profile_rules.get("blocking_failures") or [])]
+        if project.get("status") == "fail":
+            return state, False, [
+                "Project compliance constraint failed: " +
+                ", ".join(project.get("failures") or [])]
+        from transpraxis import academic_writer
+        report_record = academic_writer.artifact_record(state, "report")
+        docx_record = academic_writer.artifact_record(
+            state, "final_docx_validation")
+        render_record_state = academic_writer.artifact_record(
+            state, "libreoffice_render")
+        stale_artifacts = [name for name, record in (
+            ("report", report_record),
+            ("DOCX", docx_record),
+            ("LibreOffice render", render_record_state),
+        ) if record.get("status") in {"stale", "missing", "failed"}]
+        if stale_artifacts:
+            return state, False, [
+                "Finalization artifacts are stale or unavailable: " +
+                ", ".join(stale_artifacts)]
+        final_docx = load_academic_artifact(job_id, "final_docx_validation") or {}
+        render_record = load_academic_artifact(job_id, "libreoffice_render") or {}
+        qa = _finalization.normalize_final_qa(state.get("final_qa"))
+        structural = "PASS" if final_docx.get("status") in {
+            "pass", "pass_with_warnings"} else "FAIL" if final_docx.get(
+            "status") == "fail" else "NOT_RUN"
+        qa_reasons = []
+        if structural != "PASS":
+            qa_reasons.append(f"Structural QA={structural}")
+        if render_record.get("qa_status") != "PASS":
+            qa_reasons.append(f"LibreOffice Render={render_record.get('qa_status', 'NOT_RUN')}")
+        if qa.get("author_visual_review") != "CONFIRMED":
+            qa_reasons.append("Author Visual Review=NOT_CONFIRMED")
+        if qa.get("word_final_review") != "CONFIRMED":
+            qa_reasons.append("Word Final Review=NOT_CONFIRMED")
+        if qa_reasons:
+            return state, False, ["Final QA gate blocked: " + "; ".join(qa_reasons)]
     validation = validate_delivery_translation_state(state)
     if validation["blocking"]:
         _record_delivery_validation_findings(state, validation)
@@ -5151,13 +5484,15 @@ def generate_mti_report(bilingual_pairs, termbase_dict, theory, provider, api_ke
     durable academic artifacts beside ``state.json``.
     """
     from transpraxis import academic_writer
-    return academic_writer.run_academic_pipeline(
+    report_md = academic_writer.run_academic_pipeline(
         state, job_id, theory, provider, api_key, model,
         artifact_dir=job_dir(job_id), call_llm=call_llm,
         save_state=lambda current: save_job_state(job_id, current),
         research_settings=research_settings, literature_sources=literature_sources,
         on_status=on_status,
     )
+    save_compliance_record(job_id, load_job_state(job_id) or state)
+    return report_md
 
 
 # ================= 主流程：单文档完整流水线 =================
@@ -5259,7 +5594,7 @@ def run_job_pipeline(job_id, filename, file_bytes, *, provider, api_key, model,
 
     # 术语依赖失效：必须在“全部完成”早退之前执行，
     # 否则冻结术语表变更后的旧译文会继续以 reviewed/final/TM 状态存在。
-    state, stale_segs = _apply_glossary_staleness(state)
+    state, stale_segs = _apply_glossary_staleness(state, job_id)
     if stale_segs:
         save_job_state(job_id, state)
 

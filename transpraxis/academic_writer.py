@@ -77,6 +77,8 @@ ARTIFACT_FILES = {
     "outline": "academic-outline.json",
     "sections": "academic-sections.json",
     "report": "academic-report.json",
+    "compliance": "academic-compliance.json",
+    "language_constraints": "language-constraints.json",
     "validation": "academic-validation.json",
     "review": "academic-review.json",
     "literature_support_review": "literature-support-review.json",
@@ -88,6 +90,7 @@ ARTIFACT_FILES = {
     "quality_repair_history": "academic-quality-repair-history.json",
     "repair_history": "academic-repair-history.json",
     "final_docx_validation": "final-docx-validation.json",
+    "report_qa": "report-qa.json",
     "libreoffice_render": "libreoffice-render-status.json",
 }
 
@@ -99,7 +102,8 @@ _LLM_ARTIFACTS = {
     "academic_quality",
 }
 _COMPOSITE_ARTIFACTS = {"sections", "report"}
-_QA_ARTIFACTS = {"validation", "final_docx_validation", "libreoffice_render"}
+_QA_ARTIFACTS = {"validation", "final_docx_validation", "libreoffice_render",
+                 "compliance", "language_constraints", "report_qa"}
 
 
 def _now() -> str:
@@ -268,13 +272,20 @@ _DEFAULT_ARTIFACT_INPUTS = {
     "review": ["report", "argument_plan", "outline"],
     "literature_support_review": ["report", "argument_plan", "literature_claims"],
     "academic_quality": ["report", "validation", "review"],
+    "compliance": ["report", "evidence", "selected_cases",
+                    "literature_sources", "outline"],
+    "language_constraints": ["report"],
+    "report_qa": ["report", "compliance", "language_constraints",
+                   "selected_cases", "final_docx_validation",
+                   "libreoffice_render"],
     "human_evidence_needs": ["evidence", "case_analysis_plans", "academic_quality"],
     "human_evidence_questions": ["human_evidence_needs", "evidence", "case_analysis_plans"],
 }
 _DELEGATED_SEGMENT_ARTIFACTS = {
     "selected_cases", "outline", "sections", "report", "validation", "review",
     "literature_support_review", "academic_quality", "final_docx_validation",
-    "libreoffice_render", "repair_history", "quality_repair_history",
+    "libreoffice_render", "compliance", "language_constraints", "report_qa",
+    "repair_history", "quality_repair_history",
 }
 
 

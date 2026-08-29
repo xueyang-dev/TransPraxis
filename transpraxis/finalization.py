@@ -51,6 +51,9 @@ ARTIFACT_LABELS = {
     "review": "独立语义复核",
     "literature_support_review": "文献支持复核",
     "academic_quality": "学术质量评估",
+    "compliance": "学校合规结果",
+    "language_constraints": "项目语言约束",
+    "report_qa": "报告 QA",
     "final_docx_validation": "DOCX 结构验证",
     "delivery_assets": "最终交付文件",
     "libreoffice_render": "LibreOffice 渲染",
@@ -75,6 +78,8 @@ def default_final_qa() -> Dict[str, Any]:
         "schema_version": VERSION,
         **QA_DEFAULTS,
         "translation_truth_version": 0,
+        "source_docx_hash": None,
+        "rendered_pdf_hash": None,
         "rendered_at": None,
         "page_count": None,
         "page_metrics": [],
@@ -266,6 +271,7 @@ def case_review_view(case: Mapping[str, Any], state: Mapping[str, Any] | None = 
 
 def case_review_gate(
     state: Mapping[str, Any], selected_cases: Mapping[str, Any] | None = None,
+    *, require_artifact_status: bool = False,
 ) -> Dict[str, Any]:
     """Evaluate the author quality gate for cases used by the current report.
 
@@ -292,18 +298,29 @@ def case_review_gate(
         synthetic = case_provenance.is_synthetic(out)
         baseline_status = str(out.get("baseline_status") or "unreviewed")
         evidence = out.get("synthetic_evidence") or {}
-        machine_valid = not synthetic or all(
-            str(evidence.get(key) or "not_checked") in {"pass", "true", "high"}
-            for key in ("baseline_plausibility", "material_difference",
-                        "repair_correctness")
-        )
+        validation = out.get("validation") or {}
+        if synthetic and isinstance(validation, Mapping) and \
+                "academic_case_eligible" in validation:
+            # Reuse the existing synthetic pipeline's eligibility decision;
+            # human review is a separate gate and never replaces it.
+            machine_valid = bool(validation.get("academic_case_eligible"))
+        else:
+            machine_valid = not synthetic or all(
+                str(evidence.get(key) or "not_checked") in {"pass", "true", "high"}
+                for key in ("baseline_plausibility", "material_difference",
+                            "repair_correctness")
+            )
         reasons = []
+        provenance_errors = case_provenance.provenance_issues(case)
+        if provenance_errors:
+            reasons.append("case provenance invalid: " + ", ".join(provenance_errors))
         if review_status != "approved":
             reasons.append(f"review_status={review_status}")
         if review_status == "approved" and bool(out.get("content_stale")):
             reasons.append("approved content is stale")
-        if artifact_status == "stale":
-            reasons.append("case artifact is stale")
+        if artifact_status in {"stale", "missing", "failed"} or (
+                require_artifact_status and artifact_status == "not_available"):
+            reasons.append("case artifact is stale or unavailable")
         if synthetic and baseline_status == "rejected":
             reasons.append("synthetic baseline rejected")
         if synthetic and not machine_valid:
@@ -664,7 +681,14 @@ def evaluate_compliance(
     state: Mapping[str, Any], artifacts: Mapping[str, Any],
     profile: Mapping[str, Any], report_text: str = "",
 ) -> Dict[str, Any]:
-    """Evaluate the concrete default MTI profile without producing a holistic score."""
+    """Evaluate the configured MTI profile without producing a holistic score."""
+    if any(isinstance(rule, Mapping) and "rule_id" in rule
+           for rule in profile.get("rules") or []):
+        # Keep one authoritative evaluator for the source-backed profile;
+        # the legacy branch below only serves pre-v0.4 profile records.
+        from . import compliance
+        return compliance.evaluate_compliance(
+            state, artifacts, profile, report_text)
     import re
 
     report_artifact = artifacts.get("report") or {}

@@ -174,6 +174,36 @@ def test_final_qa_metadata_does_not_make_frozen_content_diverge(tmp_path):
         core.OUTPUT_DIR = old_output
 
 
+def test_task_status_label_uses_precise_freeze_lifecycle(tmp_path):
+    old_output = core.OUTPUT_DIR
+    core.OUTPUT_DIR = tmp_path
+    try:
+        job_id = "finalizationlabel01"
+        state = core.new_job_state("lifecycle.docx")
+        state.update(
+            p1_done=True, p2_done=True, report_enabled=False,
+            paras=["Source"], pairs=[{"source": "Source", "target": "译文"}])
+        core.save_source(job_id, b"source")
+        core.save_job_state(job_id, state)
+
+        assert core.task_status_label(state, job_id) == "可以冻结交付"
+        frozen, ok, errors = core.approve_delivery(job_id)
+        assert ok, errors
+        assert core.task_status_label(frozen, job_id) == "已冻结交付 v1"
+
+        diverged = core.save_translation_edit(job_id, 0, "新译文")
+        assert core.task_status_label(diverged, job_id) == "工作版本已偏离冻结交付 v1"
+
+        report_state = core.new_job_state("review-required.docx")
+        report_state.update(
+            p1_done=True, p2_done=True, p3_done=True, report_enabled=True,
+            report_status="generated", final_qa=finalization.normalize_final_qa(None),
+            paras=["Source"], pairs=[{"source": "Source", "target": "译文"}])
+        assert core.task_status_label(report_state) == "暂不满足交付条件"
+    finally:
+        core.OUTPUT_DIR = old_output
+
+
 def test_case_and_qa_workspace_surfaces_render_without_conflating_states(tmp_path):
     from streamlit.testing.v1 import AppTest
 
@@ -240,7 +270,7 @@ def test_case_and_qa_workspace_surfaces_render_without_conflating_states(tmp_pat
         at.session_state["workspace_section"] = "delivery"
         at.run()
         assert not at.exception, at.exception
-        assert any("暂不可安全交付" in item.value for item in at.markdown)
+        assert any("暂不满足交付条件" in item.value for item in at.markdown)
         assert any("当前译文真值" in item.value for item in at.markdown)
         assert any("冻结交付" in item.value for item in at.markdown)
         delivery_markup = "\n".join(item.value for item in at.markdown)

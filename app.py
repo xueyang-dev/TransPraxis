@@ -25,6 +25,7 @@ from transpraxis import knowledge as _knowledge
 from transpraxis import literature_evidence as _literature_evidence
 from transpraxis import report_evidence as _report_evidence
 from transpraxis import report_template as _report_template
+from transpraxis import compliance as _compliance
 from transpraxis import thesis_constraints as _thesis_constraints
 
 # Older Streamlit versions (including the Python 3.9-compatible line) do not
@@ -430,6 +431,11 @@ button[data-baseweb="tab"][aria-selected="true"] {
  background: transparent; color: var(--tp-primary-hover); box-shadow: inset 0 -2px var(--tp-primary);
 }
 div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { display: none !important; }
+[data-testid="stButtonGroup"] [role="radio"][aria-checked="true"] {
+ background:var(--tp-primary-soft) !important;
+ border-color:#69a7f8 !important;
+ color:var(--tp-brand-ink) !important;
+}
 
 /* ---------- 输入控件 ---------- */
 [data-testid="stTextInput"] input,
@@ -1226,12 +1232,12 @@ _WORKSPACE_CSS = """
 .stApp:has(.tp-workspace-shell) [data-testid="stSidebar"] { display: none !important; }
 [data-testid="stMainBlockContainer"]:has(.tp-workspace-shell) {
  width: min(100%, 1440px); max-width: 1440px; margin: 0 auto;
- padding: 18px 32px 44px;
+ padding: 10px 32px 44px;
 }
 .tp-workspace-shell { min-height: 2px; }
-.st-key-workspace_exit_actions { margin-bottom:4px; }
+.st-key-workspace_exit_actions { margin-bottom:0; }
 .st-key-workspace_exit_actions .stButton > button {
- min-height:32px; padding:0 10px; border-color:transparent; background:transparent;
+ min-height:28px; height:28px; padding:0 8px; border-color:transparent; background:transparent;
  color:var(--tp-sub); font-size:12px; justify-content:flex-start;
 }
 .st-key-workspace_exit_actions .stButton > button:hover {
@@ -1239,17 +1245,17 @@ _WORKSPACE_CSS = """
 }
 .tp-workspace-topbar {
  display:flex; align-items:flex-start; justify-content:space-between; gap:24px;
- padding: 2px 0 14px; border-bottom:1px solid var(--tp-line);
+ padding: 0 0 6px; border-bottom:1px solid var(--tp-line);
 }
-.tp-workspace-topbar h1 { margin:0; font-size:21px !important; line-height:1.25 !important; }
-.tp-workspace-eyebrow { margin-bottom:5px; color:var(--tp-sub); font-size:10px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
-.tp-workspace-meta { margin-top:6px; color:var(--tp-sub); font-size:11px; }
+.tp-workspace-topbar h1 { margin:0; padding:0 !important; font-size:20px !important; line-height:1.2 !important; }
+.tp-workspace-eyebrow { margin-bottom:3px; color:var(--tp-sub); font-size:10px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
+.tp-workspace-meta { margin-top:4px; color:var(--tp-sub); font-size:11px; }
 .tp-workspace-status { display:flex; align-items:center; gap:8px; padding-top:4px; color:var(--tp-sub); font-size:12px; white-space:nowrap; }
 .tp-status-dot { width:9px; height:9px; border-radius:50%; background:#f59e0b; }
 .tp-status-dot.is-success { background:var(--tp-success); }
 .tp-status-dot.is-danger { background:var(--tp-danger); }
 .tp-status-dot.is-neutral { background:#94a3b8; }
-.tp-workspace-layout { margin-top:15px; }
+.tp-workspace-layout { margin-top:10px; }
 .st-key-workspace_nav_col, .st-key-workspace_context_col, .st-key-workspace_main_col { min-width:0; }
 .st-key-workspace_nav_col {
  position:sticky; top:18px; align-self:flex-start; z-index:10;
@@ -1278,8 +1284,10 @@ _WORKSPACE_CSS = """
 }
 .tp-nav-state.is-done { color:#147a4a; }
 .tp-nav-state.is-attention { color:#b42318; }
+.tp-nav-state.is-stale { color:#8a5a00; }
 .tp-nav-state.is-pending { color:#8a5a00; }
 .tp-nav-state.is-neutral { color:var(--tp-faint); }
+.tp-nav-state.is-empty { color:transparent; }
 .tp-nav-state[title] { cursor:help; }
 .tp-workspace-nav-item { display:flex; align-items:center; gap:10px; }
 .tp-workspace-nav-item i { width:7px; height:7px; border:1.5px solid currentColor; border-radius:50%; }
@@ -1401,10 +1409,11 @@ _WORKSPACE_CSS = """
 .tp-case-head p { margin:0; color:var(--tp-sub); font-size:12px; line-height:1.5; }
 .tp-case-validity { flex:0 0 auto; padding:5px 8px; border-radius:999px; font-size:10px; font-weight:800; letter-spacing:.02em; white-space:nowrap; }
 .tp-case-validity.is-valid { background:#eaf8f1; color:#147a4a; }
-.tp-case-validity.is-stale { background:#fff0f0; color:#b42318; }
+.tp-case-validity.is-stale { background:#fff7e6; color:#8a5a00; }
 .tp-case-validity.is-pending { background:#fff8e8; color:#8a5a00; }
 .tp-case-role-grid { display:grid; grid-template-columns:90px minmax(0,1fr); gap:5px 10px; margin:0 0 14px; padding:10px 12px; border:1px solid var(--tp-line-subtle); border-radius:8px; background:#fbfcfe; }
-.tp-case-role-grid span { color:var(--tp-sub); font-size:11px; }
+.tp-case-role-grid { grid-template-columns:minmax(110px,.42fr) minmax(0,1fr); }
+.tp-case-role-grid span { color:var(--tp-sub); font-size:11px; white-space:nowrap; }
 .tp-case-role-grid b { color:var(--tp-ink); font-size:11px; font-weight:700; }
 .tp-case-text { min-height:110px; margin-bottom:12px; padding:12px; border:1px solid var(--tp-line); border-radius:9px; background:#fff; }
 .tp-case-text label { display:block; margin-bottom:7px; color:var(--tp-sub); font-size:10px !important; font-weight:800; letter-spacing:.06em; text-transform:uppercase; }
@@ -1420,10 +1429,10 @@ _WORKSPACE_CSS = """
 .tp-qa-profile b { margin-left:auto; color:var(--tp-ink); font-size:11px; }
 .tp-qa-profile small { flex-basis:100%; color:var(--tp-faint); font-size:10px; line-height:1.4; }
 .tp-qa-heading { margin:20px 0 9px; font-size:15px !important; }
-.tp-qa-rule { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; margin:0 0 8px; padding:12px 14px; border:1px solid var(--tp-line); border-radius:9px; background:#fff; }
+.tp-qa-rule { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin:0 0 6px; padding:9px 12px; border:1px solid var(--tp-line); border-radius:9px; background:#fff; }
 .tp-qa-rule > div { min-width:0; }
 .tp-qa-rule strong { color:var(--tp-ink); font-size:12px; }
-.tp-qa-rule p { margin:4px 0; color:var(--tp-sub); font-size:11px; line-height:1.45; }
+.tp-qa-rule p { margin:3px 0; color:var(--tp-sub); font-size:11px; line-height:1.4; }
 .tp-qa-rule small { display:block; color:var(--tp-faint); font-size:10px; line-height:1.45; }
 .tp-qa-rule > span { flex:0 0 auto; padding:4px 7px; border-radius:999px; font-size:10px; font-weight:750; white-space:nowrap; }
 .tp-qa-rule.is-pass > span { background:#eaf8f1; color:#147a4a; }
@@ -1437,6 +1446,7 @@ _WORKSPACE_CSS = """
 .tp-qa-status { margin-top:8px; padding:7px 8px; border-radius:8px; font-size:11px; font-weight:750; text-align:center; }
 .tp-qa-status.is-pass, .tp-qa-status.is-confirmed { background:#eaf8f1; color:#147a4a; }
 .tp-qa-status.is-fail { background:#fff0f0; color:#b42318; }
+.tp-qa-status.is-stale { background:#fff7e6; color:#8a5a00; }
 .tp-qa-status.is-not_run, .tp-qa-status.is-not_confirmed { background:#f1f4f8; color:#536176; }
 .st-key-translation_inspector {
  padding-left:6px; color:var(--tp-ink);
@@ -1617,14 +1627,27 @@ _WORKSPACE_CSS = """
 .tp-asset-copy span { display:block; margin-top:4px; color:var(--tp-sub); font-size:11px; }
 .tp-empty { padding:34px 20px; border:1px dashed #cbd5e1; border-radius:12px; background:#fbfcfe; color:var(--tp-sub); text-align:center; }
 .tp-tech-detail { color:var(--tp-sub); font-size:12px; }
-.tp-readiness-card { margin:0 0 14px; padding:17px 18px 15px; border:1px solid #efc1bd; border-left:4px solid var(--tp-danger); border-radius:12px; background:#fff8f7; }
-.tp-readiness-kicker { color:#b42318; font-size:10px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
+.tp-readiness-card { margin:0 0 14px; padding:17px 18px 15px; border:1px solid #edd39d; border-left:4px solid #c47b00; border-radius:12px; background:#fffaf0; }
+.tp-readiness-card.is-success { border-color:#b8dfcc; border-left-color:var(--tp-success); background:#f3fbf7; }
+.tp-readiness-card.is-danger { border-color:#efc1bd; border-left-color:var(--tp-danger); background:#fff8f7; }
+.tp-readiness-card.is-warning .tp-readiness-kicker { color:#8a5a00; }
+.tp-readiness-card.is-success .tp-readiness-kicker { color:#147a4a; }
+.tp-readiness-card.is-danger .tp-readiness-kicker { color:#b42318; }
+.tp-readiness-kicker { color:#8a5a00; font-size:10px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
 .tp-readiness-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-top:5px; }
 .tp-readiness-head h3 { margin:0; color:var(--tp-ink); font-size:22px !important; line-height:1.25; }
-.tp-readiness-head p { max-width:58ch; margin:6px 0 0; color:#6f3130; font-size:13px; line-height:1.55; }
-.tp-readiness-flag { flex:0 0 auto; padding:5px 8px; border-radius:999px; background:#fff0f0; color:#b42318; font-size:10px; font-weight:800; white-space:nowrap; }
-.tp-readiness-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:0 12px; margin-top:15px; padding-top:8px; border-top:1px solid #f1d8d5; }
-.tp-readiness-item { min-width:0; padding:10px 0 9px; border-bottom:1px solid #f4e1df; }
+.tp-readiness-head p { max-width:58ch; margin:6px 0 0; color:#6f4d13; font-size:13px; line-height:1.55; }
+.tp-readiness-card.is-success .tp-readiness-head p { color:#315f48; }
+.tp-readiness-card.is-danger .tp-readiness-head p { color:#6f3130; }
+.tp-readiness-flag { flex:0 0 auto; padding:5px 8px; border-radius:999px; background:#fff0cf; color:#8a5a00; font-size:10px; font-weight:800; white-space:nowrap; }
+.tp-readiness-card.is-success .tp-readiness-flag { background:#dff4e8; color:#147a4a; }
+.tp-readiness-card.is-danger .tp-readiness-flag { background:#fff0f0; color:#b42318; }
+.tp-readiness-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:0 12px; margin-top:15px; padding-top:8px; border-top:1px solid #f0dfbd; }
+.tp-readiness-card.is-success .tp-readiness-grid { border-top-color:#d5ebdf; }
+.tp-readiness-card.is-danger .tp-readiness-grid { border-top-color:#f1d8d5; }
+.tp-readiness-item { min-width:0; padding:10px 0 9px; border-bottom:1px solid #f1e5cb; }
+.tp-readiness-card.is-success .tp-readiness-item { border-bottom-color:#e1f0e7; }
+.tp-readiness-card.is-danger .tp-readiness-item { border-bottom-color:#f4e1df; }
 .tp-readiness-item-head { display:flex; align-items:center; gap:7px; min-width:0; }
 .tp-readiness-icon { display:inline-grid; flex:0 0 auto; place-items:center; width:18px; height:18px; border-radius:50%; font-size:11px; font-weight:850; line-height:1; }
 .tp-readiness-item.is-pass .tp-readiness-icon { background:#dff4e8; color:#147a4a; }
@@ -1653,14 +1676,30 @@ _WORKSPACE_CSS = """
 .tp-impact-chain { display:grid; gap:7px; margin-top:8px; }
 .tp-impact-chain-row { display:flex; align-items:baseline; gap:8px; color:var(--tp-ink); font-size:12px; line-height:1.45; }
 .tp-impact-chain-row i { flex:0 0 auto; color:#c47b00; font-style:normal; font-weight:800; }
-.tp-impact-chain-row span { color:var(--tp-sub); }
+.tp-impact-chain-row strong { flex:0 0 52px; color:var(--tp-ink); font-weight:750; white-space:nowrap; }
+.tp-impact-chain-row span { flex:1 1 auto; min-width:0; color:var(--tp-sub); }
 .tp-technical-note { margin:0 0 14px; padding:10px 12px; border:1px solid var(--tp-line-subtle); border-radius:8px; background:#fbfcfe; }
 .tp-technical-note strong { display:block; color:var(--tp-ink); font-size:12px; }
 .tp-technical-note small { display:block; margin-top:4px; color:var(--tp-faint); font-size:10px; line-height:1.45; }
-.tp-qa-profile { margin-bottom:14px; }
+.tp-qa-profile { margin-bottom:12px; padding:11px 13px; }
 .tp-qa-rule { border-radius:8px; }
 .tp-qa-source { margin-top:6px; color:var(--tp-faint); font-size:10px; line-height:1.45; }
 .tp-qa-rule .stExpander { margin-top:4px; }
+[class*="st-key-translation_search_"] input:focus:not([aria-invalid="true"]),
+[class*="st-key-translation_search_"] input:focus-visible:not([aria-invalid="true"]),
+[class*="st-key-case_search_"] input:focus:not([aria-invalid="true"]),
+[class*="st-key-case_search_"] input:focus-visible:not([aria-invalid="true"]) {
+ border-color:#69a7f8 !important;
+ box-shadow:0 0 0 3px rgba(18,103,232,.14) !important;
+}
+[class*="st-key-translation_search_"] [data-testid="stTextInputRootElement"]:focus-within {
+ border-color:#69a7f8 !important;
+ box-shadow:0 0 0 3px rgba(18,103,232,.14) !important;
+}
+[class*="st-key-case_search_"] [data-testid="stTextInputRootElement"]:focus-within {
+ border-color:#69a7f8 !important;
+ box-shadow:0 0 0 3px rgba(18,103,232,.14) !important;
+}
 @media (max-width: 1050px) {
  [data-testid="stMainBlockContainer"]:has(.tp-workspace-shell) { padding:22px 24px 48px; }
  .st-key-workspace_main_col { padding:0 18px; }
@@ -2630,7 +2669,7 @@ def _format_saved_at(value):
 
 def _render_recovery_panel(job_id, state):
     summary = core.recovery_summary(job_id, state)
-    status = core.task_status_label(state)
+    status = core.task_status_label(state, job_id)
     with st.container(border=True):
         st.subheader("任务状态与自动保存")
         c1, c2, c3 = st.columns(3)
@@ -3058,6 +3097,11 @@ def _render_delivery_gate(job_id, state, dstatus, target_lang="", provider="", m
     blockers = _delivery.unresolved_blocking(state)
     actions = _delivery.unresolved_findings(state)
     if blockers:
+        hard_gate_reasons = _workspace_hard_gate_reasons(job_id, state)
+        if hard_gate_reasons:
+            st.error("当前版本存在不可通过‘接受风险’跳过的交付门禁：" +
+                     "、".join(hard_gate_reasons) + "。请先完成这些门禁。")
+            return
         st.warning(f"仍有 {len(blockers)} 个必须处理问题；未处理或未明确接受风险前不能最终交付。")
         confirm = st.checkbox(
             "我已检查这些必须处理问题，并确认接受剩余风险",
@@ -3180,19 +3224,11 @@ def _workspace_status(state, job_id=""):
         return runtime_view.get("headline_status") or "未完成", tone
     if runtime_status == "completed" and state.get("report_enabled") \
             and not state.get("p3_done"):
-        report_status = state.get("report_status") or \
-            (state.get("academic_state") or {}).get("report_status")
-        if report_status in {"failed", "incomplete", "review_required"}:
-            return "报告未完成", "warning"
-    snapshot = core.delivery_snapshot_status(job_id, state) if job_id else {"current": False}
-    if snapshot.get("diverged"):
-        return "工作版本已变更", "warning"
-    if state.get("delivery_status") == "final" and snapshot.get("current"):
-        return "已冻结", "success"
+        return "暂不满足交付条件", "warning"
+    if job_id:
+        return _workspace_delivery_state(job_id, state)
     if _delivery.unresolved_blocking(state):
-        return "待审查", "warning"
-    if state.get("p2_done") and (state.get("p3_done") or not state.get("report_enabled", True)):
-        return "可交付", "success"
+        return "暂不满足交付条件", "warning"
     if state.get("p1_done"):
         return "处理中", "neutral"
     return "未开始", "neutral"
@@ -3208,6 +3244,122 @@ def _workspace_findings_counts(state):
         severity: sum(1 for item in contexts if item.get("severity") == severity)
         for severity in _delivery.SEVERITY_LABELS
     }
+
+
+def _workspace_compliance_view(job_id, state):
+    """Return the anonymous default-profile checks for this task."""
+    return core.compliance_profile_view(job_id, state)
+
+
+def _workspace_structural_qa(job_id, state):
+    """Expose a stale DOCX check as a distinct user-facing state."""
+    qa = _finalization.normalize_final_qa(state.get("final_qa"))
+    final_docx = core.load_academic_artifact(job_id, "final_docx_validation") or {}
+    structural = ("PASS" if final_docx.get("status") in {"pass", "pass_with_warnings"}
+                  else "FAIL" if final_docx.get("status") == "fail"
+                  else qa.get("structural_qa", "NOT_RUN"))
+    artifact_status = _finalization._artifact_status_value(
+        state.get("academic_state") or {}, "final_docx_validation")
+    if artifact_status in {"stale", "missing"}:
+        return "STALE"
+    if artifact_status == "failed":
+        return "FAIL"
+    return structural
+
+
+def _workspace_delivery_state(job_id, state):
+    """Return one human-facing delivery state without changing gate semantics."""
+    snapshot = core.delivery_snapshot_status(job_id, state) if job_id else {}
+    if snapshot.get("current"):
+        version = (snapshot.get("latest") or {}).get("snapshot_version")
+        return (f"已冻结交付 v{version}" if version is not None else "已冻结交付", "success")
+    if snapshot.get("diverged"):
+        version = (snapshot.get("latest") or {}).get("snapshot_version")
+        return (f"工作版本已偏离冻结交付 v{version}" if version is not None
+                else "工作版本已偏离冻结交付", "warning")
+
+    blockers = _delivery.unresolved_blocking(state)
+    impact = core.dependency_impact_view(job_id, state) if job_id else {}
+    compliance = _workspace_compliance_view(job_id, state) if job_id else {}
+    compliance_counts = compliance.get("counts") or {}
+    qa = _finalization.normalize_final_qa(state.get("final_qa"))
+    academic = state.get("academic_state") or {}
+    report_required = bool(state.get("report_enabled"))
+    report_ready = _delivery.report_ready(state)
+    stale_artifacts = any(
+        _finalization._artifact_status_value(academic, name) in {"stale", "missing", "failed"}
+        for name in ("report", "final_docx_validation", "libreoffice_render")
+    )
+    structural = _workspace_structural_qa(job_id, state) if job_id else qa.get("structural_qa")
+    case_gate = _finalization.case_review_gate(
+        state, core.load_academic_artifact(job_id, "selected_cases") if job_id else None)
+    translation_ready = (bool(state.get("p2_done")) and not blockers and
+                         (state.get("delivery_validation") or {}).get("blocking") is not True)
+    technical_blocker = (
+        not translation_ready or impact.get("status") == "stale" or
+        (report_required and (not report_ready or stale_artifacts)) or
+        case_gate.get("status") == "blocked" or compliance_counts.get("fail") or
+        compliance.get("status") == "fail" or structural in {"FAIL", "STALE"} or
+        (report_required and qa.get("libreoffice_render") == "FAIL")
+    )
+    manual_pending = (
+        case_gate.get("blocked_count", 0) or compliance_counts.get("manual_review") or
+        compliance_counts.get("not_checked") or
+        (report_required and qa.get("author_visual_review") != "CONFIRMED") or
+        (report_required and qa.get("word_final_review") != "CONFIRMED") or
+        (report_required and structural == "NOT_RUN") or
+        (report_required and qa.get("libreoffice_render") == "NOT_RUN")
+    )
+    if technical_blocker:
+        tone = "danger" if blockers or compliance_counts.get("fail") or structural == "FAIL" else "warning"
+        return "暂不满足交付条件", tone
+    if manual_pending:
+        return "暂不满足交付条件", "warning"
+    return "可以冻结交付", "success"
+
+
+def _workspace_hard_gate_reasons(job_id, state):
+    """Return delivery gates that cannot be waived as ordinary review risk."""
+    impact = core.dependency_impact_view(job_id, state) if job_id else {}
+    compliance = _workspace_compliance_view(job_id, state) if job_id else {}
+    compliance_counts = compliance.get("counts") or {}
+    qa = _finalization.normalize_final_qa(state.get("final_qa"))
+    finalization_qa_required = bool(state.get("report_enabled"))
+    academic = state.get("academic_state") or {}
+    report_ready = _delivery.report_ready(state)
+    report_stale = _finalization._artifact_status_value(academic, "report") in {
+        "stale", "missing", "failed"}
+    final_export_stale = _finalization._artifact_status_value(
+        academic, "final_docx_validation") in {"stale", "missing", "failed"}
+    render_stale = _finalization._artifact_status_value(
+        academic, "libreoffice_render") in {"stale", "missing", "failed"}
+    structural = _workspace_structural_qa(job_id, state) if job_id else qa.get("structural_qa")
+    case_gate = _finalization.case_review_gate(
+        state, core.load_academic_artifact(job_id, "selected_cases") if job_id else None)
+    translation_truth_gate_pass = (bool(state.get("p2_done")) and
+                                   (state.get("delivery_validation") or {}).get("blocking") is not True)
+    reasons = []
+    if not translation_truth_gate_pass:
+        reasons.append("当前译文交付门禁")
+    if impact.get("status") == "stale":
+        reasons.append("受影响产物需要重建")
+    if finalization_qa_required and not report_ready:
+        reasons.append("报告尚未通过交付门禁")
+    if finalization_qa_required and (report_stale or final_export_stale or render_stale):
+        reasons.append("交付产物仍是旧版本")
+    if case_gate.get("status") == "blocked":
+        reasons.append("案例来源或终审条件未满足")
+    if compliance_counts.get("fail") or compliance_counts.get("manual_review") or compliance_counts.get("not_checked"):
+        reasons.append("合规门禁尚未完成")
+    if finalization_qa_required and structural != "PASS":
+        reasons.append("DOCX 结构检查尚未通过")
+    if finalization_qa_required and qa.get("libreoffice_render") != "PASS":
+        reasons.append("页面渲染尚未通过")
+    if finalization_qa_required and qa.get("author_visual_review") != "CONFIRMED":
+        reasons.append("作者视觉复核尚未确认")
+    if finalization_qa_required and qa.get("word_final_review") != "CONFIRMED":
+        reasons.append("Word 最终复核尚未确认")
+    return list(dict.fromkeys(reasons))
 
 
 def _workspace_impact_change_label(impact):
@@ -3247,13 +3399,25 @@ def _workspace_impact_label(item):
         "quality_repair_history": "质量修复记录",
         "repair_history": "修复记录",
     }
-    raw = str(item.get("label") or item.get("id") or "相关产物")
-    return labels.get(raw, raw.replace("_", " "))
+    raw_id = str(item.get("id") or "")
+    raw_label = str(item.get("label") or "")
+    if raw_label and raw_label != raw_id:
+        return raw_label
+    mapped = labels.get(raw_id) or _finalization.artifact_label(raw_id)
+    return mapped if mapped != raw_id else "相关产物"
 
 
 def _workspace_impact_action(item):
-    action = item.get("action") or "stale"
-    return _finalization.execution_action_label(action)
+    action = item.get("action")
+    if action:
+        return _finalization.execution_action_label(action)
+    return {
+        "stale": "需要重建",
+        "missing": "需要生成",
+        "failed": "检查失败",
+        "valid": "已同步",
+        "reusable": "可复用",
+    }.get(str(item.get("status") or ""), "需要确认")
 
 
 def _render_workspace_impact_expander(impact):
@@ -3610,54 +3774,57 @@ def _render_workspace_nav(section, state, job_id=""):
     st.markdown('<div class="tp-workspace-nav-title">项目导航</div>'
                 '<div class="tp-workspace-nav-caption">从这里进入每个工作阶段。</div>',
                 unsafe_allow_html=True)
-    contexts, counts = _workspace_findings_counts(state)
+    contexts, _ = _workspace_findings_counts(state)
     case_views = _workspace_case_views(job_id, state) if job_id else []
     case_pending = sum(1 for item in case_views
                        if item.get("review_status") == "unreviewed"
                        or (item.get("case_origin") == _case_provenance.SYNTHETIC_BASELINE
                            and item.get("baseline_status") == "rejected"))
-    compliance = core.compliance_profile_view(job_id, state) if job_id else {}
+    compliance = _workspace_compliance_view(job_id, state) if job_id else {}
     qa = _finalization.normalize_final_qa(state.get("final_qa"))
     terms_done = bool(state.get("glossary_frozen") or state.get("quality_bypass")
                       or (state.get("auto_terms") and not state.get("quality_mode")))
-    snapshot = core.delivery_snapshot_status(job_id, state) if job_id else {"current": False}
     compliance_counts = compliance.get("counts") or {}
-    report_ready = _delivery.report_ready(state)
-    impact = core.dependency_impact_view(job_id, state) if job_id else {}
-    qa_complete = (qa.get("structural_qa") == "PASS" and
-                   qa.get("libreoffice_render") == "PASS" and
-                   qa.get("author_visual_review") == "CONFIRMED" and
-                   qa.get("word_final_review") == "CONFIRMED")
     qa_required = bool(state.get("report_enabled"))
+    delivery_label, _delivery_tone = _workspace_delivery_state(job_id, state) \
+        if job_id else ("未开始", "neutral")
+    qa_attention_count = sum(int(compliance_counts.get(key, 0) or 0)
+                             for key in ("fail", "manual_review", "not_checked"))
+    if qa_required:
+        structural = _workspace_structural_qa(job_id, state) if job_id else qa.get("structural_qa")
+        qa_attention_count += int(structural != "PASS")
+        qa_attention_count += int(qa.get("libreoffice_render") != "PASS")
+        qa_attention_count += int(qa.get("author_visual_review") != "CONFIRMED")
+        qa_attention_count += int(qa.get("word_final_review") != "CONFIRMED")
+    if delivery_label.startswith("已冻结交付"):
+        delivery_nav = ("", "done", "当前工作版本与冻结交付一致")
+    elif delivery_label.startswith("工作版本已偏离冻结交付"):
+        delivery_nav = ("1 项", "attention", delivery_label)
+    elif delivery_label == "可以冻结交付":
+        delivery_nav = ("", "pending", "所有前置事实已满足，可生成不可变交付")
+    else:
+        delivery_nav = ("1 项", "attention", "仍有交付门禁未完成")
     nav_meta = {
-        "overview": ("当前", "neutral", "查看任务全貌"),
-        "translation": (("已完成", "done", "翻译门禁已通过")
-                         if state.get("p2_done") else ("待处理", "pending", "翻译尚未完成")),
-        "terms": (("已冻结", "done", "术语已冻结") if terms_done else
-                  ("待处理", "pending", "术语仍需确认")),
-        "review": (("待处理", "attention", f"审校队列还有 {len(contexts)} 项") if contexts else
-                   ("已完成", "done", "没有未关闭的审校发现") if state.get("p2_done") else
-                   ("待处理", "pending", "翻译完成后开始审校")),
-        "cases": (("待确认", "attention", f"还有 {case_pending} 个案例未完成人工确认") if case_pending else
-                  ("已确认", "done", "案例均已完成人工确认") if case_views else
-                  ("待生成", "pending", "案例选择产物尚未生成")),
-        "report": (("已生成", "done", "报告稿已生成") if state.get("p3_done") else
-                   ("未完成", "attention", "报告仍需完成") if state.get("report_enabled") else
-                   ("不适用", "neutral", "当前任务未启用实践报告")),
-        "qa": ((f"{compliance_counts.get('fail', 0)} 项失败", "attention", "合规规则存在失败项")
-               if compliance_counts.get("fail") else
-               ("需复核", "attention", f"还有 {compliance_counts.get('manual_review', 0)} 项需要人工复核")
-               if compliance_counts.get("manual_review") else
-               ("需确认", "pending", "仍有独立最终 QA 未确认")
-               if qa_required and not qa_complete else
-               ("已通过", "done", "合规与最终 QA 已完成") if qa_required else
-               ("不适用", "neutral", "当前任务未启用最终 QA")),
-        "delivery": (("已冻结", "done", "已有当前冻结交付") if snapshot.get("current") else
-                     ("未就绪", "attention", "仍有交付阻塞或未确认事项") if (
-                         impact.get("status") == "stale" or contexts or case_pending or
-                         not report_ready or compliance_counts.get("fail") or
-                         compliance_counts.get("manual_review") or (qa_required and not qa_complete)) else
-                     ("待冻结", "pending", "检查完成后可冻结交付")),
+        "overview": (("", "neutral", "当前任务全貌") if section == "overview" else
+                     ("", "neutral", "回到任务概览")),
+        "translation": (("", "done", "翻译门禁已通过")
+                         if state.get("p2_done") else ("1 项", "pending", "翻译尚未完成")),
+        "terms": (("", "done", "术语已冻结") if terms_done else
+                  ("1 项", "pending", "术语仍需确认")),
+        "review": ((f"{len(contexts)} 项", "attention", f"审校队列还有 {len(contexts)} 项") if contexts else
+                   ("", "done", "没有未关闭的审校发现") if state.get("p2_done") else
+                   ("", "pending", "翻译完成后开始审校")),
+        "cases": ((f"{case_pending} 项", "attention", f"还有 {case_pending} 个案例未完成人工确认") if case_pending else
+                  ("", "done", "案例均已完成人工确认") if case_views else
+                  ("", "pending", "案例选择产物尚未生成")),
+        "report": (("", "done", "报告稿已生成") if state.get("p3_done") else
+                   ("1 项", "attention", "报告仍需完成") if state.get("report_enabled") else
+                   ("", "neutral", "当前任务未启用实践报告")),
+        "qa": ((f"{qa_attention_count} 项", "attention", f"合规与最终 QA 还有 {qa_attention_count} 项需要处理")
+               if qa_attention_count else
+               ("", "done", "合规与最终 QA 已完成") if qa_required else
+               ("", "neutral", "当前任务未启用最终 QA")),
+        "delivery": delivery_nav,
     }
     labels = [("overview", "概览"), ("translation", "翻译"),
               ("terms", "术语"), ("review", "审校"), ("cases", "案例"),
@@ -3670,7 +3837,7 @@ def _render_workspace_nav(section, state, job_id=""):
                     else ":material/check_circle:" if nav_tone == "done"
                     else ":material/error_outline:" if nav_tone == "attention"
                     else ":material/schedule:" if nav_tone == "pending"
-                    else ":material/radio_button_unchecked:")
+                    else ":material/info:")
             with st.container(key=f"workspace_nav_item_{value}"):
                 label_col, state_col = st.columns([5, 1.65], gap="small")
                 with label_col:
@@ -3679,7 +3846,8 @@ def _render_workspace_nav(section, state, job_id=""):
                         st.session_state.workspace_section = value
                         st.rerun()
                 with state_col:
-                    st.markdown(f'<span class="tp-nav-state is-{nav_tone}" title="{escape(nav_title)}">'
+                    state_class = f"is-{nav_tone}" if nav_status else "is-empty"
+                    st.markdown(f'<span class="tp-nav-state {state_class}" title="{escape(nav_title)}">'
                                 f'{escape(nav_status)}</span>', unsafe_allow_html=True)
 
 
@@ -3690,11 +3858,7 @@ def _render_workspace_project_details(state):
 
 
 def _translation_pair_status(pair):
-    if pair.get("human_edited"):
-        return "↻"
-    if pair.get("reviewed"):
-        return "✓"
-    return "●"
+    return _translation_pair_status_label(pair)
 
 
 def _translation_pair_status_label(pair):
@@ -4014,13 +4178,14 @@ def _render_workspace_delivery_context(job_id, state):
     approval = latest.get("approval") or {}
     truth = core.translation_truth_view(job_id, state)
     working_label = f'v{truth.get("version", 0)} · 当前'
-    frozen_label = (f'v{latest.get("snapshot_version")} · 已冻结'
+    frozen_label = (f'v{latest.get("snapshot_version")} · 已冻结交付'
                     if latest else "尚未生成")
     if snapshot.get("diverged"):
-        status_label = "工作版本已变更；冻结交付仍可下载"
+        status_label = (f'工作版本已偏离冻结交付 v{latest.get("snapshot_version")}；'
+                        "原冻结版本仍可下载")
         status_tone = "warning"
     elif latest:
-        status_label = "工作版本与冻结交付一致"
+        status_label = f'已冻结交付 v{latest.get("snapshot_version")}'
         status_tone = "success"
     else:
         status_label = "尚未生成冻结交付"
@@ -4060,8 +4225,19 @@ def _render_workspace_overview(job_id, state):
                 '<div class="tp-section-lead">当前任务与项目进度</div>',
                 unsafe_allow_html=True)
     _render_runtime_panel(job_id, state)
-    action_text = (f"{blockers} 个必须处理问题阻止最终交付。" if blockers
-                   else "当前没有交付阻塞，可以准备最终版本。")
+    impact = core.dependency_impact_view(job_id, state)
+    compliance = _workspace_compliance_view(job_id, state)
+    compliance_counts = compliance.get("counts") or {}
+    if blockers:
+        action_text = f"{blockers} 个必须处理问题阻止最终交付。"
+    elif impact.get("status") == "stale":
+        action_text = "当前译文已通过，但受影响的报告产物仍需重建。"
+    elif state.get("report_enabled") and not _delivery.report_ready(state):
+        action_text = "报告尚未完成，暂不满足交付条件。"
+    elif compliance_counts.get("fail") or compliance_counts.get("manual_review"):
+        action_text = "合规检查或人工复核尚未完成，暂不满足交付条件。"
+    else:
+        action_text = "当前没有交付阻塞，可以准备最终版本。"
     st.markdown('<div class="tp-overview-hero">'
                 f'{_workspace_status_badge(status, tone)}'
                 f'<strong>{escape(action_text)}</strong>'
@@ -4101,7 +4277,7 @@ def _render_workspace_overview(job_id, state):
         ("翻译", bool(state.get("p2_done")), False),
         ("人工审校", bool(state.get("p2_done") and not contexts), bool(contexts)),
         ("报告草稿", bool(state.get("p3_done")), False),
-        ("最终交付", _workspace_status(state, job_id)[0] == "已冻结", False),
+        ("最终交付", _workspace_status(state, job_id)[0].startswith("已冻结交付"), False),
     ]
     progress_rows = []
     for label, done, active in progress:
@@ -4138,15 +4314,19 @@ def _render_workspace_translation(job_id, state):
     truth = core.translation_truth_view(job_id, state)
     last_change = truth.get("last_change") or {}
     changed_indexes = last_change.get("segment_indexes") or []
+    raw_change_reason = str(last_change.get("reason") or "")
+    change_reason = ("当前译文已更新，相关下游需要重新检查"
+                     if "CURRENT_TRANSLATION" in raw_change_reason
+                     else raw_change_reason or "工作版本已更新")
     change_note = (f"最近变更：第 {', '.join(str(int(x) + 1) for x in changed_indexes)} 段 · "
-                   f"{last_change.get('reason') or '工作版本已更新'}"
+                   f"{change_reason}"
                    if changed_indexes else "尚未记录工作版本变更")
     st.markdown(
         '<div class="tp-truth-banner">'
         '<div><span class="tp-truth-kicker">交付与审校依据</span>'
         '<strong>当前译文 — 交付和审校的唯一来源</strong>'
         f'<p>版本 v{truth["version"]} · {truth["segment_count"]:,} 段。报告、案例、附录和交付文件都只能读取这里的当前译文。</p>'
-        f'<small>{escape(change_note)} · 技术标识：CURRENT_TRANSLATION</small></div>'
+        f'<small>{escape(change_note)}</small></div>'
         '</div>', unsafe_allow_html=True)
     reviewed = (state.get("review_stats") or {}).get("reviewed_segments", 0)
     total = len(pairs)
@@ -4236,7 +4416,7 @@ def _render_workspace_translation(job_id, state):
         key=table_key,
         column_config={
             "状态": st.column_config.TextColumn("状态", width="small",
-                                                   help="✓ 已审校 · ● 待审 · ↻ 已修改"),
+                                                   help="已修改=人工改过；已审校=人工检查完成；待审=尚未确认"),
             "#": st.column_config.TextColumn("#", width="small"),
             "原文": st.column_config.TextColumn("原文", width="large"),
             "当前译文": st.column_config.TextColumn("当前译文", width="large"),
@@ -4472,8 +4652,30 @@ def _case_origin_label(case):
 
 
 def _case_review_status_label(status):
-    return {"unreviewed": "未审", "approved": "已批准纳入", "rejected": "已排除"}.get(
-        str(status), str(status or "未审"))
+    value = str(status or "")
+    return {"unreviewed": "待人工确认", "approved": "已批准纳入", "rejected": "已排除"}.get(
+        value, "需人工确认" if value else "待人工确认")
+
+
+def _case_state_label(value):
+    return {
+        "pass": "已通过", "fail": "未通过", "manual_review": "待人工复核",
+        "not_checked": "未检查", "not_applicable": "不适用",
+        "not_available": "尚未生成", "unreviewed": "未处理",
+        "approved": "已确认", "rejected": "已拒绝", "modified": "已修改",
+        "other": "其他",
+    }.get(str(value or ""), "需确认" if value else "—")
+
+
+def _case_identity_label(case):
+    raw = str(case.get("case_id") or "")
+    if raw.startswith("seg-"):
+        index = case.get("segment_index")
+        return f"第 {int(index) + 1} 段" if isinstance(index, int) else "真实修订案例"
+    if raw.startswith(("LSC-", "SC-")):
+        index = case.get("segment_index")
+        return f"第 {int(index) + 1} 段" if isinstance(index, int) else "案例"
+    return "案例" if raw else "未命名案例"
 
 
 def _case_review_is_stale(case, state):
@@ -4512,21 +4714,35 @@ def _render_workspace_cases(job_id, state):
         '<div><span class="tp-truth-kicker">案例引用依据</span>'
         '<strong>当前译文 — 案例引用的交付真值</strong>'
         f'<p>所有案例的“当前译文”都来自工作译文 v{truth["version"]}；案例只保存来源与分析用途，不另造终稿。</p>'
-        '<small>技术标识：CURRENT_TRANSLATION</small>'
         '</div></div>', unsafe_allow_html=True)
     if not views:
         st.markdown('<div class="tp-empty">尚未生成案例选择产物。</div>', unsafe_allow_html=True)
         return
-    origin_filter = st.selectbox(
-        "案例来源", ["全部", "真实修订", "合成对照", "翻译决策"],
-        key=f"case_origin_filter_{job_id}")
-    status_filter = st.selectbox(
-        "审校状态", ["全部", "未审", "已批准纳入", "已排除"],
-        key=f"case_status_filter_{job_id}")
+    filter_origin, filter_status, filter_search = st.columns([1, 1, 1.6], gap="small")
+    with filter_origin:
+        origin_filter = st.selectbox(
+            "案例来源", ["全部", "真实修订", "合成对照", "翻译决策"],
+            key=f"case_origin_filter_{job_id}", label_visibility="collapsed")
+    with filter_status:
+        status_filter = st.selectbox(
+            "审校状态", ["全部", "待人工确认", "已批准纳入", "已排除"],
+            key=f"case_status_filter_{job_id}", label_visibility="collapsed")
+    with filter_search:
+        case_search = st.text_input(
+            "搜索案例", key=f"case_search_{job_id}",
+            placeholder="搜索段落、原文或译文…", label_visibility="collapsed")
+    needle = str(case_search or "").strip().casefold()
     filtered = [item for item in views
                 if (origin_filter == "全部" or _case_origin_label(item) == origin_filter)
                 and (status_filter == "全部" or
-                     _case_review_status_label(item.get("review_status")) == status_filter)]
+                     _case_review_status_label(item.get("review_status")) == status_filter)
+                and (not needle or needle in " ".join(
+                    str(value or "") for value in (
+                        _case_identity_label(item), _case_origin_label(item),
+                        _case_review_status_label(item.get("review_status")),
+                        item.get("source_text"), item.get("current_text"),
+                        item.get("target_subsection"), item.get("section_title"),
+                    )).casefold())]
     if not filtered:
         st.info("当前筛选下没有案例。")
         return
@@ -4535,28 +4751,31 @@ def _render_workspace_cases(job_id, state):
     if selected_id not in ids:
         selected_id = ids[0]
         st.session_state[f"selected_case_id_{job_id}"] = selected_id
-    queue_col, detail_col = st.columns([1.12, 2.55], gap="medium")
+    queue_col, detail_col = st.columns([1.35, 2.3], gap="medium")
     with queue_col:
         st.markdown(f'<h3>案例队列 <span class="tp-review-queue-count">{len(filtered)}</span></h3>',
                     unsafe_allow_html=True)
         labels = []
         label_ids = {}
-        for item in filtered:
-            label = (f'{item.get("case_id") or "—"} · {_case_origin_label(item)} · '
+        for index, item in enumerate(filtered, start=1):
+            label = (f'{_case_identity_label(item)} · {_case_origin_label(item)} · '
                      f'{_case_review_status_label(item.get("review_status"))}')
+            if label in label_ids:
+                label = f'{label} · 第 {index} 项'
             labels.append(label)
             label_ids[label] = str(item.get("case_id"))
         queue_key = f"case_queue_{job_id}"
         current_label = next(label for label in labels if label_ids[label] == selected_id)
         if st.session_state.get(queue_key) not in labels:
             st.session_state[queue_key] = current_label
-        chosen_label = st.radio("案例队列", labels, key=queue_key,
-                                label_visibility="collapsed")
+        chosen_label = st.selectbox(
+            "案例队列", labels, key=queue_key, label_visibility="collapsed",
+            help="选择一个案例查看证据并记录人工终审。")
         selected_id = label_ids[chosen_label]
         st.session_state[f"selected_case_id_{job_id}"] = selected_id
         approved = sum(item.get("review_status") == "approved" for item in views)
         excluded = sum(item.get("review_status") == "rejected" for item in views)
-        st.caption(f"全部 {len(views)} · 已批准 {approved} · 已排除 {excluded} · 未审 {len(views) - approved - excluded}")
+        st.caption(f"显示 {len(filtered)} / 总计 {len(views)} · 总计状态：已批准 {approved} · 已排除 {excluded} · 待人工确认 {len(views) - approved - excluded}")
     item = next(item for item in filtered if str(item.get("case_id")) == selected_id)
     display = _case_provenance.display_contract(item)
     lifecycle = item.get("artifact_status") or "not_available"
@@ -4565,7 +4784,7 @@ def _render_workspace_cases(job_id, state):
         stale = tone == "stale"
         status = _case_review_status_label(item.get("review_status"))
         st.markdown(
-            f'<div class="tp-case-head"><div><div class="tp-section-kicker">{escape(str(item.get("case_id") or "—"))}</div>'
+            f'<div class="tp-case-head"><div><div class="tp-section-kicker">当前选中 · {escape(_case_identity_label(item))}</div>'
             f'<h3>{escape(display["origin_label"])} · {escape(status)}</h3>'
             f'<p>{escape(display["origin_description"])}</p></div>'
             f'<span class="tp-case-validity is-{tone}">{validity_label}</span></div>',
@@ -4581,8 +4800,6 @@ def _render_workspace_cases(job_id, state):
         role_rows.append('<span>当前译文</span><b>当前译文</b>')
         st.markdown('<div class="tp-case-role-grid">' + "".join(role_rows) + '</div>',
                     unsafe_allow_html=True)
-        st.caption(f'目标小节：{item.get("target_subsection") or "—"} · '
-                   f'Artifact lifecycle：{lifecycle}')
         text_col_a, text_col_b = st.columns(2)
         with text_col_a:
             st.markdown(f'<div class="tp-case-text"><label>原文</label><p>{escape(item.get("source_text") or "—")}</p></div>', unsafe_allow_html=True)
@@ -4597,10 +4814,10 @@ def _render_workspace_cases(job_id, state):
         evidence = item.get("synthetic_evidence") or {}
         analysis = item.get("analysis_fields") or {}
         evidence_rows = [
-            ("基线合理性", evidence.get("baseline_plausibility") or "—"),
-            ("实质差异", evidence.get("material_difference") or "—"),
-            ("修复正确性", evidence.get("repair_correctness") or "—"),
-            ("分析价值", evidence.get("academic_analysis_value") or "—"),
+            ("基线合理性", _case_state_label(evidence.get("baseline_plausibility"))),
+            ("实质差异", _case_state_label(evidence.get("material_difference"))),
+            ("修复正确性", _case_state_label(evidence.get("repair_correctness"))),
+            ("分析价值", _case_state_label(evidence.get("academic_analysis_value"))),
             ("基线状态", ({"modified": "已修改", "rejected": "已拒绝",
                            "approved": "已确认", "unreviewed": "未处理"}.get(
                                item.get("baseline_status"), "不适用")
@@ -4611,7 +4828,7 @@ def _render_workspace_cases(job_id, state):
         case_plan = item.get("case_plan") or {}
         if case_plan:
             evidence_rows.extend([
-                ("问题类型", (case_plan.get("problem") or {}).get("type") or "—"),
+                ("问题类型", _case_state_label((case_plan.get("problem") or {}).get("type"))),
                 ("决策理由", "已保存" if case_plan.get("decision_rationale") else "未提供"),
                 ("理论映射", "已保存" if case_plan.get("theory_mapping") else "未提供"),
             ])
@@ -4627,9 +4844,9 @@ def _render_workspace_cases(job_id, state):
         if item.get("segment_current_text") and item.get("current_text") != item.get("segment_current_text"):
             st.caption("当前译文已按案例片段定位；完整段落真值仍以翻译工作区中的当前译文为准。")
         with st.expander("查看依赖与技术依据", expanded=False):
-            st.caption(f'技术标识：{item.get("segment_id") or "—"} · '
-                       f'依赖状态：{"需要重建" if stale else "可复用"}')
-        with st.expander("查看关联证据（分析 / 术语 / findings / 文献）", expanded=True):
+            st.caption(f'依赖状态：{"需要重建" if stale else "可复用"} · '
+                       f'内部生命周期：{lifecycle} · 技术标识：{item.get("segment_id") or "—"}')
+        with st.expander("查看关联证据", expanded=True):
             commentary = item.get("analytical_commentary") or []
             if commentary:
                 st.markdown("**分析评论**")
@@ -4647,9 +4864,12 @@ def _render_workspace_cases(job_id, state):
             else:
                 st.caption("未登记与本案例直接绑定的术语记录。")
             if item.get("case_findings"):
-                st.markdown("**相关 findings**")
+                st.markdown("**相关审校发现**")
                 for finding in item.get("case_findings") or []:
-                    st.markdown(f'- {escape(str(finding.get("severity") or "—"))} · {escape(str(finding.get("reason") or "审校发现"))}')
+                    severity = {"blocking": "必须处理", "actionable": "建议",
+                                "informational": "参考"}.get(
+                                    str(finding.get("severity") or ""), "审校发现")
+                    st.markdown(f'- {escape(severity)} · {escape(str(finding.get("reason") or "审校发现"))}')
             else:
                 st.caption("当前段落没有已登记的 finding。")
             if item.get("literature_evidence"):
@@ -4660,7 +4880,7 @@ def _render_workspace_cases(job_id, state):
                 st.caption("未登记案例专属文献证据；当前分析边界仍以项目证据为准。")
             human_entries = item.get("human_evidence") or []
             if human_entries:
-                st.markdown("**Human Author Evidence**")
+                st.markdown("**作者补充证据**")
                 for entry in human_entries:
                     st.markdown(f'- {escape(str(entry.get("question_type") or "说明"))}: '
                                 f'{escape(str(entry.get("answer") or "—"))}')
@@ -4754,36 +4974,80 @@ def _render_workspace_qa(job_id, state):
     st.markdown('<div class="tp-section-kicker">交付检查</div><h2>合规与最终 QA</h2>'
                 '<div class="tp-section-lead">每一项检查都独立决定一件事；结构检查和页面渲染通过，也不等于作者与 Word 最终复核已确认。</div>',
                 unsafe_allow_html=True)
-    compliance = core.compliance_profile_view(job_id, state)
-    profile = _thesis_constraints.compliance_profile(
-        str(state.get("compliance_profile_id") or "MTI_PRACTICE_REPORT_DEFAULT"))
+    compliance = _workspace_compliance_view(job_id, state)
+    profile_id = str(state.get("compliance_profile_id") or
+                     _compliance.DEFAULT_PROFILE_ID)
+    profile = _compliance.compliance_profile(profile_id)
     counts = compliance.get("counts") or {}
+    source_mapping_label = {
+        "reference_template_mapped": "已登记匿名参考模板",
+    }.get(profile.get("authority_mapping_status"), "院校特殊要求需人工确认")
     st.markdown(
         '<div class="tp-qa-profile"><strong>MTI 翻译实践报告</strong>'
-        f'<span>{escape(str(profile.get("institution") or ""))} · {escape(str(profile.get("program") or ""))}</span>'
+        f'<span>{escape(str(profile.get("display_name") or "默认 MTI 实践报告规范"))} · {escape(source_mapping_label)}</span>'
         f'<b>通过 {counts.get("pass", 0)} · 失败 {counts.get("fail", 0)} · 人工复核 {counts.get("manual_review", 0)} · 未检查 {counts.get("not_checked", 0)}</b>'
-        '<small>规则集技术标识：MTI_PRACTICE_REPORT_DEFAULT</small>'
         '</div>', unsafe_allow_html=True)
-    st.markdown('<h3 class="tp-qa-heading">确定性合规规则</h3>', unsafe_allow_html=True)
+    with st.expander("查看规则集技术依据", expanded=False):
+        st.markdown(
+            f'**规则集内部标识**：`{escape(str(profile.get("profile_id") or "—"))}`')
+        mapping_status = profile.get("authority_mapping_status")
+        mapping_label = {
+            "reference_template_mapped": "已登记匿名参考模板",
+        }.get(mapping_status, "院校特殊要求需人工确认")
+        st.caption(f'参考映射状态：{mapping_label}')
+        for source in profile.get("sources") or profile.get("source_documents") or []:
+            st.caption(f'参考来源记录：{source.get("document") or source.get("title") or source.get("file") or "—"} · '
+                       f'{source.get("note") or source.get("authority") or ""}')
+        for source in profile.get("implementation_sources") or []:
+            st.caption(f'项目实现依据（非规范来源）：{source.get("document") or source.get("file") or "—"}')
+    st.markdown('<h3 class="tp-qa-heading">合规检查清单</h3>', unsafe_allow_html=True)
     for index, rule in enumerate(compliance.get("rules") or []):
         status = str(rule.get("status") or "not_checked")
-        label = {"pass": "通过", "fail": "失败", "manual_review": "手动复核", "not_checked": "未检查"}.get(status, status)
+        label = {"pass": "通过", "fail": "失败", "manual_review": "手动复核",
+                 "not_applicable": "不适用", "not_checked": "未检查"}.get(status, status)
+        rule_label = (rule.get("description") or rule.get("label") or
+                      rule.get("rule_id") or rule.get("id") or "合规规则")
         source = rule.get("source") or {}
+        applicability = rule.get("scope") or rule.get("applicability") or "—"
+        check_level = rule.get("check_type") or rule.get("check_level") or "—"
+        check_level_label = {"deterministic": "自动检查", "manual": "人工检查",
+                             "project_constraint": "项目约束"}.get(str(check_level), str(check_level))
+        authority = rule.get("authority_level") or ""
+        authority_label = {"project": "项目约束",
+                           "reference_template": "默认参考模板",
+                           "custom_profile": "用户自定义院校规则"}.get(
+                               str(authority), "未映射的自定义规则" if not (
+                                   rule.get("source_available") or
+                                   rule.get("reliable_source_mapping") or
+                                   source.get("available"))
+                               else str(source.get("authority") or "—"))
+        source_document = rule.get("source_document") or source.get("file")
+        has_rule_source = (
+            rule.get("source_kind") in {"reference_template", "custom_profile"} and
+            rule.get("authority_level") != "project" and
+            (rule.get("source_available") or
+             rule.get("reliable_source_mapping") or source.get("available")))
+        rule_source = (source_document if has_rule_source else
+                       "院校特殊要求需根据实际模板确认")
         with st.container(key=f"qa_rule_{job_id}_{index}"):
             st.markdown(
-                f'<div class="tp-qa-rule is-{status}"><div><strong>{escape(str(rule.get("label") or rule.get("id")))}</strong>'
+                f'<div class="tp-qa-rule is-{status}"><div><strong>{escape(str(rule_label))}</strong>'
                 f'<p>{escape(str(rule.get("message") or ""))}</p>'
-                f'<small>适用：{escape(str(rule.get("applicability") or "—"))} · 位置：{escape(str(rule.get("location") or "—"))}</small>'
                 f'</div><span>{escape(label)}</span></div>', unsafe_allow_html=True)
-            with st.expander("查看规则依据", expanded=False):
-                st.caption(f'检查级别：{source and rule.get("check_level") or "—"} · '
-                           f'来源：{source.get("file") or "—"} · 页码：{source.get("page") or "—"} · '
-                           f'条款：{source.get("clause") or "—"}')
+            with st.expander("查看来源与技术细节", expanded=False):
+                st.caption(f'规则来源：{rule_source} · 页码/条款：{rule.get("page_or_clause") or source.get("page") or "待提供"}')
+                source_url = rule.get("source_url") or source.get("url") or ""
+                if source_url and has_rule_source:
+                    st.markdown(f'来源链接：[打开来源]({source_url})')
+                st.caption(f'适用范围：{applicability} · 检查方式：{check_level_label} · 规则层级：{authority_label}')
+                implementation_source = rule.get("implementation_source")
+                implementation_clause = rule.get("implementation_clause") or rule.get("source_clause")
+                if implementation_source:
+                    st.caption(f'项目实现依据（非规范来源）：{implementation_source} · {implementation_clause or "—"}')
+                st.caption(f'内部状态：{status} · 规则标识：{rule.get("rule_id") or rule.get("id") or "—"}')
     qa = _finalization.normalize_final_qa(state.get("final_qa"))
-    final_docx = core.load_academic_artifact(job_id, "final_docx_validation") or {}
-    structural = "PASS" if final_docx.get("status") in {"pass", "pass_with_warnings"} else \
-        "FAIL" if final_docx.get("status") == "fail" else qa.get("structural_qa", "NOT_RUN")
-    if structural != qa.get("structural_qa"):
+    structural = _workspace_structural_qa(job_id, state)
+    if structural in {"PASS", "FAIL", "NOT_RUN"} and structural != qa.get("structural_qa"):
         qa["structural_qa"] = structural
         state["final_qa"] = qa
         core.save_job_state(job_id, state)
@@ -4800,7 +5064,10 @@ def _render_workspace_qa(job_id, state):
             with left:
                 st.markdown(f'<div class="tp-qa-fact"><strong>{escape(label)}</strong><span>{escape(proof)}</span></div>', unsafe_allow_html=True)
             with right:
-                st.markdown(f'<div class="tp-qa-status is-{str(status).lower()}">{escape(_finalization.final_qa_label(str(field), str(status)))}</div>', unsafe_allow_html=True)
+                status_class = "stale" if status == "STALE" else str(status).lower()
+                status_label = "需要重建" if status == "STALE" else _finalization.final_qa_label(
+                    str(field), str(status))
+                st.markdown(f'<div class="tp-qa-status is-{status_class}">{escape(status_label)}</div>', unsafe_allow_html=True)
             if field == "libreoffice_render":
                 if st.button("运行 LibreOffice 页面预检", key=f"qa_run_lo_{job_id}",
                              disabled=not bool(state.get("p2_done")), width="stretch"):
@@ -4818,24 +5085,35 @@ def _render_workspace_qa(job_id, state):
                     st.rerun()
     if qa.get("libreoffice_render") == "PASS":
         st.caption(f'渲染记录：{qa.get("page_count") or "—"} 页 · 当前 DOCX 已渲染并保存 PDF 页面预检结果。')
+        render_record = core.load_academic_artifact(job_id, "libreoffice_render") or {}
+        from transpraxis import rendered_qa as _rendered_qa
+        st.markdown("#### 关键页面定位（作者需在 Word 中复核）")
+        st.dataframe(pd.DataFrame(_rendered_qa.key_page_references(render_record)),
+                     hide_index=True, width="stretch")
     st.warning("只有以上四项独立质量事实和合规门禁都分别满足要求，才能把版本标为最终确认。")
 
 
 def _render_workspace_qa_context(job_id, state):
     qa = _finalization.normalize_final_qa(state.get("final_qa"))
-    compliance = core.compliance_profile_view(job_id, state)
+    compliance = _workspace_compliance_view(job_id, state)
     snapshot = core.delivery_snapshot_status(job_id, state)
-    structural_label = {"PASS": "已通过", "FAIL": "失败", "NOT_RUN": "尚未运行"}.get(
-        qa.get("structural_qa"), "尚未运行")
-    render_label = {"PASS": "已通过", "FAIL": "失败", "NOT_RUN": "尚未运行"}.get(
-        qa.get("libreoffice_render"), "尚未运行")
+    structural = _workspace_structural_qa(job_id, state)
+    render_status = _finalization._artifact_status_value(
+        state.get("academic_state") or {}, "libreoffice_render")
+    structural_label = {"PASS": "已通过", "FAIL": "失败", "STALE": "需要重建",
+                         "NOT_RUN": "尚未运行"}.get(structural, "尚未运行")
+    render_label = ("需要重建" if render_status in {"stale", "missing"} else
+                    "失败" if render_status == "failed" or qa.get("libreoffice_render") == "FAIL" else
+                    "已通过" if qa.get("libreoffice_render") == "PASS" else "尚未运行")
     author_label = "已确认" if qa.get("author_visual_review") == "CONFIRMED" else "尚未确认"
     word_label = "已确认" if qa.get("word_final_review") == "CONFIRMED" else "尚未确认"
+    delivery_label, _ = _workspace_delivery_state(job_id, state)
     st.markdown('<div class="tp-info-card"><h3>交付门禁</h3>'
                 f'<div class="tp-info-stat"><span>合规失败</span><b>{(compliance.get("counts") or {}).get("fail", 0)}</b></div>'
                 f'<div class="tp-info-stat"><span>DOCX 结构</span><b>{structural_label}</b></div>'
                 f'<div class="tp-info-stat"><span>页面渲染</span><b>{render_label}</b></div>'
                 f'<div class="tp-info-stat"><span>作者 / Word</span><b>{author_label} / {word_label}</b></div>'
+                f'<div class="tp-info-stat"><span>交付判断</span><b>{delivery_label}</b></div>'
                 f'<div class="tp-info-stat"><span>最近冻结</span><b>{"v" + str((snapshot.get("latest") or {}).get("snapshot_version")) if snapshot.get("latest") else "尚未生成"}</b></div>'
                 '</div>', unsafe_allow_html=True)
 
@@ -5227,6 +5505,15 @@ def _report_page_view(job_id, state, artifacts=None):
     runtime_view = core.build_job_runtime_view(job_id, state)
     runtime_status = runtime_view.get("runtime_status") or runtime_view.get("status")
     quality = academic.get("quality_status") or academic.get("status") or "not_started"
+    final_qa = _finalization.normalize_final_qa(state.get("final_qa"))
+    academic_records = academic.get("artifacts") or {}
+    strict_finalization = bool(state.get("report_enabled")) and any(
+        name in academic_records for name in (
+            "report", "compliance", "final_docx_validation",
+            "libreoffice_render", "report_qa"))
+    final_review_pending = strict_finalization and (
+        final_qa.get("author_visual_review") != "CONFIRMED" or
+        final_qa.get("word_final_review") != "CONFIRMED")
     validation = artifacts.get("validation") or {}
     groups = _report_issue_groups(artifacts, academic) + _report_review_issue_groups(state)
     if runtime_status == "waiting_manual" and not any(
@@ -5272,13 +5559,18 @@ def _report_page_view(job_id, state, artifacts=None):
         overall = "draft_preview"
     else:
         overall = "blocked"
+    report_preview_available = bool(state.get("p3_md") or artifacts.get("report"))
     status_meta = {
         "running": ("正在运行", "查看运行详情", "运行详情", "neutral"),
         "failed": ("运行失败", "查看运行详情", "运行详情", "danger"),
-        "blocked": ("交付受阻", "处理阻塞问题", "问题与修复", "danger"),
-        "review_required": ("待复核", "查看待复核项", "问题与修复", "warning"),
-        "ready_for_delivery": ("可交付", "进入交付", None, "success"),
-        "draft_preview": ("草稿可预览", "查看当前稿件", "当前稿件", "neutral"),
+        "blocked": ("可预览 · 尚不可交付" if report_preview_available else "尚不可交付",
+                    "处理阻塞问题", "问题与修复", "danger"),
+        "review_required": ("可预览 · 等待复核" if report_preview_available else "等待复核",
+                            "查看待复核项", "问题与修复", "warning"),
+        "ready_for_delivery": ("暂不满足交付条件" if final_review_pending else "可以冻结交付",
+                                "完成最终确认" if final_review_pending else "进入交付",
+                                None, "warning" if final_review_pending else "success"),
+        "draft_preview": ("可预览 · 尚不可交付", "查看当前稿件", "当前稿件", "neutral"),
     }
     label, cta, target_tab, tone = status_meta[overall]
     severity_order = {"blocker": 0, "warning": 1, "human_review": 2}
@@ -5297,14 +5589,33 @@ def _report_page_view(job_id, state, artifacts=None):
     if overall == "blocked" and not groups:
         cta = "查看运行详情"
         target_tab = "运行详情"
+    if overall == "blocked":
+        if blocking:
+            gate_note = f"仍有 {len(blocking)} 个报告阻塞项；下一步：{cta}。"
+        elif validation.get("status") == "fail":
+            gate_note = "当前问题列表没有报告阻塞项，但验证结果仍未通过；下一步：查看报告验证结果。"
+        elif quality in {"fail", "failed"}:
+            gate_note = "当前问题列表没有报告阻塞项，但报告质量检查未通过；下一步：查看质量检查结果。"
+        else:
+            gate_note = "报告门禁尚未完成；下一步：查看运行详情并完成报告流程。"
+    elif overall == "review_required" and not groups:
+        gate_note = "报告仍需人工复核；下一步：查看运行详情并记录复核结果。"
+    elif overall == "ready_for_delivery" and final_review_pending:
+        gate_note = "报告技术检查已完成，但作者视觉复核和 Word 最终复核仍未确认；下一步：进入交付检查。"
+    else:
+        gate_note = ""
     return {
         "overall": overall, "overall_label": label, "tone": tone,
         "primary_cta": cta, "target_tab": target_tab,
         "runtime": runtime_view, "quality": quality,
         "validation": validation, "groups": groups, "blocking": blocking,
         "recommended_issue": recommended_issue,
-        "preview_only": overall != "ready_for_delivery",
-        "delivery_label": "可交付" if overall == "ready_for_delivery" else "不可交付",
+        "preview_only": overall != "ready_for_delivery" or final_review_pending,
+        "delivery_label": ("暂不满足交付条件" if final_review_pending else "可以冻结交付")
+        if overall == "ready_for_delivery" else
+        "可预览 · 尚不可交付" if report_preview_available else "尚不可交付",
+        "final_review_pending": final_review_pending,
+        "gate_note": gate_note,
     }
 
 
@@ -5520,6 +5831,8 @@ def _render_report_status_card(job_id, view):
     signal = runtime.get("runtime", {}).get("last_heartbeat_at") or runtime.get("last_activity_at")
     current_step = runtime.get("current_operation") or runtime.get("headline") or "等待下一步"
     detail = runtime.get("detail") or "当前没有新的运行说明。"
+    if view.get("gate_note") and view["gate_note"] not in detail:
+        detail = f"{detail} {view['gate_note']}"
     progress_html = ""
     if runtime.get("progress_total"):
         progress_pct = round(min(1.0, runtime["progress_completed"] /
@@ -5568,6 +5881,8 @@ def _render_report_issue_workbench(job_id, state, view, artifacts):
     if not groups:
         st.markdown('<div class="tp-report-issues-empty">当前没有待处理的问题。</div>',
                     unsafe_allow_html=True)
+        if view.get("gate_note"):
+            st.warning(view["gate_note"])
         return
     if view["overall"] == "running":
         st.info("系统仍在运行。问题列表是最近一次检查结果，请等待当前步骤完成后再执行修复。")
@@ -5621,8 +5936,11 @@ def _render_report_issue_workbench(job_id, state, view, artifacts):
 def _render_report_recommended_action(job_id, view):
     issue = view.get("recommended_issue")
     if view["overall"] == "ready_for_delivery":
-        title = "进入交付并冻结最终版本"
-        description = "报告已通过当前验证，下一步是确认并生成不可变的最终交付版本。"
+        title = "完成作者与 Word 最终复核" if view.get("final_review_pending") \
+            else "进入交付并冻结最终版本"
+        description = ("报告技术检查已完成，但两项人工终审仍需分别确认。"
+                       if view.get("final_review_pending") else
+                       "报告已通过当前验证，下一步是确认并生成不可变的最终交付版本。")
     elif view["overall"] in {"running", "failed"}:
         title = view["primary_cta"]
         description = ("查看当前阶段和运行日志，完成后再继续交付。"
@@ -5829,7 +6147,6 @@ def _render_workspace_report(job_id, state):
         '<div class="tp-truth-banner"><div><span class="tp-truth-kicker">报告输入依据</span>'
         '<strong>当前译文 — 报告证据的唯一来源</strong>'
         f'<p>报告中的译文证据来自工作译文 v{truth["version"]}；译文变更会使受影响的案例、写作单元和报告稿进入“需要更新”。</p>'
-        '<small>技术标识：CURRENT_TRANSLATION</small>'
         '</div></div>', unsafe_allow_html=True)
     _render_report_status_card(job_id, view)
     impact = core.dependency_impact_view(job_id, state)
@@ -5871,22 +6188,21 @@ def _render_workspace_delivery(job_id, state):
     latest = snapshot.get("latest")
     report_ready = _delivery.report_ready(state)
     impact = core.dependency_impact_view(job_id, state)
-    compliance = core.compliance_profile_view(job_id, state)
+    compliance = _workspace_compliance_view(job_id, state)
     compliance_counts = compliance.get("counts") or {}
     qa = _finalization.normalize_final_qa(state.get("final_qa"))
     finalization_qa_required = bool(state.get("report_enabled"))
     final_docx = core.load_academic_artifact(job_id, "final_docx_validation") or {}
     academic = state.get("academic_state") or {}
-    final_export_stale = _finalization._artifact_status_value(
-        academic, "final_docx_validation") == "stale"
-    render_stale = _finalization._artifact_status_value(
-        academic, "libreoffice_render") == "stale"
-    report_stale = _finalization._artifact_status_value(academic, "report") == "stale"
-    structural = ("PASS" if final_docx.get("status") in {"pass", "pass_with_warnings"}
-                  else "FAIL" if final_docx.get("status") == "fail"
-                  else qa.get("structural_qa", "NOT_RUN"))
-    if final_export_stale:
-        structural = "STALE"
+    final_export_status = _finalization._artifact_status_value(
+        academic, "final_docx_validation")
+    render_status = _finalization._artifact_status_value(
+        academic, "libreoffice_render")
+    report_status = _finalization._artifact_status_value(academic, "report")
+    final_export_stale = final_export_status in {"stale", "missing", "failed"}
+    render_stale = render_status in {"stale", "missing", "failed"}
+    report_stale = report_status in {"stale", "missing", "failed"}
+    structural = _workspace_structural_qa(job_id, state)
     qa_ready = (not finalization_qa_required or
                 not report_stale and not final_export_stale and not render_stale and
                 compliance.get("status") == "pass" and
@@ -5899,8 +6215,18 @@ def _render_workspace_delivery(job_id, state):
         state, core.load_academic_artifact(job_id, "selected_cases"))
     case_pending = case_gate.get("blocked_count", 0)
     case_stale = sum(1 for item in case_views if _case_review_is_stale(item, state))
-    translation_gate_pass = (bool(state.get("p2_done")) and not blockers and
-                             (state.get("delivery_validation") or {}).get("blocking") is not True)
+    render_label = ("需要重建" if render_status == "stale" else
+                    "失败" if render_status == "failed" else
+                    "尚未运行" if render_status in {"missing", "not_available"} else
+                    "已通过" if qa.get("libreoffice_render") == "PASS" else "尚未运行")
+    render_detail = ("上一份页面预检通过；当前译文变化后需要重新运行" if render_status == "stale" else
+                     "页面预检失败，需要查看失败原因" if render_status == "failed" else
+                     "尚未生成页面预检结果" if render_status in {"missing", "not_available"} else
+                     f"{qa.get('page_count') or '—'} 页 PDF 页面预检" if qa.get("libreoffice_render") == "PASS" else
+                     "需要重新运行页面预检")
+    translation_truth_gate_pass = (bool(state.get("p2_done")) and
+                                   (state.get("delivery_validation") or {}).get("blocking") is not True)
+    translation_gate_pass = translation_truth_gate_pass and not blockers
     report_draft_exists = bool(state.get("p3_md") or
                                core.load_academic_artifact(job_id, "report"))
     affected_count = len(impact.get("affected") or [])
@@ -5910,13 +6236,16 @@ def _render_workspace_delivery(job_id, state):
          "交付门禁通过 · 0 个阻塞问题" if translation_gate_pass else
          f"还有 {len(blockers)} 个问题阻止继续交付",
          "pass" if translation_gate_pass else "warning"),
-        ("学术产物同步", "需要更新" if impact.get("status") == "stale" else
+        ("学术产物同步", "需要更新" if (impact.get("status") == "stale" or
+                                          report_stale or final_export_stale) else
          "已同步" if report_ready else "报告未完成",
          f"{affected_count} 项下游产物待重建" if impact.get("status") == "stale" else
+         "报告或 DOCX 产物需要重新检查" if report_stale or final_export_stale else
          "报告与当前译文一致" if report_ready else
          "报告稿可预览，但尚未达到可交付状态" if report_draft_exists else
          "报告稿尚未生成",
-         "warning" if impact.get("status") == "stale" or not report_ready else "pass"),
+         "warning" if impact.get("status") == "stale" or report_stale or
+         final_export_stale or not report_ready else "pass"),
         ("案例复核", "需要重建" if case_stale else "待人工确认" if case_pending else
          "已确认" if case_views else "待生成",
          f"{case_stale} 个案例受译文变化影响" if case_stale else
@@ -5926,41 +6255,50 @@ def _render_workspace_delivery(job_id, state):
         ("合规检查", f"{compliance_counts.get('fail', 0)} 项失败" if compliance_counts.get("fail") else
          "需人工复核" if compliance_counts.get("manual_review") else "已通过",
          (f"{compliance_counts.get('manual_review', 0)} 项需要人工复核 · "
-          f"{compliance_counts.get('not_checked', 0)} 项未检查") if compliance_counts.get("fail") else
+          f"{compliance_counts.get('not_checked', 0)} 项未检查")
+         if compliance_counts.get("manual_review") or compliance_counts.get("not_checked") else
          "所有适用规则已通过" if compliance.get("status") == "pass" else "仍有规则需要确认",
          "warning" if compliance_counts.get("fail") or compliance_counts.get("manual_review") else "pass"),
         ("DOCX 结构检查", "已通过" if structural == "PASS" else
-         "失败" if structural == "FAIL" else "尚未运行",
-         "文档结构检查已保存" if structural == "PASS" else "需要先完成结构检查" if structural == "NOT_RUN" else "结构检查发现问题",
+         "失败" if structural == "FAIL" else "需要重建" if structural == "STALE" else "尚未运行",
+         "文档结构检查已保存" if structural == "PASS" else
+         "上一份检查已通过；当前译文变化后需要重新检查" if structural == "STALE" else
+         "需要先完成结构检查" if structural == "NOT_RUN" else "结构检查发现问题",
          "pass" if structural == "PASS" else "warning"),
-        ("LibreOffice 页面渲染", "已通过" if qa.get("libreoffice_render") == "PASS" else
-         "失败" if qa.get("libreoffice_render") == "FAIL" else "尚未运行",
-         f"{qa.get('page_count') or '—'} 页 PDF 页面预检" if qa.get("libreoffice_render") == "PASS" else
-         "需要重新运行页面预检",
-         "pass" if qa.get("libreoffice_render") == "PASS" else "warning"),
+        ("LibreOffice 页面渲染", render_label, render_detail,
+         "warning" if render_status in {"stale", "missing", "failed", "not_available"} or
+         qa.get("libreoffice_render") != "PASS" else "pass"),
         ("作者视觉复核", "已确认" if qa.get("author_visual_review") == "CONFIRMED" else "尚未确认",
          "作者已确认关键页面" if qa.get("author_visual_review") == "CONFIRMED" else "需要作者检查关键页面与版式",
          "pass" if qa.get("author_visual_review") == "CONFIRMED" else "warning"),
         ("Word 最终复核", "已确认" if qa.get("word_final_review") == "CONFIRMED" else "尚未确认",
          "Word 最终页面已确认" if qa.get("word_final_review") == "CONFIRMED" else "需要在 Word 更新字段并确认最终页面",
          "pass" if qa.get("word_final_review") == "CONFIRMED" else "warning"),
-        ("冻结交付", "已冻结" if snapshot.get("current") else "尚未冻结",
+        ("冻结交付", f"已冻结交付 v{latest.get('snapshot_version')}"
+         if snapshot.get("current") and latest else
+         f"工作版本已偏离冻结交付 v{latest.get('snapshot_version')}"
+         if snapshot.get("diverged") and latest else "尚未生成",
          f"冻结交付 v{latest.get('snapshot_version')} 可下载" if snapshot.get("current") and latest else
+         f"v{latest.get('snapshot_version')} 保持不变；完成更新后可冻结新版本 v{int(latest.get('snapshot_version')) + 1}"
+         if snapshot.get("diverged") and latest else
          "所有前置事实满足后再生成不可变版本",
          "pass" if snapshot.get("current") else "warning"),
     ]
-    delivery_ready = (translation_gate_pass and impact.get("status") != "stale" and
-                      (not state.get("report_enabled") or report_ready) and
-                      case_gate.get("status") != "blocked" and
-                      compliance.get("status") == "pass" and qa_ready)
+    hard_gate_reasons = _workspace_hard_gate_reasons(job_id, state)
+    delivery_state_label, delivery_state_tone = _workspace_delivery_state(job_id, state)
     if snapshot.get("current"):
-        readiness_title = f"已冻结，可交付 v{latest.get('snapshot_version') if latest else '—'}"
+        readiness_title = delivery_state_label
         readiness_summary = "当前冻结交付仍是可下载的不可变版本。"
-    elif delivery_ready:
-        readiness_title = "可以安全交付"
+    elif snapshot.get("diverged"):
+        readiness_title = delivery_state_label
+        readiness_summary = (f"冻结交付 v{latest.get('snapshot_version')} 保持不变；"
+                             f"当前工作版本需要完成检查后，才能冻结为新版本 v{int(latest.get('snapshot_version')) + 1}。"
+                             if latest else "当前工作版本与最近冻结交付不一致，需要重新检查后再冻结。")
+    elif delivery_state_label == "可以冻结交付":
+        readiness_title = "可以冻结交付"
         readiness_summary = "所有交付前置事实均已分别满足，可以生成冻结交付。"
     else:
-        readiness_title = "暂不可安全交付"
+        readiness_title = "暂不满足交付条件"
         summary_parts = []
         if translation_gate_pass:
             summary_parts.append("当前译文已通过交付门禁")
@@ -5970,6 +6308,12 @@ def _render_workspace_delivery(job_id, state):
             summary_parts.append(f"{compliance_counts['fail']} 项合规检查失败")
         if compliance_counts.get("manual_review"):
             summary_parts.append(f"{compliance_counts['manual_review']} 项需要人工复核")
+        if compliance_counts.get("not_checked"):
+            summary_parts.append(f"{compliance_counts['not_checked']} 项尚未检查")
+        if structural == "STALE":
+            summary_parts.append("DOCX 结构检查需要重建")
+        if render_stale:
+            summary_parts.append("LibreOffice 页面预检需要重建")
         if qa.get("author_visual_review") != "CONFIRMED" and qa.get("word_final_review") != "CONFIRMED":
             summary_parts.append("作者视觉复核和 Word 最终复核尚未确认")
         elif qa.get("author_visual_review") != "CONFIRMED":
@@ -5978,13 +6322,14 @@ def _render_workspace_delivery(job_id, state):
             summary_parts.append("Word 最终复核尚未确认")
         if case_pending and "案例" not in "".join(summary_parts):
             summary_parts.append(f"另有 {case_pending} 个案例待人工确认")
-        readiness_summary = "；".join(summary_parts) + "。"
+        readiness_summary = ("当前暂不满足交付条件；" + "；".join(summary_parts) + "。"
+                             if summary_parts else "当前暂不满足交付条件；请查看各项准备状态。")
     st.markdown('<div class="tp-section-kicker">工作流最后一步</div><h2>最终交付</h2>'
                 '<div class="tp-section-lead">先判断是否安全，再处理阻塞项；确认后才会生成不可变版本。</div>',
                 unsafe_allow_html=True)
-    flag_label = "已冻结" if snapshot.get("current") else "未就绪"
+    flag_label = delivery_state_label
     st.markdown(
-        f'<div class="tp-readiness-card"><div class="tp-readiness-kicker">交付判断</div>'
+        f'<div class="tp-readiness-card is-{delivery_state_tone}"><div class="tp-readiness-kicker">交付判断</div>'
         f'<div class="tp-readiness-head"><div><h3>{escape(readiness_title)}</h3>'
         f'<p>{escape(readiness_summary)}</p></div><span class="tp-readiness-flag">{flag_label}</span></div>'
         '<div class="tp-readiness-grid">' + "".join(
@@ -6016,6 +6361,12 @@ def _render_workspace_delivery(job_id, state):
         next_detail = "作者视觉复核和 Word 最终复核都必须分别记录。"
         next_button = "打开合规与 QA"
         next_target = "qa"
+    elif snapshot.get("diverged") and latest:
+        next_title = f"冻结为新版本 v{int(latest.get('snapshot_version')) + 1}"
+        next_detail = (f"当前工作版本已偏离 v{latest.get('snapshot_version')}；"
+                       "冻结会追加新版本，不会覆盖已有交付。")
+        next_button = "回到冻结操作"
+        next_target = "freeze"
     else:
         next_title = "生成冻结交付"
         next_detail = "前置检查已完成，确认后会生成不可变交付快照。"
@@ -6059,11 +6410,18 @@ def _render_workspace_delivery(job_id, state):
             f'<div><span>仍可复用</span><strong>{reusable_count} 个未受影响单元/资产</strong></div>'
             '</div></div>', unsafe_allow_html=True)
         _render_workspace_impact_expander(impact)
-    if blockers:
-        st.warning(f"{len(blockers)} 个必须处理问题仍会阻止最终版本。处理问题，或明确接受剩余风险。")
-        accept = st.checkbox("我已检查这些问题，并确认接受剩余风险", key=f"workspace_delivery_accept_{job_id}")
+    freeze_action = (f"冻结为新版本 v{int(latest.get('snapshot_version')) + 1}"
+                     if latest else "确认并冻结最终版本")
+    if blockers and hard_gate_reasons:
+        st.error(f"还有 {len(blockers)} 个审校阻塞项；以下门禁不能通过“接受风险”跳过："
+                 f"{'、'.join(dict.fromkeys(hard_gate_reasons))}。请先完成这些门禁。")
+    elif blockers:
+        st.warning(f"还有 {len(blockers)} 个审校阻塞项；这些项目可在人工检查后明确接受剩余风险。")
+        accept = st.checkbox("我已检查这些审校问题，并确认接受剩余风险", key=f"workspace_delivery_accept_{job_id}")
         note = st.text_input("接受风险说明", key=f"workspace_delivery_note_{job_id}", placeholder="说明为什么可以接受…")
-        if st.button("接受风险并冻结最终版本", type="primary",
+        risk_action = (f"接受风险并{freeze_action}" if latest
+                       else "接受风险并冻结最终版本")
+        if st.button(risk_action, type="primary",
                      disabled=not accept or not report_ready or not qa_ready,
                      key=f"workspace_delivery_accept_go_{job_id}", width="stretch"):
             _, ok, errors = core.approve_delivery(job_id, note or "人工确认并接受剩余风险",
@@ -6075,7 +6433,7 @@ def _render_workspace_delivery(job_id, state):
                 st.error(error)
     elif not snapshot.get("current"):
         note = st.text_input("交付说明（可选）", key=f"workspace_delivery_final_note_{job_id}", placeholder="例如：已完成人工审校…")
-        if st.button("确认并冻结最终版本", type="primary",
+        if st.button(freeze_action, type="primary",
                      disabled=not report_ready or not qa_ready,
                      key=f"workspace_delivery_final_{job_id}", width="stretch"):
             _, ok, errors = core.approve_delivery(job_id, note or "人工确认最终交付",
@@ -7006,7 +7364,7 @@ if app_view == "history":
                 filename = escape(str(job["state"].get("filename", "?")))
                 runtime_view = core.build_job_runtime_view(job["job_id"], job["state"])
                 status = escape(runtime_view["headline_status"])
-                business_status = escape(core.task_status_label(job["state"]))
+                business_status = escape(core.task_status_label(job["state"], job["job_id"]))
                 recovery = core.recovery_summary(job["job_id"], job["state"])
                 hc1.markdown(f'<div class="tp-history-copy"><strong>{filename}</strong>'
                              f'<span>{status} · 业务阶段：{business_status}</span></div>',
