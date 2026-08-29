@@ -20,7 +20,7 @@ def run_regression() -> Dict[str, Any]:
                  if case.get("case_type") == "authentic_revision"]
     synthetic = [case for case in cases
                  if case.get("case_type") == "synthetic_contrast"]
-    private_markers = ("示例大学", "论文_MTI", "state.json", "outputs/")
+    private_markers = ("PRIVATE_INSTITUTION", "论文_MTI", "state.json", "outputs/")
     serialized = json.dumps(fixture, ensure_ascii=False)
     approved_synthetic_is_non_historical = all(
         case.get("review_status") == "approved"

@@ -118,6 +118,22 @@ def test_reject_blocks_gate_and_replacement_starts_unreviewed(tmp_path):
     gate = finalization.case_review_gate(
         replaced, core.load_academic_artifact(job_id, "selected_cases"))
     assert gate["blocked_case_ids"] == ["SC-99"]
+    assert replaced["academic_state"]["artifacts"]["case:SC-99"]["status"] == "valid"
+    approved_new, ok, message = core.review_academic_case(
+        job_id, "SC-99", "approved", "替换案例已重新核对", actor="author")
+    assert ok, message
+    assert finalization.case_review_gate(
+        approved_new, core.load_academic_artifact(job_id, "selected_cases"))["status"] == "pass"
+
+
+def test_provenance_mismatch_blocks_case_finalization(tmp_path):
+    case = _synthetic_case("SC-BAD", "382", "模拟初译", "当前译文")
+    case["text_role"]["initial"] = case_provenance.HISTORICAL_INITIAL
+    _job_id, state, selected = _setup(tmp_path, [case])
+    gate = finalization.case_review_gate(state, selected)
+    assert gate["status"] == "blocked"
+    assert any("case provenance invalid" in reason
+               for reason in gate["cases"][0]["reasons"])
 
 
 def test_case_translation_edit_marks_review_stale_and_stage2_chain(tmp_path):
