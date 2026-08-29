@@ -299,17 +299,18 @@ valid record               reuse
 
 ### 阶段 4：Compliance Profile + Language Constraints（P1，3—5 天）
 
-在现有 `thesis_constraints` 和 template contract 上增加 **Compliance Profile**，不开发通用规则 DSL。第一份 profile 为：
+在现有 `thesis_constraints` 和 template contract 上增加 **Compliance Profile**，不开发通用规则 DSL。默认 profile 为：
 
 ```text
 profile_id: MTI_PRACTICE_REPORT_DEFAULT
-institution: 示例培养单位
-program: MTI 英语笔译
-effective_date: 2026
-source_documents: [...]
+display_name: 默认 MTI 实践报告规范
+program: MTI 翻译实践报告
+source_type: reference_template
+source_id: mti_practice_report_reference_v1
+scope: default_profile
 ```
 
-每条规则都必须保存来源文件、页码／条款、适用范围和检查级别。只有完成来源映射的规则才能标为 enforced；未确认规则显示 manual review，不能伪装成学校硬性要求。
+默认结构来自匿名真实 MTI 实践样本的产品抽象，不代表全国统一或院校强制要求。每条规则都必须保存来源、适用范围和检查级别。只有完成可靠来源映射的规则才能标为 enforced；未确认规则显示 manual review，不能伪装成院校硬性要求。未来院校特定规则由用户自定义 profile 承载。
 
 首批确定性检查包括：
 
@@ -320,10 +321,10 @@ source_documents: [...]
 - 图号采用“图 3.x”、表号采用“表 3.x”等按章编号；
 - 正文与附录是否存在及角色是否正确；
 - 双语对照附录要求；
-- 笔译实践源文原则上不少于 10,000 词；
+- 中文源文按汉字数检查；英文源文最低长度折算保留人工确认；
 - 案例分析是否为核心章节、结论是否回应研究问题；
 - 页眉、页码体系、页面尺寸、页边距、标题样式、行距等可从 DOCX 结构读取的格式要求；
-- synthetic case 在 default MTI profile 下的计数与披露政策；
+- synthetic case 在默认 profile 下的计数与披露政策；
 - `【待作者填写】` 等人工确认项。
 
 同阶段增加：
@@ -388,9 +389,23 @@ LibreOffice PASS 只说明该引擎成功渲染并通过对应规则，绝不等
 - 25 个案例按配置分布并通过来源、目标、标签与计数政策检查；
 - 未知作者信息保留为明确 manual review 项；
 - Structural PASS + LibreOffice PASS 时，Word Final Review 仍可保持 NOT_CONFIRMED；
-- default MTI profile 每个 enforced rule 都能追溯到规范来源。
+- 默认 MTI profile 每个 enforced rule 都能追溯到匿名参考来源记录。
 
 发布前执行完整测试、一次端到端真实任务、一次中断恢复和一次局部重建验证，然后发布 v0.4.0。
+
+#### 阶段 4—6 实际完成（v0.4.0 release candidate）
+
+- Stage 4 已落在 `transpraxis/compliance.py`：`MTI_PRACTICE_REPORT_DEFAULT` 使用结构化 rule records，保留 authority/source/clause/conflict 字段；项目 Roadmap 仅作为实现追踪，不是规范来源。默认 profile 不携带真实院校身份。
+- Stage 4 的确定性检查覆盖摘要、关键词、目录层级、正文/参考文献双向 ID、图表编号与 caption、双语附录、按语源区分的原文长度、结构事实、DOCX 可读取 layout、作者占位符和项目级语言约束。英文 10,000 字折算、脚注/顺序编码冲突、synthetic 是否计入学校最低案例数均保留为 manual review。
+- Stage 5 已落在 `transpraxis/rendered_qa.py` 与现有 finalization records：PyMuPDF 只读取 PDF 文本/块/字体/位置事实，不做 OCR；空白页、密度、标题落单、边界、页眉页脚和页码区域分别作为 warning 或 manual review。LibreOffice 缺失时是 `NOT_RUN`，不伪造 PASS。
+- Stage 5 保存独立的 Structural QA、LibreOffice Render、Author Visual Review、Word Final Review 和 `report-qa.md`；DOCX 或 render 变化会清除旧人工确认并沿 Stage 2 dependency graph 重跑相应下游。
+- Stage 6 已用 `eval/fixtures/mti_finalization_regression.json` 完成匿名 Case-15、文献/术语定向变化、案例分布、占位符、断点恢复、增量复用、QA 分离、E2E 冻结和历史 snapshot 不回写回归。当前 release candidate 不提前声称完成 v0.5 Translation Quality Pipeline。
+
+真实实现限制：当前自动化预检只有 LibreOffice 引擎；Microsoft Word 的字段更新、目录刷新、表格分页和最终视觉效果仍必须由作者在 Word 中确认。旧版仅有 `p3_md` 而没有结构化 report artifact 的任务继续可读取，并沿历史交付路径运行；拥有 v0.4 artifact record 的任务才进入严格 compliance/QA finalization gate。
+
+#### Stage 4.5 source-backed rule population
+
+`MTI_PRACTICE_REPORT_DEFAULT` 以 `mti_practice_report_reference_v1` 保存匿名结构化参考来源。摘要、关键词、目录三级、图表章内编号、双语附录、案例分析报告基本结构、A4、页边距、页眉/页脚距离和固定 20 磅行距在该默认产品 profile 中执行确定性检查。英文源文最低长度折算、synthetic case 是否计入最低案例数、具体引用格式和院校特殊封面/页眉/目录要求继续为 `manual_review`，统一提示用户根据所在院校要求确认。项目 roadmap 只作实现追踪，不是规范来源；真实原始 DOC/DOCX/PDF 不进入仓库。
 
 ## v0.5.0：Translation Quality Pipeline
 
@@ -445,4 +460,4 @@ v0.5.0 的成功标准不是“某模型分数最高”，而是能够回答：�
 
 ## v0.4.0 最终验收标准
 
-v0.4.0 完成时，修改一个最终译文 segment 后，系统必须准确展示其 stale 依赖链，只重新生成受影响案例和写作单元，并复用其余内容；任何 synthetic baseline 永远保持非历史 provenance；default MTI profile 的确定性规则、LibreOffice 预检、作者视觉复核和 Word 最终确认分别记录。最终 DOCX、Word/PDF 产物与 QA 必须绑定同一当前译文 hash，且不得暗示未完成的检查已经通过。
+v0.4.0 完成时，修改一个最终译文 segment 后，系统必须准确展示其 stale 依赖链，只重新生成受影响案例和写作单元，并复用其余内容；任何 synthetic baseline 永远保持非历史 provenance；默认 MTI profile 的确定性规则、LibreOffice 预检、作者视觉复核和 Word 最终确认分别记录。最终 DOCX、Word/PDF 产物与 QA 必须绑定同一当前译文 hash，且不得暗示未完成的检查已经通过。

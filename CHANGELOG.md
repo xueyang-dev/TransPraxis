@@ -1,19 +1,41 @@
 # Changelog
 
-本文件记录 TransPraxis / 译践 的用户可见变更。当前公开版本为 `v0.3.0`。
+本文件记录 TransPraxis / 译践 的用户可见变更。`v0.4.0` 已达到发布候选状态；本轮 UX closure 已完成并冻结，发布仍以人工签发为准。
 
 ## [Unreleased]
 
 ### MTI 终稿基线
 
 - 增加不含私人论文全文的匿名 MTI finalization fixture 与离线回归入口，覆盖真实修订和合成对照案例的基本边界。
-- 当前工作树基线为 281 项自动化测试通过；后续 provenance 与合规改动继续以该基线为准。
+- v0.4.0 release candidate 当前全套自动化测试为 352 项通过；匿名 MTI finalization fixture 可离线运行。
+
+### v0.4.0 UX closure / release hardening
+
+- Final Delivery 生命周期统一为“暂不满足交付条件 / 可以冻结交付 / 已冻结交付 vN / 工作版本已偏离冻结交付 vN”；历史与恢复入口不再显示泛化的 `可交付`。
+- 默认 MTI profile 使用匿名结构化参考记录；缺少可靠来源映射的自定义规则不能标为 `enforced`。`docs/mti-practice-driven-roadmap.md` 仅作实现追踪，不是规范来源。
+- release gate 增加 `academic_writer.py` 及关键模块的 `py_compile` / import 检查；编译、导入、Streamlit 冷启动、完整测试（352 passed）、匿名回归夹具和真实 23-case 项目 smoke test 均通过。
+- v0.4.0 UX 现已冻结；除非发现 correctness bug，不再进行新的 v0.4.0 UX 重构。
 
 ### Translation Truth + Provenance
 
 - 固化 `case_origin`、`text_role`、`review_status` 三维语义；旧 `authentic_revision` / `synthetic_contrast` 案例仍可读取并自动补齐公开字段。
 - 人工批准只改变 `review_status`，不会把合成对照升格为真实修订；真实与模拟案例在报告、DOCX 和案例工作区使用确定性标签与说明。
 - 增加 strict compliance profile 的 synthetic 计数策略：严格 profile 下合成案例只能作为补充，不能满足正式最低案例数。
+
+### v0.4.0 MTI Finalization Pipeline
+
+- 将 `CURRENT_TRANSLATION`、案例 provenance、人工案例终审和冻结交付绑定到同一可追溯工作版本；合成对照即使获批仍保持 `SYNTHETIC_BASELINE`。
+- 为学术 artifact 保存精确输入 ID 与生命周期状态，支持按案例/小节的定向 stale propagation、未受影响单元复用，以及报告组合、DOCX 导出和 QA 重跑的独立语义。
+- 增加 `MTI_PRACTICE_REPORT_DEFAULT` source-backed compliance profile、项目级语言/术语约束、可配置引文格式和可定位的 manual review 结果；没有可靠来源的要求不会被标记为 enforced。
+- 默认 profile 以匿名真实实践样本抽象常见 MTI 报告结构；英文源文换算、synthetic 案例计数、具体引用格式和院校特殊版式继续显式保留为 manual review。
+- 将 Structural QA、LibreOffice render、Author Visual Review 和 Word Final Review 分开保存；LibreOffice 只作为自动预检引擎，`report-qa.md` 绑定当前译文、报告、DOCX、PDF 和 QA 状态。
+- 扩展匿名 MTI 回归，覆盖 Case-15 人工拒绝、文献/术语定向失效、断点恢复、增量重建、QA 分离和 frozen snapshot 不可回写。
+
+### v0.4.0 已知边界
+
+- 默认 profile 不携带真实院校、学院、网页或规范文件身份；未来院校特定要求只能作为用户自定义 profile 扩展。缺少可靠映射的规则不会冒充 `enforced`。
+- 英文源文的 10,000 字折算规则未确认，因此只给出 manual review；不会自行换算为 10,000 English words。
+- LibreOffice 不可用时状态为 `NOT_RUN`；Word 字段更新、目录刷新和最终视觉确认仍必须在 Microsoft Word 中完成。
 
 ## [0.3.0] - 2026-08-24
 

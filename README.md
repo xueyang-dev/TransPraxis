@@ -17,15 +17,15 @@ TransPraxis / 译践是一套面向长文档翻译实践的本地工作空间，
 
 ## Quick Start
 
-### 安装 v0.3.0
+### 安装 v0.4.0
 
 需要 Python 3.10 或更高版本。
 
 从 [GitHub Releases](https://github.com/xueyang-dev/TransPraxis/releases) 下载
-`transpraxis-0.3.0-py3-none-any.whl`，然后运行：
+`transpraxis-0.4.0-py3-none-any.whl`，然后运行：
 
 ```bash
-python -m pip install ./transpraxis-0.3.0-py3-none-any.whl
+python -m pip install ./transpraxis-0.4.0-py3-none-any.whl
 transpraxis
 ```
 
@@ -109,7 +109,7 @@ python scripts/translate_pdf.py "文档.pdf" --target-lang 简体中文 --qualit
 
 ## 使用说明与限制
 
-AI 生成的译文和实践报告仅作为工作稿，提交前应人工核对事实、术语、引文和理论判断。`--lan` 当前采用受信任局域网模式，不包含认证层；不应暴露到不受信任的网络。LAN 认证不在 v0.3.0 范围内。
+AI 生成的译文和实践报告仅作为工作稿，提交前应人工核对事实、术语、引文和理论判断。`--lan` 当前采用受信任局域网模式，不包含认证层；不应暴露到不受信任的网络。LAN 认证不在 v0.4.0 范围内。
 
 ## 文档
 
