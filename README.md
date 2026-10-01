@@ -1,3 +1,9 @@
+> **项目迁移 / Project migration**
+>
+> TransPraxis / 译践已演进为 **Folith · 译页**；后续开发在 [xueyang-dev/Folith](https://github.com/xueyang-dev/Folith) 继续。以下 README 保留为历史记录；新用户请从 Folith 开始。
+>
+> TransPraxis has evolved into **Folith · 译页**. Active development continues at [xueyang-dev/Folith](https://github.com/xueyang-dev/Folith). The README below is retained as a historical record; new users should start with Folith.
+
 # TransPraxis / 译践
 
 <p align="center">
